@@ -1,0 +1,10 @@
+cb_size_byte = 8192
+cb_min_record_size = 64
+cb_max_record_size = 2048
+cb_max_key_len = 8
+leaf_page_size = 4096
+index_file_path = "c/d/E"
+backend_storage = "disk"
+read_promotion_rate = 100
+write_load_full_page = true
+cache_only = false

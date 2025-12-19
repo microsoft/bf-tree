@@ -1,0 +1,202 @@
+[[E2EBench]]
+name = "in_memory_old"
+threads = [8, 24]
+time = 20
+repeat = 5
+record_cnt = 1_000_000
+distribution = ["Uniform"]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [128]
+file_path = ":memory:"
+key_len = 8
+scan_cnt = 32
+sut = ["BfTree"]
+
+[[E2EBench]]
+name = "test"
+threads = [24]
+time = 20
+repeat = 10
+record_cnt = 1_000_000
+distribution = ["Uniform"]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [16]
+file_path = "micro"
+key_len = 8
+scan_cnt = 32
+sut = ["BfTree"]
+
+
+[[E2EBench]]
+name = "cache"
+threads = [30, 30, 30, 30, 31, 24, 16, 8, 4, 2, 1]
+time = 30
+repeat = 3
+record_cnt = 50_000_000
+distribution = [{ Zipf = 0.9 }, "Uniform"]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [128, 256, 512, 1024]
+file_path = "/mnt/ssd/micro"
+key_len = 8
+scan_cnt = 32
+sut = ["BfTree", "RocksDB", "Sled", "Lmdb", "Splinterdb"]
+
+[[E2EBench]]
+name = "scan"
+threads = [30, 30, 30, 31, 24, 16, 8, 4, 2, 1]
+time = 30
+repeat = 3
+record_cnt = 50_000_000
+distribution = [{ Zipf = 0.9 }, "Uniform"]
+workload_mix = [
+	{ read = 0, negative_read = 0, update = 0, scan = 100, insert = 0 },
+]
+memory_size_mb = [128, 256, 512, 1024]
+file_path = "/mnt/ssd/micro"
+key_len = 8
+scan_cnt = 32
+sut = ["BfTree", "RocksDB", "Sled", "Lmdb", "Splinterdb"]
+
+[[E2EBench]]
+name = "overall"
+threads = [30, 30, 30, 30, 30, 31]
+time = 30
+repeat = 5
+record_cnt = 200_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 0, negative_read = 0, update = 0, scan = 100, insert = 0 },
+	{ read = 0, negative_read = 0, update = 100, scan = 0, insert = 0 },
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [2048]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 32
+sut = ["BfTree", "RocksDB", "PageCache", "BwTree"]
+
+
+[[E2EBench]]
+name = "spdk"
+# threads = [1]
+threads = [30, 30, 30, 30, 30, 31, 24, 16, 8, 4, 2, 1]
+time = 30
+repeat = 5
+record_cnt = 200_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 50, negative_read = 0, update = 50, scan = 0, insert = 0 },
+]
+memory_size_mb = [2048]
+file_path = "10000:02:00.0"
+# file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 32
+sut = ["BfTree"]
+
+[[E2EBench]]
+name = "scalability"
+threads = [30, 30, 30, 30, 30, 31, 24, 16, 8, 4, 2, 1]
+time = 30
+repeat = 5
+record_cnt = 200_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 50, negative_read = 0, update = 50, scan = 0, insert = 0 },
+]
+memory_size_mb = [2048]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 8
+sut = ["BfTree", "PageCache", "RocksDB", "BwTree"]
+
+[[E2EBench]]
+name = "inmemory"
+threads = [30, 30, 31]
+time = 30
+repeat = 5
+record_cnt = 200_000_000
+distribution = ["Uniform"]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [32768]
+file_path = "/mnt/ssd/micro:memory"
+key_len = 16
+scan_cnt = 8
+sut = ["BfTree"]
+
+
+[[E2EBench]]
+name = "cache_sensitivity"
+threads = [30, 30, 30, 30, 30, 24]
+time = 30
+repeat = 5
+record_cnt = 200_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [512, 1024, 2048, 4096, 8192]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 8
+sut = ["BfTree", "PageCache", "RocksDB", "BwTree"]
+
+[[E2EBench]]
+name = "skewness"
+threads = [30, 30, 30, 30, 30, 24]
+time = 30
+repeat = 5
+record_cnt = 200_000_000
+distribution = [{ Zipf = 1.0 }, { Zipf = 0.8 }, { Zipf = 0.6 }, "Uniform"]
+workload_mix = [
+	{ read = 50, negative_read = 0, update = 50, scan = 0, insert = 0 },
+]
+memory_size_mb = [2048]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 8
+sut = ["BfTree", "PageCache", "RocksDB", "BwTree"]
+
+[[E2EBench]]
+name = "workload"
+threads = [30, 30, 30, 30, 30, 24]
+time = 30
+repeat = 5
+record_cnt = 200_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+	{ read = 80, negative_read = 0, update = 20, scan = 0, insert = 0 },
+	{ read = 50, negative_read = 0, update = 50, scan = 0, insert = 0 },
+	{ read = 20, negative_read = 0, update = 80, scan = 0, insert = 0 },
+	{ read = 0, negative_read = 0, update = 100, scan = 0, insert = 0 },
+]
+memory_size_mb = [2048]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 8
+sut = ["BfTree", "PageCache", "RocksDB", "BwTree"]
+
+[[E2EBench]]
+name = "latency"
+threads = [30, 30, 30, 1]
+time = 30
+repeat = 5
+record_cnt = 200_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [2048]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 8
+sut = ["BfTree", "PageCache", "RocksDB", "BwTree"]

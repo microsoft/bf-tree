@@ -1,0 +1,76 @@
+[package]
+name = "benchmark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bf-tree = { path = "..", features = ["metrics"] }
+rand = "0.9.2"
+rand_distr = "0.5.1"
+shumai = "0.2.18"
+mimalloc = { version = "*", default-features = false }
+serde = { version = "1.0.199", features = ["derive"] }
+zipf = "7.0.1"
+serde_json = "1.0.116"
+libc = "0.2.154"
+redb = { version = "1.5.1", optional = true }
+lmdb-rkv = { version = "0.14.0", optional = true }
+sled = { version = "0.34.7", optional = true }
+
+[dependencies.rocksdb]
+default-features = false
+features = ["lz4"]
+version = "0.24.0"
+optional = true
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[features]
+metrics-rt = ["bf-tree/metrics-rt"]
+metrics-rt-debug-all = ["bf-tree/metrics-rt-debug-all"]
+metrics-rt-debug-timer = ["bf-tree/metrics-rt-debug-timer"]
+flamegraph = ["shumai/flamegraph"]
+perf = ["shumai/perf"]
+spdk = ["bf-tree/spdk"]
+rocksdb = ["dep:rocksdb"]
+sled = ["dep:sled"]
+redb = ["dep:redb"]
+lmdb = ["dep:lmdb-rkv"]
+
+[profile.release]
+opt-level = 3
+debug = true
+strip = "none"
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+incremental = true
+codegen-units = 16
+rpath = false
+# https://smallcultfollowing.com/babysteps/blog/2024/05/02/unwind-considered-harmful/
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+debug = true
+strip = "none"
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+incremental = true
+codegen-units = 16
+rpath = false
+
+
+[[bin]]
+name = "bftree"
+path = "bin/bftree.rs"
+
+[[bin]]
+name = "e2e"
+path = "bin/e2e.rs"

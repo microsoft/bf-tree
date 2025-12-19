@@ -1,0 +1,7 @@
+command script import dev/bf_tree_fmt.py
+
+type summary add  bf_tree::nodes::leaf_node::MiniPageNextLevel --python-function bf_tree_fmt.mini_page_next_level
+type synthetic add bf_tree::nodes::leaf_node::LeafKVMeta --python-class bf_tree_fmt.LeafKvMetaProvider
+type synthetic add bf_tree::nodes::node_meta::NodeMeta --python-class bf_tree_fmt.NodeMetaProvider
+type synthetic add bf_tree::nodes::leaf_node::LeafNode --python-class bf_tree_fmt.LeafNodeProvider
+type synthetic add bf_tree::nodes::page_id::PageID --python-class bf_tree_fmt.PidProvider

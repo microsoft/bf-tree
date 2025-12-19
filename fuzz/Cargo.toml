@@ -1,0 +1,39 @@
+[package]
+name = "bf-tree-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ahash = "0.8.6"
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = { version = "0.4" }
+mimalloc = { version = "*", default-features = false }
+
+# The libafl shim doesn't work for us somehow, don't have the bandwidth to debug it now
+# libfuzzer-sys = { git = "https://github.com/AFLplusplus/LibAFL.git", branch = "libfuzzer-best", package = "libafl_libfuzzer" }
+
+[dependencies.bf-tree]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "circular_buffer"
+path = "fuzz_targets/circular_buffer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "bf_tree"
+path = "fuzz_targets/bf_tree.rs"
+test = false
+doc = false

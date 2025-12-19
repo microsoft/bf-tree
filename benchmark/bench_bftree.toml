@@ -1,0 +1,112 @@
+[[BfTreeBench]]
+name = "inmemory"
+threads = [32, 32]
+time = 10
+repeat = 5
+record_cnt = 100_000_000
+distribution = ["Uniform"]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [16384]
+file_path = ":memory:"
+key_len = 16
+scan_cnt = 32
+storage = ["Memory"]
+read_promotion_rate = [100]
+copy_on_access_ratio = [0.1]
+
+[[BfTreeBench]]
+name = "storage"
+threads = [30, 30, 30, 30, 31]
+time = 30
+repeat = 5
+record_cnt = 100_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 0, negative_read = 0, update = 0, scan = 100, insert = 0 },
+	{ read = 0, negative_read = 0, update = 100, scan = 0, insert = 0 },
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [1024]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 32
+storage = ["StdDirect", "IoUringPolling", "IoUringBlocking"]
+read_promotion_rate = [30]
+copy_on_access_ratio = [0.1]
+
+[[BfTreeBench]]
+name = "read_only"
+threads = [30, 30, 30, 30, 31]
+time = 30
+repeat = 5
+record_cnt = 100_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [1024]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 32
+storage = ["IoUringBlocking"]
+read_promotion_rate = [30]
+copy_on_access_ratio = [0.1]
+
+
+[[BfTreeBench]]
+name = "promotion_rate"
+threads = [30, 30, 30, 30, 31]
+time = 30
+repeat = 5
+record_cnt = 100_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [1024]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 32
+storage = ["IoUringBlocking"]
+read_promotion_rate = [1, 5, 10, 20, 40, 60, 80, 100]
+copy_on_access_ratio = [0.1]
+
+
+[[BfTreeBench]]
+name = "copy_on_access_ratio"
+threads = [30, 30, 30, 30, 31]
+time = 30
+repeat = 5
+record_cnt = 100_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 100, negative_read = 0, update = 0, scan = 0, insert = 0 },
+]
+memory_size_mb = [1024]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 32
+storage = ["IoUringBlocking"]
+read_promotion_rate = [30]
+copy_on_access_ratio = [0.0, 0.05, 0.1, 0.15, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+
+[[BfTreeBench]]
+name = "insert_only"
+threads = [30]
+time = 10
+repeat = 3
+record_cnt = 1_000_000
+distribution = [{ Zipf = 0.9 }]
+workload_mix = [
+	{ read = 0, negative_read = 0, update = 0, scan = 0, insert = 100 },
+]
+memory_size_mb = [1024]
+file_path = "/mnt/ssd/micro"
+key_len = 16
+scan_cnt = 32
+storage = ["StdDirect", "IoUringPolling", "IoUringBlocking"]
+read_promotion_rate = [30]
+copy_on_access_ratio = [0.1]
