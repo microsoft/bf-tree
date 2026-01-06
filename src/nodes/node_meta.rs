@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::nodes::FENCE_KEY_CNT;
 
 #[repr(C)]

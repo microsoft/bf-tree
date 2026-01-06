@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use std::hint::black_box;
 use std::{collections::HashMap, ops::Range};
 

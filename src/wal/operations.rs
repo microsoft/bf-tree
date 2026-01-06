@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::nodes::leaf_node::OpType;
 
 use super::LogEntryImpl;

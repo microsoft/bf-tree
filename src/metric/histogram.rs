@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::metric::RecorderImpl;
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use std::collections::HashMap;

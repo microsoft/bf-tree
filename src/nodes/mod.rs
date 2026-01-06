@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 mod inner_node;
 pub(crate) mod leaf_node;
 mod node_meta;

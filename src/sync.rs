@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #[cfg(all(feature = "shuttle", test))]
 pub(crate) use shuttle::sync::*;
 

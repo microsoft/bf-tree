@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use std::collections::{HashMap, VecDeque};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};

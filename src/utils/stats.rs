@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #![allow(unused)]
 
 use crate::nodes::{leaf_node::MiniPageNextLevel, PageID};

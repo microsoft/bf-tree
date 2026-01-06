@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 import lldb
 
 def leaf_kv_meta(valobj, internal_dict):

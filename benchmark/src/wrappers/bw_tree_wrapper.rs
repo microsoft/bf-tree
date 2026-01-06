@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use std::path::Path;
 
 use bf_tree::{BfTree, LeafReadResult, ScanReturnField};

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use core::panic;
 use std::{alloc::Layout, cmp::Ordering, sync::atomic};
 

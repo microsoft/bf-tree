@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 pub(crate) mod atomic_wait;
 pub(crate) mod inner_lock;
 mod mapping_table;

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #[derive(Debug)]
 pub(crate) enum TreeError {
     Locked,

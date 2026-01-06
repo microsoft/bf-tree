@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 /// Adapted from https://github.com/m-ou-se/atomic-wait
 use crate::sync::atomic::AtomicU32;
 

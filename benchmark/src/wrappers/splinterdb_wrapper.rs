@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use splinterdb_sys::{DefaultSdb, LookupResult};
 
 use crate::KvStore;
