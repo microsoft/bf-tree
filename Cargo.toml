@@ -2,6 +2,8 @@
 name = "bf-tree"
 version = "0.4.7"
 edition = "2021"
+license = "MIT"
+description = "Bf-Tree is a modern read-write-optimized concurrent larger-than-memory range index in Rust from Microsoft Research."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
