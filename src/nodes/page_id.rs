@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::nodes::InnerNode;
 
 /// A page ID can be either a heap pointer (pointing to inner nodes)

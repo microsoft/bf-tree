@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use std::ops::Range;
 
 use rand::distributions::{Distribution as RandDistribution, Uniform};

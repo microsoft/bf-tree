@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #![doc = include_str!("../README.md")]
 pub mod circular_buffer;
 mod config;

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #[cfg(target_os = "linux")]
 use crate::fs::IoUringVfs;
 

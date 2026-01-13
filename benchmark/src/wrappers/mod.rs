@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 mod bf_tree_wrapper;
 mod bw_tree_wrapper;
 #[cfg(feature = "lmdb")]

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use serde::Serialize;
 use std::cell::UnsafeCell;
 use std::ops::AddAssign;

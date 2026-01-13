@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #![no_main]
 
 use arbitrary::Arbitrary;

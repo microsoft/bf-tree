@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::{metric::recorders::TlsRecorder, metric::RecorderImpl};
 use chrono::{Datelike, Timelike};
 use core::array;

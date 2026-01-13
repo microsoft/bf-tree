@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::metric::RecorderImpl;
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use variant_count::VariantCount;

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 pub mod bench_bftree;
 pub mod bench_e2e;
 mod common;

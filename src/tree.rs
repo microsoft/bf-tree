@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #[cfg(not(all(feature = "shuttle", test)))]
 use rand::Rng;
 
