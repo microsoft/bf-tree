@@ -1,0 +1,58 @@
+[package]
+name = "bf-tree"
+version = "0.4.5"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand = { version = "0.8.5", features = ["small_rng"] }
+rand_test = {package = "rand", version = "0.9.2"}
+tracing = { version = "0.1", optional = true }
+serde = { version = "1", features = ["derive"]}
+serde_json = "1.0.116"
+auto_ops = { version = "0.3", optional = true }
+hdrhistogram = { version = "7.5.4", optional = true }
+chrono = { version = "0.4.38", optional = true }
+variant_count = { version = "1.1.0", optional = true }
+toml = "0.8.23"
+thread_local = "1.1.9"
+cfg-if = "=1.0.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6.4"
+libc = "0.2.155"
+#spdk-rs = { git = "https://github.com/openebs/spdk-rs.git", branch = "release/2.5", optional = true }
+#crossbeam-queue = { version = "0.3.11", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
+[dev-dependencies]
+proptest = "1.6.0"
+proptest-derive = "0.5.1"
+tempfile = "3.10.1"
+shuttle = "0.7.1"
+tracing-subscriber = "0.3"
+rstest = "0.19.0"
+bytemuck = { version = "1.24.0", features = ["must_cast"] }
+
+[features]
+shuttle = []
+tracing = ["dep:tracing"]
+#spdk = ["dep:spdk-rs", "dep:crossbeam-queue"]
+
+# Whether to compile metrics or not
+metrics = ["dep:auto_ops", "dep:hdrhistogram", "dep:chrono", "dep:variant_count"]
+# Whether to enable release metrics at runtime
+# Release metrics are saved in static crate-level tls and each thread can only access its own copy of metrics. Low overhead
+metrics-rt = ["dep:auto_ops", "dep:hdrhistogram", "dep:chrono", "dep:variant_count"]
+# Whether to enable debug all metrics at runtime
+# Debug metrics are bf-tree level tls. A thread can exclusively access (mut) all tls copies of the metrics of a bf-tree. High overhead
+metrics-rt-debug-all = ["dep:auto_ops", "dep:hdrhistogram", "dep:chrono", "dep:variant_count"]
+# Whether to enable only the debug timer metrics at runtime
+# Only enable debug timer metrics. This is useful as r/w timers could be affected by counter/gauge metrics when all are enabled
+metrics-rt-debug-timer = ["dep:auto_ops", "dep:hdrhistogram", "dep:chrono", "dep:variant_count"]
+
+[profile.release]
+debug = true
