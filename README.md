@@ -90,21 +90,14 @@ More advanced benchmarking, with metrics collecting, numa-node binding, huge pag
 env MIMALLOC_SHOW_STATS=1 MIMALLOC_LARGE_OS_PAGES=1 MIMALLOC_RESERVE_HUGE_OS_PAGES_AT=0 numactl --membind=0 --cpunodebind=0 cargo bench --features "metrics-rt" micro
 ```
 
-#### Fuzz testing
+#### Fuzz and Shuttle Testing
 
-Check the [fuzz](fuzz/README.md) folder for more details.
+**Fuzz testing**: This is a bug finding technique that generates random inputs to the system and test for crash. Bf-Tree employs fuzzing to generate random operation sequences
+(e.g., insert, read, scan) to the system and check that none of the operation sequence will crash the system or lead to inconsistent state. Check the 
+[fuzz](fuzz/README.md) folder for more details.
 
-**Fuzzing** is a bug finding technique that generates random inputs to the system and test for crash.
-Bf-Tree employs fuzzing to generate random operation sequences (e.g., insert, read, scan) to the system and check that none of the operation sequence will crash the system or lead to inconsistent state.
-
-**Property-based testing** checks that a system behaves according to its specification.
-In particular, Bf-Tree should semantically behave like any range index, e.g., a previously inserted record should be found in the future, a deleted record should not be found in the future, etc.
-We use property-based testing to check that Bf-Tree always behaves like the B-tree in Rust's standard library, which is a battle-tested in-memory B-tree implementation.
-Like fuzzing, property-based testing generates random inputs to Bf-Tree and std B-tree and checks that they always return consistent results.
-
-**Shuttle testing**
-Concurrent systems are nondeterministic, and subject to exponential amount of different thread interleaving.
-We use shuttle to deterministically and systematically explore different thread interleaving to uncover the bugs caused by subtle multithread interactions.
+**Shuttle testing**: Concurrent systems are nondeterministic, and subject to exponential amount of different thread interleaving. We use shuttle to deterministically and 
+systematically explore different thread interleaving to uncover the bugs caused by subtle multithread interactions.
 
 ### Code of Conduct
 
@@ -130,5 +123,4 @@ trademarks or logos are subject to those third-party’s policies.
 
 ### Contact
 
-- Badrish Chandramouli (badrishc@microsoft.com)
 - bftree@microsoft.com
