@@ -38,19 +38,13 @@ PRs are accepted and preferred over feature requests. Feel free to reach out if 
 
 ## Developer Guide
 
-### Build & Test
+### Building
 
 #### Prerequisite
 
-Bf-Tree supports Linux, Windows, and macOS, although only a recently version of Linux is rigorously tested.
+Bf-Tree supports Linux, Windows, and macOS, although only a recently version of Linux is rigorously tested. Bf-Tree is written in Rust, which you can install [here](https://rustup.rs).
 
-Bf-Tree is written in Rust, which you can install [here](https://rustup.rs), note that Bf-Tree requires a nightly version of Rust.
-```bash
-curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly
-```
-
-Please kindly install pre-commit hooks to ensure that your code is formatted and linted in the same way as the rest of the project;
-the coding style will be enforced in CI, these hooks act as a pre-filtering to save us some CI cycles.
+Please install pre-commit hooks to ensure that your code is formatted and linted in the same way as the rest of the project; the coding style will be enforced in CI, these hooks act as a pre-filter.
 
 ```bash
 # If on Ubuntu
@@ -64,19 +58,32 @@ pre-commit install
 cargo build --release
 ```
 
-#### Test
+### Testing
+
+#### Unit Tests
 
 ```bash
 cargo test
 ```
 
-#### Concurrency test using [shuttle](https://github.com/awslabs/shuttle)
+#### Shuttle Tests
+
+Concurrent systems are nondeterministic, and subject to exponential amount of different thread interleaving. We use [shuttle](https://github.com/awslabs/shuttle)
+to deterministically and systematically explore different thread interleaving to uncover the bugs caused by subtle multithread interactions.
+
 ```bash
 cargo test --features "shuttle" --release shuttle_bf_tree_concurrent_operations
 ```
 (Takes about 5 minute to run)
 
-#### In-memory benchmark
+#### Fuzz Tests
+
+Fuzz testing is a bug finding technique that generates random inputs to the system and test for crash. Bf-Tree employs fuzzing to generate random operation sequences
+(e.g., insert, read, scan) to the system and check that none of the operation sequence will crash the system or lead to inconsistent state. Check the 
+[fuzz](fuzz/README.md) folder for more details.
+
+
+### Benchmarking
 
 Check the [benchmark](benchmark/README.md) folder for more details.
 
@@ -89,22 +96,6 @@ More advanced benchmarking, with metrics collecting, numa-node binding, huge pag
 ```bash
 env MIMALLOC_SHOW_STATS=1 MIMALLOC_LARGE_OS_PAGES=1 MIMALLOC_RESERVE_HUGE_OS_PAGES_AT=0 numactl --membind=0 --cpunodebind=0 cargo bench --features "metrics-rt" micro
 ```
-
-#### Fuzz testing
-
-Check the [fuzz](fuzz/README.md) folder for more details.
-
-**Fuzzing** is a bug finding technique that generates random inputs to the system and test for crash.
-Bf-Tree employs fuzzing to generate random operation sequences (e.g., insert, read, scan) to the system and check that none of the operation sequence will crash the system or lead to inconsistent state.
-
-**Property-based testing** checks that a system behaves according to its specification.
-In particular, Bf-Tree should semantically behave like any range index, e.g., a previously inserted record should be found in the future, a deleted record should not be found in the future, etc.
-We use property-based testing to check that Bf-Tree always behaves like the B-tree in Rust's standard library, which is a battle-tested in-memory B-tree implementation.
-Like fuzzing, property-based testing generates random inputs to Bf-Tree and std B-tree and checks that they always return consistent results.
-
-**Shuttle testing**
-Concurrent systems are nondeterministic, and subject to exponential amount of different thread interleaving.
-We use shuttle to deterministically and systematically explore different thread interleaving to uncover the bugs caused by subtle multithread interactions.
 
 ### Code of Conduct
 
@@ -130,5 +121,4 @@ trademarks or logos are subject to those third-party’s policies.
 
 ### Contact
 
-- Badrish Chandramouli (badrishc@microsoft.com)
 - bftree@microsoft.com
