@@ -103,7 +103,7 @@ impl<T> RwLock<T> {
 
             let w = self.writer_wake_counter.load(Ordering::Acquire);
             s = self.lock_val.load(Ordering::Relaxed);
-            if s >= 2 {
+            if s >= 2 && s % 2 == 0 {
                 atomic_wait::wait(&self.writer_wake_counter, w);
                 s = self.lock_val.load(Ordering::Relaxed);
             }
