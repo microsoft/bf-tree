@@ -10,9 +10,13 @@ You can find the Bf-Tree research paper [here](https://badrish.net/papers/bftree
 ### Rust
 
 Bf-Tree is written in Rust, and is available as a Rust crate. You can add Bf-Tree to your `Cargo.toml` like this:
+```bash
+$ cargo add bf_tree
+```
+Which will add bf_tree as a dependency to your Cargo.toml
 ```toml
 [dependencies]
-bf-tree = "0.1.0"
+bf-tree = "0.4.0"
 ```
 
 An example use of Bf-Tree:
