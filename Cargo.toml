@@ -1,6 +1,6 @@
 [package]
 name = "bf-tree"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
 license = "MIT"
 description = "Bf-Tree is a modern read-write-optimized concurrent larger-than-memory range index in Rust from Microsoft Research."

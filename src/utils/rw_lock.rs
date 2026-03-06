@@ -43,7 +43,7 @@ impl<T> RwLock<T> {
                 }
             }
 
-            if v % 2 == 1 {
+            if !v.is_multiple_of(2) {
                 atomic_wait::wait(&self.lock_val, v);
                 v = self.lock_val.load(Ordering::Relaxed);
             }
@@ -103,7 +103,7 @@ impl<T> RwLock<T> {
 
             let w = self.writer_wake_counter.load(Ordering::Acquire);
             s = self.lock_val.load(Ordering::Relaxed);
-            if s >= 2 {
+            if s >= 2 && !s.is_multiple_of(2) {
                 atomic_wait::wait(&self.writer_wake_counter, w);
                 s = self.lock_val.load(Ordering::Relaxed);
             }
