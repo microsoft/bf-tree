@@ -339,6 +339,11 @@ impl Config {
         self.leaf_page_size
     }
 
+    /// Returns `true` if the storage backend is in-memory (no file-backed storage).
+    pub fn is_memory_backend(&self) -> bool {
+        self.storage_backend == StorageBackend::Memory
+    }
+
     /// Validate the configuration and report any invalid parameter, if found.
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Sanity check of the input parameters

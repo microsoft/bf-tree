@@ -56,8 +56,7 @@ fn concurrent_ops() {
     for _ in 0..config.thread_cnt {
         let tree_clone = bf_tree.clone();
         let handle = thread::spawn(move || {
-            let mut buffer = Vec::with_capacity(4096);
-            unsafe { buffer.set_len(4096) };
+            let mut buffer = vec![0u8; 4096];
 
             let mut rng = thread_rng();
             let current_tid = thread::current().id();
