@@ -4,7 +4,17 @@
 env MIMALLOC_SHOW_STATS=1 MIMALLOC_LARGE_OS_PAGES=1 MIMALLOC_RESERVE_HUGE_OS_PAGES_AT=0 numactl --membind=0 --cpunodebind=0 cargo bench --features "metrics-rt" micro
 ```
 
-Currently benchmark can only run on Linux.
+Currently, the benchmark can only run on Linux.
+
+## Enable SPDK
+
+Make sure you enable `spdk` in [Cargo.toml](/Cargo.toml) by uncommenting out these lines in that file:
+
+```bash
+spdk-rs = { git = "https://github.com/openebs/spdk-rs.git", branch = "release/2.5", optional = true }
+crossbeam-queue = { version = "0.3.11", optional = true }
+spdk = ["dep:spdk-rs", "dep:crossbeam-queue"]
+```
 
 ## Prerequisites
 
