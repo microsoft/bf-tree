@@ -174,6 +174,19 @@ impl CPRSnapShotMgr {
         static SNAPSHOT_THREAD_VERSION: AtomicU64 = AtomicU64::new(INVALID_SNAPSHOT_VERSION);
     }
 
+    pub fn are_all_threads_in_next_version(&self) -> bool {
+        if !self.snapshot_in_progress.load(Ordering::Acquire) {
+            return false;
+        } else {
+            let global_phase_id = self.get_global_phase_id();
+            if global_phase_id == 3 || global_phase_id == 0 {
+                return true;
+            } else {
+                return false;
+            }
+        }
+    }
+
     pub fn get_snapshot_thread_id() -> Result<usize, ()> {
         let tid = Self::SNAPSHOT_THREAD_ID.with(|id| id.load(Ordering::Relaxed));
         if tid == INVALID_SNAPSHOT_THREAD_ID {
@@ -1364,6 +1377,7 @@ impl CPRSnapShotMgr {
 }
 
 impl BfTree {
+    /// Take a new CPR snapshot
     pub fn cpr_snapshot(&self) {
         if !self.config.use_snapshot {
             panic!("Snapshots are not enabled in the configuration");
@@ -1373,6 +1387,8 @@ impl BfTree {
         snpshot_mgr.snapshot(self);
     }
 
+    
+    /// Recover a BfTree from a CPR snapshot
     pub fn new_from_cpr_snapshot(
         recovery_snapshot_file_path: PathBuf, //  The snapshot file to recover from
         use_snapshot: bool,
@@ -1387,6 +1403,12 @@ impl BfTree {
             buffer_ptr,
             buffer_size,
         )
+    }
+
+    /// Check if all threads are running in the next version of the current snapshot
+    pub fn are_all_threads_in_next_version(&self) -> bool {
+        let snpshot_mgr = self.snapshot_mgr.clone().unwrap();
+        snpshot_mgr.are_all_threads_in_next_version()
     }
 }
 
