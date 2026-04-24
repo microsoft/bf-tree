@@ -17,6 +17,7 @@ use crate::{
     fs::{MemoryVfs, StdVfs, VfsImpl},
     mini_page_op::{LeafEntrySLocked, LeafEntryXLocked},
     nodes::{LeafNode, PageID},
+    snapshot::CPRSnapShotMgr,
     utils::{rw_lock::RwLock, MappingTable},
     Config, StorageBackend,
 };
@@ -75,15 +76,21 @@ impl<'a> Iterator for PageTableIter<'a> {
 pub(crate) struct PageTable {
     table: MappingTable<RwLock<PageLocation>>,
     vfs: Arc<dyn VfsImpl>,
+    snapshot_mgr: Option<Arc<CPRSnapShotMgr>>,
     pub(crate) config: Arc<Config>,
 }
 
 impl PageTable {
-    fn new(file_handle: Arc<dyn VfsImpl>, config: Arc<Config>) -> Self {
+    fn new(
+        file_handle: Arc<dyn VfsImpl>,
+        config: Arc<Config>,
+        snapshot_mgr: Option<Arc<CPRSnapShotMgr>>,
+    ) -> Self {
         let mapping = MappingTable::default();
         Self {
             table: mapping,
             vfs: file_handle,
+            snapshot_mgr,
             config,
         }
     }
@@ -92,11 +99,13 @@ impl PageTable {
         mapping: impl Iterator<Item = (PageID, PageLocation)>,
         vfs: Arc<dyn VfsImpl>,
         config: Arc<Config>,
+        snapshot_mgr: Option<Arc<CPRSnapShotMgr>>,
     ) -> Self {
         let mapping = mapping.map(|(pid, loc)| (pid.as_id(), RwLock::new(loc)));
         Self {
             table: MappingTable::new_from_iter(mapping),
             vfs,
+            snapshot_mgr,
             config,
         }
     }
@@ -120,10 +129,10 @@ impl PageTable {
         let v = v.write();
         LeafEntryXLocked::new(
             v,
-            #[cfg(feature = "tracing")]
             *pid,
             self.vfs.as_ref(),
             self.config.leaf_page_size,
+            self.snapshot_mgr.clone(),
         )
     }
 
@@ -140,10 +149,10 @@ impl PageTable {
         let x_locked = LeafEntryXLocked::with_buffer(
             lock_guard,
             self.vfs.as_ref(),
-            #[cfg(feature = "tracing")]
             pid,
             self.config.leaf_page_size,
             base_ptr,
+            self.snapshot_mgr.clone(),
         );
         LeafNode::free_base_page(base_ptr);
 
@@ -172,10 +181,10 @@ impl PageTable {
 
         let x_locked = LeafEntryXLocked::new(
             lock_guard,
-            #[cfg(feature = "tracing")]
             pid,
             self.vfs.as_ref(),
             self.config.leaf_page_size,
+            self.snapshot_mgr.clone(),
         );
 
         (pid, x_locked)
@@ -194,9 +203,13 @@ impl Drop for LeafStorage {
 }
 
 impl LeafStorage {
-    pub(crate) fn new(config: Arc<Config>, buffer_ptr: Option<*mut u8>) -> Self {
+    pub(crate) fn new(
+        config: Arc<Config>,
+        buffer_ptr: Option<*mut u8>,
+        snapshot_mgr: Option<Arc<CPRSnapShotMgr>>,
+    ) -> Self {
         let vfs: Arc<dyn VfsImpl> = make_vfs(&config.storage_backend, &config.file_path);
-        let page_table = PageTable::new(vfs.clone(), config.clone());
+        let page_table = PageTable::new(vfs.clone(), config.clone(), snapshot_mgr);
         let circular_buffer = CircularBuffer::new(
             config.cb_size_byte,
             config.cb_copy_on_access_ratio,
@@ -330,6 +343,13 @@ impl LeafStorage {
             true,
         );
 
+        // Ensure snapshot version does not change
+        let dst_ref = unsafe { &mut *(new_page.as_ptr() as *mut LeafNode) };
+        dst_ref.set_snapshot_version(
+            unsafe { &mut *(mini_page_ptr) }.get_snapshot_version(),
+            false,
+        );
+
         self.circular_buffer.dealloc(mini_page);
         unsafe {
             debug_assert!(
@@ -408,6 +428,7 @@ mod tests {
             table: MappingTable::new(1024),
             vfs: vfs.clone(),
             config: config.clone(),
+            snapshot_mgr: None,
         };
 
         let mut allocated = Vec::new();
@@ -428,7 +449,7 @@ mod tests {
             (pid, loc.clone())
         });
 
-        let recovered = PageTable::new_from_mapping(pt_iter, vfs.clone(), config.clone());
+        let recovered = PageTable::new_from_mapping(pt_iter, vfs.clone(), config.clone(), None);
 
         for (a, b) in allocated.iter().zip(recovered.iter()) {
             assert_eq!(a.0, b.1);

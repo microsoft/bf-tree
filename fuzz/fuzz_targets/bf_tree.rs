@@ -45,7 +45,10 @@ fuzz_target!(|methods: Vec<Methods>| {
     };
     let tmp_dir = env::temp_dir();
     let tmp_file_path = tmp_dir.join(format!("bf_tree_fuzz_{pid}_{tid}.db"));
+    let snapshot_file_path = tmp_dir.join(format!("bf_tree_fuzz_snapshot_{pid}_{tid}.cpr"));
     let mut config = Config::new(&tmp_file_path, 8192);
+    config.snapshot_file_path(snapshot_file_path.clone());
+    config.use_snapshot(true);
     config.storage_backend(bf_tree::StorageBackend::Std);
     let bf_tree = BfTree::with_config(config.clone(), None).unwrap();
 
@@ -120,9 +123,17 @@ fuzz_target!(|methods: Vec<Methods>| {
         }
     }
 
-    bf_tree.snapshot();
+    bf_tree.cpr_snapshot();
     drop(bf_tree);
-    let bf_tree = BfTree::new_from_snapshot(config.clone(), None).unwrap();
+    let bf_tree = BfTree::new_from_cpr_snapshot(
+        snapshot_file_path.clone(), //  The snapshot file to recover from
+        false,
+        None, // The snapshot file of the newly recovered Bf-tree
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     for k in std_btree.iter() {
         let bf_v = bf_tree.read(k, &mut buffer);

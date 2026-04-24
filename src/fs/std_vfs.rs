@@ -80,4 +80,10 @@ impl VfsImpl for StdVfs {
         counter!(IOWriteRequest);
         self.file.seek_write(buf, offset as u64).unwrap();
     }
+
+    fn reset(&self) {
+        assert!(self.file.set_len(0).is_ok());
+        let offset = self.file.metadata().unwrap().len();
+        self.offset_alloc.reset(offset as usize);
+    }
 }

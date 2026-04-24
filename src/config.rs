@@ -14,6 +14,7 @@ use crate::{
         leaf_node::LeafKVMeta, LeafNode, CACHE_LINE_SIZE, DISK_PAGE_SIZE, MAX_KEY_LEN,
         MAX_LEAF_PAGE_SIZE,
     },
+    snapshot::BfTreeMeta,
 };
 use serde::Deserialize;
 use std::sync::atomic::AtomicUsize;
@@ -36,6 +37,7 @@ pub struct Config {
     pub(crate) read_promotion_rate: AtomicUsize,
     pub(crate) scan_promotion_rate: AtomicUsize,
     pub(crate) storage_backend: StorageBackend,
+    pub(crate) snapshot_backend: StorageBackend,
     pub(crate) cb_size_byte: usize,
     pub(crate) cb_min_record_size: usize,
     pub(crate) cb_max_record_size: usize,
@@ -45,6 +47,9 @@ pub struct Config {
     pub(crate) cb_copy_on_access_ratio: f64,
     pub(crate) read_record_cache: bool,
     pub(crate) file_path: PathBuf,
+    pub(crate) use_snapshot: bool,
+    pub(crate) snapshot_version: u64,
+    pub(crate) snapshot_file_path: PathBuf,
     pub(crate) max_mini_page_size: usize,
     pub(crate) mini_page_binary_search: bool,
     pub(crate) write_ahead_log: Option<Arc<WalConfig>>,
@@ -55,9 +60,12 @@ pub struct Config {
 impl Clone for Config {
     fn clone(&self) -> Self {
         Self {
+            snapshot_version: self.snapshot_version,
             read_promotion_rate: AtomicUsize::new(self.read_promotion_rate.load(Ordering::Relaxed)),
             scan_promotion_rate: AtomicUsize::new(self.scan_promotion_rate.load(Ordering::Relaxed)),
             storage_backend: self.storage_backend.clone(),
+            snapshot_backend: self.snapshot_backend.clone(),
+            use_snapshot: self.use_snapshot,
             cb_size_byte: self.cb_size_byte,
             cb_min_record_size: self.cb_min_record_size,
             cb_max_record_size: self.cb_max_record_size,
@@ -67,6 +75,7 @@ impl Clone for Config {
             cb_copy_on_access_ratio: self.cb_copy_on_access_ratio,
             read_record_cache: self.read_record_cache,
             file_path: self.file_path.clone(),
+            snapshot_file_path: self.snapshot_file_path.clone(),
             max_mini_page_size: self.max_mini_page_size,
             mini_page_binary_search: self.mini_page_binary_search,
             write_ahead_log: self.write_ahead_log.clone(),
@@ -100,6 +109,9 @@ pub struct ConfigFile {
     pub(crate) cb_max_key_len: usize,
     pub(crate) leaf_page_size: usize,
     pub(crate) index_file_path: String,
+    pub(crate) snapshot_file_path: String,
+    pub(crate) use_snapshot: bool,
+    pub(crate) snapshot_version: u64,
     pub(crate) backend_storage: String,
     pub(crate) read_promotion_rate: usize,
     pub(crate) write_load_full_page: bool,
@@ -122,8 +134,10 @@ impl Default for Config {
         };
 
         Self {
+            snapshot_version: 0,
             read_promotion_rate: AtomicUsize::new(read_promotion_rate),
             scan_promotion_rate: AtomicUsize::new(scan_promotion_rate),
+            use_snapshot: false,
             cb_size_byte: DEFAULT_CIRCULAR_BUFFER_SIZE,
             cb_min_record_size: DEFAULT_MIN_RECORD_SIZE,
             cb_max_record_size: DEFAULT_MAX_RECORD_SIZE,
@@ -136,9 +150,11 @@ impl Default for Config {
             max_mini_page_size: DEFAULT_MAX_MINI_PAGE_SIZE,
             mini_page_binary_search: true,
             storage_backend: StorageBackend::Memory,
+            snapshot_backend: StorageBackend::Std,
             write_ahead_log: None,
             write_load_full_page: true,
             cache_only: false,
+            snapshot_file_path: PathBuf::from("targets/snapshot"),
         }
     }
 }
@@ -183,8 +199,10 @@ impl Config {
 
         // Return the config
         Self {
+            snapshot_version: config_file.snapshot_version,
             read_promotion_rate: AtomicUsize::new(config_file.read_promotion_rate),
             scan_promotion_rate: AtomicUsize::new(scan_promotion_rate),
+            use_snapshot: config_file.use_snapshot,
             cb_size_byte: config_file.cb_size_byte,
             cb_min_record_size: config_file.cb_min_record_size,
             cb_max_record_size: config_file.cb_max_record_size,
@@ -193,14 +211,41 @@ impl Config {
             max_fence_len: config_file.cb_max_key_len * 2,
             cb_copy_on_access_ratio: DEFAULT_COPY_ON_ACCESS_RATIO,
             file_path: PathBuf::from(config_file.index_file_path),
+            snapshot_file_path: PathBuf::from(config_file.snapshot_file_path),
             read_record_cache: true,
             max_mini_page_size: DEFAULT_MAX_MINI_PAGE_SIZE,
             mini_page_binary_search: true,
             storage_backend: storage,
+            snapshot_backend: StorageBackend::Std,
             write_ahead_log: None,
             write_load_full_page: config_file.write_load_full_page,
             cache_only: config_file.cache_only,
         }
+    }
+
+    // Create a new config file from the metadata of a snapshot
+    pub(crate) fn new_from_snapshot(meta: &BfTreeMeta) -> Self {
+        let mut config = Self::default();
+
+        // Load config from the snapshot metadata
+        config
+            .snapshot_version(meta.snapshot_version + 1)
+            .cache_only(meta.cache_only)
+            .read_promotion_rate(meta.read_promotion_rate)
+            .scan_promotion_rate(meta.scan_promotion_rate)
+            .cb_min_record_size(meta.cb_min_record_size)
+            .cb_max_record_size(meta.cb_max_record_size)
+            .leaf_page_size(meta.leaf_page_size)
+            .cb_max_key_len(meta.cb_max_key_len)
+            .max_fence_len(meta.max_fence_len)
+            .cb_copy_on_access_ratio(meta.cb_copy_on_access_ratio)
+            .read_record_cache(meta.read_record_cache)
+            .max_mini_page_size(meta.max_mini_page_size)
+            .mini_page_binary_search(meta.mini_page_binary_search)
+            .write_load_full_page(meta.write_load_full_page)
+            .cb_size_byte(meta.cb_size_byte);
+
+        config
     }
 
     /// Default: Std
@@ -212,11 +257,29 @@ impl Config {
         self
     }
 
+    pub fn write_load_full_page(&mut self, load_full_page: bool) -> &mut Self {
+        self.write_load_full_page = load_full_page;
+        self
+    }
+
+    /// Default: Std
+    ///
+    /// Override the storage backend used for snapshot files.
+    pub fn snapshot_backend(&mut self, backend: StorageBackend) -> &mut Self {
+        self.snapshot_backend = backend;
+        self
+    }
+
     /// Default: 30
     ///
     /// prob% of chance that a **page** will be promoted to buffer during scan operations.
     pub fn scan_promotion_rate(&mut self, prob: usize) -> &mut Self {
         self.scan_promotion_rate.store(prob, Ordering::Relaxed);
+        self
+    }
+
+    pub fn max_fence_len(&mut self, len: usize) -> &mut Self {
+        self.max_fence_len = len;
         self
     }
 
@@ -301,6 +364,23 @@ impl Config {
 
     pub fn file_path<P: AsRef<Path>>(&mut self, file_path: P) -> &mut Self {
         self.file_path = file_path.as_ref().to_path_buf();
+        self
+    }
+
+    pub fn snapshot_file_path<P: AsRef<Path>>(&mut self, file_path: P) -> &mut Self {
+        self.snapshot_file_path = file_path.as_ref().to_path_buf();
+        self
+    }
+
+    /// Default: false
+    pub fn use_snapshot(&mut self, use_snapshot: bool) -> &mut Self {
+        self.use_snapshot = use_snapshot;
+        self
+    }
+
+    /// Default: 0
+    pub fn snapshot_version(&mut self, snapshot_version: u64) -> &mut Self {
+        self.snapshot_version = snapshot_version;
         self
     }
 
@@ -467,6 +547,15 @@ impl Config {
             return Err(ConfigError::CircularBufferSize(
                 "In non cache-only mode, cb_size_byte should be at least 2 times of leaf_page_size"
                     .to_string(),
+            ));
+        }
+
+        if self.use_snapshot
+            && self.file_path == self.snapshot_file_path
+            && self.snapshot_file_path != PathBuf::new()
+        {
+            return Err(ConfigError::SnapshotFileInvalid(
+                "snapshot file path should not be the same as the main file path".to_string(),
             ));
         }
 

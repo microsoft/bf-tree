@@ -182,6 +182,7 @@ impl NodeInfo {
     }
 }
 
+/// This BFS-ordered iterator assumes the tree structure does not change during the iteration.  
 /// Visit the BfTree nodes in a BFS manner.
 pub(crate) struct BfsVisitor<'a> {
     _tree: &'a BfTree,
