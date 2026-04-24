@@ -333,7 +333,8 @@ impl InnerNode {
 
             // If prefix compare is the same, we need to compare the full key.
             if cmp == Ordering::Equal
-                && (key_meta.key_len > InnerKVMeta::KEY_LOOK_AHEAD_SIZE as u16)
+                && ((key_meta.key_len > InnerKVMeta::KEY_LOOK_AHEAD_SIZE as u16)
+                    || !search_key_postfix.is_empty())
             {
                 let rest_key = self.get_post_key_ref(key_meta);
                 cmp = rest_key.cmp(search_key_postfix);

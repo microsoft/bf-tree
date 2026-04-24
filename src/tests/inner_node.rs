@@ -16,16 +16,19 @@ enum InnerTestOp {
     Read,
 }
 
-fn inner_insert_read(input: Vec<(Vec<u8>, u64, InnerTestOp)>) {
-    let mut model = HashMap::<Vec<u8>, PageID>::new();
-
+fn make_inner_node() -> *mut InnerNode {
     let test_vfs = TestVfs::new();
     let mut inner_builder = InnerNodeBuilder::new();
     inner_builder
         .set_disk_offset(DiskOffsetGuard::new(0, &test_vfs))
         .set_children_is_leaf(true)
         .set_left_most_page_id(PageID::new(0));
-    let inner = unsafe { &mut *inner_builder.build() };
+    inner_builder.build()
+}
+
+fn inner_insert_read(input: Vec<(Vec<u8>, u64, InnerTestOp)>) {
+    let mut model = HashMap::<Vec<u8>, PageID>::new();
+    let inner = unsafe { &mut *(make_inner_node()) };
 
     for (k, v, op) in input.iter() {
         match op {
@@ -112,4 +115,33 @@ fn test_inner_insert_read() {
         }
     }
     // runner.run(&strategy, test).unwrap();
+}
+
+#[test]
+fn test_inner_lower_bound_with_same_prefix() {
+    let inner = unsafe { &mut *make_inner_node() };
+
+    assert!(inner.insert(b"bbbb", PageID::from_id(1)));
+    assert!(inner.insert(b"test", PageID::from_id(2)));
+    assert!(inner.insert(b"teste", PageID::from_id(3)));
+
+    let pos = inner.lower_bound(b"teste");
+    let meta = inner.get_kv_meta(pos as u16);
+    assert_eq!(inner.get_full_key(meta), b"teste");
+    assert_eq!(inner.get_value(meta), PageID::from_id(3));
+
+    let pos = inner.lower_bound(b"test");
+    let meta = inner.get_kv_meta(pos as u16);
+    assert_eq!(inner.get_full_key(meta), b"test");
+    assert_eq!(inner.get_value(meta), PageID::from_id(2));
+
+    let pos = inner.lower_bound(b"aaaa");
+    assert_eq!(pos, 0);
+
+    let pos = inner.lower_bound(b"testz");
+    let meta = inner.get_kv_meta(pos as u16);
+    assert_eq!(inner.get_full_key(meta), b"teste");
+    assert_eq!(inner.get_value(meta), PageID::from_id(3));
+
+    InnerNode::free_node(inner);
 }
