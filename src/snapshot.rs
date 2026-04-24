@@ -25,7 +25,7 @@ use std::sync::atomic::AtomicUsize;
 use thread_local::ThreadLocal;
 
 use crate::{
-    circular_buffer::{CircularBuffer},
+    circular_buffer::CircularBuffer,
     error::ConfigError,
     fs::VfsImpl,
     mini_page_op::LeafOperations,
@@ -34,7 +34,8 @@ use crate::{
     storage::{make_vfs, LeafStorage, PageLocation, PageTable},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     utils::{get_rng, inner_lock::ReadGuard, BfsVisitor, NodeInfo},
-    BfTree, Config, StorageBackend,
+    wal::{LogEntry, LogEntryImpl, WriteAheadLog},
+    BfTree, Config, StorageBackend, WalConfig, WalReader,
 };
 
 const BF_TREE_MAGIC_BEGIN: &[u8; 16] = b"BF-TREE-V0-BEGIN";
@@ -42,16 +43,24 @@ const BF_TREE_MAGIC_END: &[u8; 14] = b"BF-TREE-V0-END";
 const META_DATA_PAGE_OFFSET: usize = 0;
 
 const INVALID_SNAPSHOT_THREAD_ID: usize = usize::MAX; // Invalid thread slot id
-const NULL_PAGE_LOCATION_OFFSET: usize = usize::MAX;
+const NULL_PAGE_LOCATION_OFFSET: usize = usize::MAX; // Special page loc offset for a Null page
 const INVALID_SNAPSHOT_STATE: u64 = u64::MAX; // Invalid snapshot state
 pub const INVALID_SNAPSHOT_VERSION: u64 = u64::MAX; // Invalid snapshot version
 const DEFAULT_MAX_SNAPSHOT_THREAD_NUM: usize = 256; // Maximum numbers of concurrent threads in Bf-tree, if snapshot is enabled.
 const SNAPSHOT_STATE_PHASE_ID_SHIFT: usize = 61; // Number of bits to shift for phase id
 const SNAPSHOT_STATE_PHASE_NUM: u64 = 4; // There are 4 snapshot phases
-const SNAPSHOT_STATE_PHASE_ID_MASK: u64 = 0b111 << SNAPSHOT_STATE_PHASE_ID_SHIFT; // Most significant 3 bits for phase id
+const SNAPSHOT_STATE_PHASE_ID_MASK: u64 = 0b111 << SNAPSHOT_STATE_PHASE_ID_SHIFT; // Most significant 3 bits for phase id (allowing up to 8 phases)
 const SNAPSHOT_STATE_VERSION_MASK: u64 = (1 << SNAPSHOT_STATE_PHASE_ID_SHIFT) - 1; // Least significant 61 bits for version number
 
-/// A simplified CRP snapshot of a Bf-Tree without the epoch framework.
+/// A simplified CPR snapshot of a Bf-Tree.
+/// For details, see the original CPR paper.
+/// When compared to the original CPR paper, the following simplifications were made:
+/// 1. No epoch framework, global state machine only.
+/// 2. No 2PL and partial execution of read/upsert/delete/ in one version allowed
+///    E.g., a bf-tree upsert operation requires a series of mini-transcational modifications m_0..m_n.
+///    We do not lock all m(s) beforehand. Also, we allow the operation to restart if at m_i CPR detects
+///    a version inconsistency (PREPARE/v thread seeing a (v+1) record). This is OK for bf-tree
+///    because all m(s) are independent even though a m_i could involve multiple page modifications.
 pub struct CPRSnapShotMgr {
     // Snapshot state
     // | 3 bits   |     61 bits    |
@@ -62,7 +71,7 @@ pub struct CPRSnapShotMgr {
     // Thread-level snapshot state
     thread_local_states: [AtomicU64; DEFAULT_MAX_SNAPSHOT_THREAD_NUM],
     // Mappings of base/mini/inner nodes to their corresponding snapshot file offsets.
-    // Each user thread updates its own mappings asyncrhonously.
+    // Each user thread updates its own mappings asyncrhonously and get merged in the end.
     thread_local_inner_mappings:
         UnsafeCell<[Vec<(*const InnerNode, usize)>; DEFAULT_MAX_SNAPSHOT_THREAD_NUM]>,
     thread_local_base_mappings: UnsafeCell<[Vec<(PageID, usize)>; DEFAULT_MAX_SNAPSHOT_THREAD_NUM]>,
@@ -77,6 +86,11 @@ pub struct CPRSnapShotMgr {
     snapshot_in_progress: AtomicBool,
 }
 
+unsafe impl Sync for CPRSnapShotMgr {}
+
+unsafe impl Send for CPRSnapShotMgr {}
+
+/// Within the life time of this guard, bf-tree transactions are protected by CPR logic.
 pub struct CPRSnapshotGuard {
     snapshot_mgr: Option<Arc<CPRSnapShotMgr>>,
     thread_slot_id: usize,
@@ -85,12 +99,10 @@ pub struct CPRSnapshotGuard {
 impl CPRSnapshotGuard {
     pub fn new(snapshot_mgr: Option<Arc<CPRSnapShotMgr>>) -> Result<Self, ()> {
         match snapshot_mgr {
-            None => {
-                return Ok(Self {
-                    snapshot_mgr: None,
-                    thread_slot_id: INVALID_SNAPSHOT_THREAD_ID,
-                });
-            }
+            None => Ok(Self {
+                snapshot_mgr: None,
+                thread_slot_id: INVALID_SNAPSHOT_THREAD_ID,
+            }),
             Some(ref mgr) => {
                 let thread_slot_id = mgr
                     .reserve_thread_slot()
@@ -168,22 +180,18 @@ impl CPRSnapShotMgr {
     // Each user thread is assigned an unique snapshot thread id and local snapshot version
     // for each bf-tree transaction (node split/insert/create), if snapshot is enabled.
     thread_local! {
-        static SNAPSHOT_THREAD_ID: AtomicUsize = AtomicUsize::new(INVALID_SNAPSHOT_THREAD_ID);
+        static SNAPSHOT_THREAD_ID: AtomicUsize = const { AtomicUsize::new(INVALID_SNAPSHOT_THREAD_ID) };
         // For snapshot thread with valid snapshot_thread_id, its version is already contained in thread_local_states.
         // But we keep an extra copy here for easier access.
-        static SNAPSHOT_THREAD_VERSION: AtomicU64 = AtomicU64::new(INVALID_SNAPSHOT_VERSION);
+        static SNAPSHOT_THREAD_VERSION: AtomicU64 = const { AtomicU64::new(INVALID_SNAPSHOT_VERSION) };
     }
 
     pub fn are_all_threads_in_next_version(&self) -> bool {
         if !self.snapshot_in_progress.load(Ordering::Acquire) {
-            return false;
+            false
         } else {
             let global_phase_id = self.get_global_phase_id();
-            if global_phase_id == 3 || global_phase_id == 0 {
-                return true;
-            } else {
-                return false;
-            }
+            global_phase_id == 3 || global_phase_id == 0
         }
     }
 
@@ -296,6 +304,7 @@ impl CPRSnapShotMgr {
         (state & SNAPSHOT_STATE_PHASE_ID_MASK) >> SNAPSHOT_STATE_PHASE_ID_SHIFT
     }
 
+    /// Move the global snapshot stable to the next one.
     fn advance_global_state(&self) -> u64 {
         let phase_id = self.get_global_phase_id();
         let version = self.get_global_version();
@@ -320,7 +329,7 @@ impl CPRSnapShotMgr {
                 new_state
             }
             3 => {
-                // (SWEEPING, v + 1) -> (FINISHING, v + 1)
+                // (SWEEPING, v + 1) -> (REST, v + 1)
                 let new_state = Self::new_snapshot_state(0, version);
                 self.global_state.store(new_state, Ordering::Release);
                 new_state
@@ -368,7 +377,12 @@ impl CPRSnapShotMgr {
                 // If the global state has changed, reset
                 // This is to guarantee that as soon as global state rolls to the next one,
                 // all new local states will either be reversed without further action or in the new state.
-                if self.get_local_state(&tid) != global_state {
+                // Otherwise something bad could happen as described below:
+                // T1: state = global phase 'x'
+                // Mgr: global phase <- 'x + 1'
+                // Mrgr: all threads in phase 'x + 1' or invalid -> Execute 'x + 1' action
+                // T1: local state = state <- Inconsistency with global state
+                if self.get_local_state(&tid) != self.global_state.load(Ordering::Acquire) {
                     self.set_local_state(&tid, INVALID_SNAPSHOT_STATE);
                     assert!(self.thread_slots[tid]
                         .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
@@ -393,10 +407,7 @@ impl CPRSnapShotMgr {
         self.set_local_state(&thread_slot_id, INVALID_SNAPSHOT_STATE);
         self.thread_slots[thread_slot_id].store(false, Ordering::Release);
 
-        Self::set_snapshot_thread_tls(
-            INVALID_SNAPSHOT_THREAD_ID,
-            INVALID_SNAPSHOT_STATE & SNAPSHOT_STATE_VERSION_MASK,
-        );
+        Self::set_snapshot_thread_tls(INVALID_SNAPSHOT_THREAD_ID, INVALID_SNAPSHOT_VERSION);
     }
 
     pub fn get_snapshot_guard(
@@ -407,8 +418,8 @@ impl CPRSnapShotMgr {
 
     /// Snapshot a page to the current snapshot file and return its offset in the file.
     /// The invoker needs to guarantee that the page to be copied is xlocked
-    /// throughput the lifetime of this function.
-    /// Also the invoker needs to guarantee proper alignment of ptr which could required
+    /// throughout the lifetime of this function.
+    /// Also the invoker needs to guarantee proper alignment of ptr which could be required
     /// by the underlying vfs. (E.g., io_uring_vfs requires 512B alignment)
     pub fn snapshot_page(&self, ptr: &[u8], size: usize) -> usize {
         // Allocate space in the snapshot file
@@ -441,10 +452,10 @@ impl CPRSnapShotMgr {
         let mini_mappings = unsafe { &mut *self.thread_local_mini_mappings.get() };
         let tid = Self::get_snapshot_thread_id()
             .expect("Snapshot of page triggered by unregistered thread.");
-        mini_mappings[tid].push((id.clone(), offset));
+        mini_mappings[tid].push((id, offset));
 
         let mini_size_mappings = unsafe { &mut *self.thread_local_mini_size_mappings.get() };
-        mini_size_mappings[tid].push((id.clone(), size));
+        mini_size_mappings[tid].push((id, size));
     }
 
     pub fn snapshot_base_page(&self, id: PageID, ptr: &[u8], size: usize) {
@@ -452,8 +463,8 @@ impl CPRSnapShotMgr {
 
         let base_mappings = unsafe { &mut *self.thread_local_base_mappings.get() };
         let tid = Self::get_snapshot_thread_id()
-            .expect("Snapshot of page triggered by unregistered thread.");
-        base_mappings[tid].push((id.clone(), offset));
+            .expect("Snapshot of page triggered by unregistereds thread.");
+        base_mappings[tid].push((id, offset));
     }
 
     pub fn snapshot_root_page(&self, root_id: PageID) {
@@ -461,7 +472,7 @@ impl CPRSnapShotMgr {
     }
 
     /// Sweep through all data pages and take snapshots of those
-    /// whose version is less than or equal to the current snapshot version.
+    /// whose version is less than the passed-in snapshot version.
     fn sweep(
         &self,
         tree: &BfTree,
@@ -479,11 +490,13 @@ impl CPRSnapShotMgr {
         // Phase 1: Block all snapshot id reservation, drain the thread table.
         // Phase 2: Traverse the tree and take snapshots of inner nodes whose version is < 'version'.
         // Phase 3: Unblock snapshot id reservation.
-        // TODO: A better approach to scan all inner nodes.
+        // Given that there are usually a very limited number of inner nodes, user workload should be affected minimally.
+        // TODO: A complete block-free approach to scan all inner nodes.
         self.pause_snapshot.store(true, Ordering::Release);
         loop {
             if self.check_if_phase_completed(INVALID_SNAPSHOT_STATE) {
-                // Root node
+                // Upon reaching here, no user threads can obtain a snapshot id nor making changes to the tree structure.
+                // We sweep the root node first
                 loop {
                     let root_id = tree.get_root_page();
                     let rid = root_id.0;
@@ -536,7 +549,7 @@ impl CPRSnapShotMgr {
                     } else {
                         // Inner
                         let ptr = rid.as_inner_node();
-                        // No need for WriteGuard as the tree structured is frozen and there is no other WriteGuard active.
+                        // No need for WriteGuard as the tree structured is frozen and there are no active writers.
                         let inner = match ReadGuard::try_read(ptr) {
                             Ok(inner) => inner,
                             Err(_) => continue,
@@ -558,7 +571,7 @@ impl CPRSnapShotMgr {
                     loop {
                         match node {
                             NodeInfo::Inner { ptr, .. } => {
-                                // No need for WriteGuard as the tree structured is frozen and there is no other WriteGuard active.
+                                // No need for WriteGuard as the tree structured is frozen and there are no active writers.
                                 let inner = match ReadGuard::try_read(ptr) {
                                     Ok(inner) => inner,
                                     Err(_) => continue,
@@ -574,10 +587,7 @@ impl CPRSnapShotMgr {
                                 break;
                             }
                             NodeInfo::Leaf { level, .. } => {
-                                // corner case: we might still get a leaf node when the root is leaf...
-                                //
-                                // When ROOT is leaf, it is in `FORCE` mode, meaning that all data are write to disk.
-                                // do don't need to do anything here.
+                                // This should have been captured by the case when root node is a leaf
                                 assert_eq!(level, 0);
                                 break;
                             }
@@ -590,6 +600,7 @@ impl CPRSnapShotMgr {
             // At most wasting 1 second per state transition.
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+        // Resume workload
         self.pause_snapshot.store(false, Ordering::Release);
 
         // In SWEEPING phase, there will be no new disk pages with v < 'version' being created. As such,
@@ -620,6 +631,7 @@ impl CPRSnapShotMgr {
                     }
                 }
                 PageLocation::Full(ptr) => {
+                    // We snapshot Full page as a disk page to reduce some complexity as they are equivalent.
                     let full_ref = leaf.load_cache_page(*ptr);
                     if full_ref.get_snapshot_version() < version {
                         let full_ptr = unsafe {
@@ -646,8 +658,9 @@ impl CPRSnapShotMgr {
                         mini_size_mapping.push((pid, mini_ref.meta.node_size as usize));
 
                         if !tree.cache_only {
+                            // In disk-mode, the base page of mini-page is part of the snapshot as well.
                             let base_ref = leaf.load_base_page(mini_ref.next_level.as_offset());
-                            assert!(base_ref.get_snapshot_version() < version);
+                            assert!(base_ref.get_snapshot_version() < version); // disk page's version should never be greater than its mini-page's.
 
                             let base_ptr = unsafe {
                                 std::slice::from_raw_parts(
@@ -663,6 +676,11 @@ impl CPRSnapShotMgr {
                 }
                 PageLocation::Null => {
                     assert!(tree.cache_only);
+                    // In cache-only mode, an entry in page table could be Null when the corresponding mini-page is evicted.
+                    // The Null page is also snapshotted with a special marker.
+                    // Note that, the underlying assumption here is that Null page is always of an older version which may not be true.
+                    // To reconcille with the CPR semantics, we say that any data page in cache-only mode could be either Null or a valid page.
+                    // TODO: version the Null pages.
                     mini_mapping.push((pid, NULL_PAGE_LOCATION_OFFSET)); // Special marker
                     mini_size_mapping.push((pid, 0));
                 }
@@ -672,21 +690,24 @@ impl CPRSnapShotMgr {
         enumerate_leaf_count
     }
 
-    // Finalize the snapshot file and reset the snapshotmgr's internal data.s
+    /// Finalize the snapshot file and reset the snapshotmgr's internal data.
+    #[allow(clippy::too_many_arguments)]
     fn finalize(
         &self,
         snapshot_version: u64,
-        inner_mapping: &mut Vec<(*const InnerNode, usize)>,
-        mini_mapping: &mut Vec<(PageID, usize)>,
-        mini_size_mapping: &mut Vec<(PageID, usize)>,
-        base_mapping: &mut Vec<(PageID, usize)>,
+        inner_mapping: &mut [(*const InnerNode, usize)],
+        mini_mapping: &mut [(PageID, usize)],
+        mini_size_mapping: &mut [(PageID, usize)],
+        base_mapping: &mut [(PageID, usize)],
         leaf_count_upper: usize,
         config: Arc<Config>,
     ) {
+        // There could be duplicate leaf/inner node mappings and we use a hash map to de-duplicate them.
         let mut inner_mapping_unique: HashMap<*const InnerNode, usize> = HashMap::new();
         let mut mini_mapping_unique: HashMap<PageID, usize> = HashMap::new();
         let mut mini_size_mapping_unique: HashMap<PageID, usize> = HashMap::new();
         let mut base_mapping_unique: HashMap<PageID, usize> = HashMap::new();
+
         let local_inner_mappings = unsafe { &mut *self.thread_local_inner_mappings.get() };
         let local_mini_mappings = unsafe { &mut *self.thread_local_mini_mappings.get() };
         let local_mini_size_mappings = unsafe { &mut *self.thread_local_mini_size_mappings.get() };
@@ -695,22 +716,20 @@ impl CPRSnapShotMgr {
         // De-duplicate mappings among snapshot threads
         for thread_slot_id in 0..DEFAULT_MAX_SNAPSHOT_THREAD_NUM {
             for m in local_inner_mappings[thread_slot_id].iter() {
-                if !inner_mapping_unique.contains_key(&m.0) {
-                    inner_mapping_unique.insert(m.0, m.1);
-                }
+                inner_mapping_unique.entry(m.0).or_insert(m.1);
             }
             for m in local_mini_mappings[thread_slot_id].iter() {
-                if !mini_mapping_unique.contains_key(&m.0) {
-                    mini_mapping_unique.insert(m.0, m.1);
-                }
+                mini_mapping_unique.entry(m.0).or_insert(m.1);
             }
             for m in local_mini_size_mappings[thread_slot_id].iter() {
-                if !mini_size_mapping_unique.contains_key(&m.0) {
-                    mini_size_mapping_unique.insert(m.0, m.1);
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    mini_size_mapping_unique.entry(m.0)
+                {
+                    e.insert(m.1);
                 } else {
                     // In cache-only mode, given that NULL page has no snapshot version, a page
-                    // could be snapshotted multiple times with different content.
-                    // In disk mode, assert that the same page is only never snapshotted with different
+                    // could be snapshotted multiple times with either a valid page or a Null page.
+                    // In disk mode, assert that the same page is never snapshotted with different
                     // content
                     if !config.cache_only {
                         assert!(m.1 == mini_size_mapping_unique.get(&m.0).copied().unwrap());
@@ -719,13 +738,11 @@ impl CPRSnapShotMgr {
             }
 
             for m in local_base_mappings[thread_slot_id].iter() {
-                if !base_mapping_unique.contains_key(&m.0) {
-                    base_mapping_unique.insert(m.0, m.1);
-                }
+                base_mapping_unique.entry(m.0).or_insert(m.1);
             }
         }
 
-        // De-duplicate with the sweep results
+        // De-duplicate with the sweep mappings
         for (k, v) in inner_mapping.iter() {
             if !inner_mapping_unique.contains_key(k) {
                 inner_mapping_unique.insert(*k, *v);
@@ -740,7 +757,9 @@ impl CPRSnapShotMgr {
             if !mini_size_mapping_unique.contains_key(k) {
                 mini_size_mapping_unique.insert(*k, *v);
             } else {
-                assert!(*v == mini_size_mapping_unique.get(k).copied().unwrap());
+                if !config.cache_only {
+                    assert!(*v == mini_size_mapping_unique.get(k).copied().unwrap());
+                }
             }
         }
         for (k, v) in base_mapping.iter() {
@@ -761,14 +780,15 @@ impl CPRSnapShotMgr {
             assert!(mini_mapping_unique.len() <= base_mapping_unique.len());
         }
 
-        // Finally inner node mappings of the snapshot
+        // Finalize the inner node mappings of the snapshot
         let mut final_inner_mapping: Vec<(*const InnerNode, usize)> = Vec::new();
         for (k, v) in inner_mapping_unique.into_iter() {
             final_inner_mapping.push((k, v));
         }
 
-        // Final base leaf node mappings of the snapshot, disk-mode only
+        // Finalize the base leaf node mappings of the snapshot, disk-mode only
         // Sort the base leaf node mappings by PageID in ascending order
+        // which is required for page table initialization.
         let mut sorted_base_mapping_uninit: Vec<MaybeUninit<(PageID, usize)>> =
             Vec::with_capacity(base_mapping_unique.len());
         unsafe {
@@ -788,12 +808,17 @@ impl CPRSnapShotMgr {
                 base_mapping_unique.len(),
                 sorted_base_mapping_init.iter().filter(|&&b| b).count()
             );
-            unsafe { std::mem::transmute(sorted_base_mapping_uninit) }
+            unsafe {
+                std::mem::transmute::<
+                    std::vec::Vec<std::mem::MaybeUninit<(PageID, usize)>>,
+                    std::vec::Vec<(PageID, usize)>,
+                >(sorted_base_mapping_uninit)
+            }
         } else {
             Vec::new()
         };
 
-        // Final mini-page leaf node mappings of the snapshot
+        // Finalize mini-page leaf node mappings of the snapshot
         let mut final_mini_mapping: Vec<(PageID, usize)> = Vec::new();
         for (k, v) in mini_mapping_unique.into_iter() {
             final_mini_mapping.push((k, v));
@@ -804,25 +829,23 @@ impl CPRSnapShotMgr {
             final_mini_size_mapping.push((k, v));
         }
 
-        let mut leaf_page_num = 0;
-
-        if config.cache_only {
+        let leaf_page_num = if config.cache_only {
             // For a pagelocation that's NULL (evicted), we don't know its version
             // As such, we assume they are of the snapshot version and should be included.
             // A few slots in page table mnight be wasted due to false positive.
             // TODO: Be precise which requires some more metadata. Ideas:
             // 1) Count number of child leaf nodes in snapshotted inner nodes
             // 2) Put version in Null PageLocation.
-            //assert!(leaf_count_upper >= final_mini_mapping.len());
-            leaf_page_num = leaf_count_upper;
+            // 3) Compact the snapshot file
+            leaf_count_upper
         } else {
             assert!(leaf_count_upper >= final_sorted_base_mapping.len());
-            leaf_page_num = final_sorted_base_mapping.len();
-        }
+            final_sorted_base_mapping.len()
+        };
 
         let mut file_size = std::mem::size_of::<BfTreeMeta>() as u64;
 
-        // Flush final mappings into the snapshot file
+        // Flush various mappings into the snapshot file
         let (inner_offset, inner_size) = serialize_vec_to_disk(&final_inner_mapping, &self.vfs);
 
         if inner_offset != 0 {
@@ -848,7 +871,7 @@ impl CPRSnapShotMgr {
             file_size = (base_offset + align_to_sector_size(base_size)) as u64;
         }
 
-        // Flush the header to the snapshot file
+        // Write the header to the first disk page of the snapshot file
         let metadata = BfTreeMeta {
             magic_begin: *BF_TREE_MAGIC_BEGIN,
             root_id: unsafe { PageID::from_raw(self.root_id.load(Ordering::Acquire)) },
@@ -886,7 +909,7 @@ impl CPRSnapShotMgr {
         self.reset();
     }
 
-    /// Take a CRP snapshot of Bf-Tree
+    /// Take a CPR snapshot of a Bf-Tree
     pub fn snapshot(&self, tree: &BfTree) {
         // Allowing only one active snapshot at a time.
         if self
@@ -897,43 +920,45 @@ impl CPRSnapShotMgr {
             return;
         }
 
-        // Clear the snapshot file
+        // Clear previous snapshots from the snapshot file
         self.vfs.reset();
 
-        // Initialize a local inner node and leaf node mapping
-        let mut inner_mapping: Vec<(*const InnerNode, usize)> = Vec::new();
-        let mut mini_mapping: Vec<(PageID, usize)> = Vec::new();
-        let mut mini_size_mapping: Vec<(PageID, usize)> = Vec::new();
-        let mut base_mapping: Vec<(PageID, usize)> = Vec::new();
+        // Initialize a inner node and leaf node mapping for the sweep
+        let mut sweep_inner_mapping: Vec<(*const InnerNode, usize)> = Vec::new();
+        let mut sweep_mini_mapping: Vec<(PageID, usize)> = Vec::new();
+        let mut sweep_mini_size_mapping: Vec<(PageID, usize)> = Vec::new();
+        let mut sweep_base_mapping: Vec<(PageID, usize)> = Vec::new();
 
         // At the beginning, the global phase id must be 0 (REST).
         let mut current_global_phase_id = self.get_global_phase_id();
         assert_eq!(current_global_phase_id, 0);
 
+        // Version of the ongoing snapshot is set
         let snapshot_version = self.get_global_version();
 
-        // Immediately move the global state to (1 (PREPARE), V)
+        // Immediately move the global state to (1 (PREPARE), snapshot_version)
         let mut current_global_state = self.advance_global_state();
         current_global_phase_id = self.get_global_phase_id();
         assert_eq!(current_global_phase_id, 1);
         assert_eq!(snapshot_version, self.get_global_version());
-        let mut leaf_node_count_upper_bound = 0;
+
+        let mut leaf_node_count_upper_bound = 0; // Indicate the total number of leaf nodes in the captured snapshot.
 
         loop {
             if self.check_if_phase_completed(current_global_state) {
                 match current_global_phase_id {
                     // REST
                     0 => {
-                        // Upon reaching here, all user threads are in (REST, v + 1).
-                        // All snapshots of pages of v are done, and no more snapshot operations
+                        // Upon reaching here, all user threads are in (REST, snapshot_version + 1).
+                        // All snapshots of pages of snapshot_version are done, and no more snapshot operations
                         // neither. As such, we can safely finalize the snapshot by writing out the
                         // metadata and page mappings.
                         self.finalize(
                             snapshot_version,
-                            &mut inner_mapping,
-                            &mut mini_mapping,
-                            &mut mini_size_mapping,
-                            &mut base_mapping,
+                            &mut sweep_inner_mapping,
+                            &mut sweep_mini_mapping,
+                            &mut sweep_mini_size_mapping,
+                            &mut sweep_base_mapping,
                             leaf_node_count_upper_bound,
                             tree.config.clone(),
                         );
@@ -957,19 +982,20 @@ impl CPRSnapShotMgr {
                     }
                     // SWEEPING
                     3 => {
-                        // Sweep through and snapshot all data pages whose version is less than (v + 1)
+                        // Upon reaching here, there are no user threads with snapshot_version anymore.
+                        // Sweep through and snapshot all data pages whose version is less than (snapshot_version + 1)
                         // and build inner node and leaf node mapping for those pages.
-                        // Upon completion, all pages with version less than (v + 1) should have been captured in the snapshot.
+                        // Upon completion, all pages with version less than (snapshot_version + 1) should have been captured in the snapshot.
                         // Note that, there could be duplicate snapshots during and after the sweep as user threads in 'SWEEPING'
                         // state keeps taking snapshots of pages even if they have been captured by the sweep as the sweep does not
                         // alter page versions. De-duplication is needed when finalizing the snapshot file.
                         leaf_node_count_upper_bound = self.sweep(
                             tree,
                             snapshot_version + 1,
-                            &mut inner_mapping,
-                            &mut mini_mapping,
-                            &mut mini_size_mapping,
-                            &mut base_mapping,
+                            &mut sweep_inner_mapping,
+                            &mut sweep_mini_mapping,
+                            &mut sweep_mini_size_mapping,
+                            &mut sweep_base_mapping,
                         );
 
                         current_global_state = self.advance_global_state();
@@ -993,20 +1019,28 @@ impl CPRSnapShotMgr {
             .is_ok());
     }
 
-    /// Recover a Bf-tree from an existing snapshot file (recovery_snapshot_file_path)
-    /// Configuration of the newly created Bf-tree is retrieved from the snapshot file
-    /// and cannot be changed except:
-    /// 1. buffer_ptr (optional)
-    /// 2. buffer_size (overrides the size retrieved from the snapshot file)
-    /// 3. If enabled, provide path of the snapshot file of the newly recovered Bf-tree
-    ///    which must be different from the recovery snapshot file path
+    /// Recover a Bf-tree from an existing snapshot file at recovery_snapshot_file_path.
+    ///
+    /// Most configuration params are directly retrieved from the snapshot file
+    /// with the following ones for the caller to specify:
+    /// 1. use_snapshot: whether the new tree will also support snapshot.
+    /// 2. new_snapshot_file_path: If use_snapshot, then provide the path of the snapshot file of the newly recovered Bf-tree.
+    ///    Note that, this path must be different from the recovery_snapshot_file_path.
+    /// 3. buffer_ptr: optional pointer to a pre-allocated buffer for the newly recovered Bf-tree
+    /// 4. buffer_size optional override of the buffer size retrieved from the snapshot file.
+    ///    Note that, if the newly specified value is smaller than the one retrieved from the snapshot file,
+    ///    then failure to restore a tree might happen. This is because during recovery, the memory cache pages
+    ///    of the tree at the moment of snapshot are reinstated into memory too.
+    /// 5. wal_config: optional write-ahead log configuration for the newly recovered Bf-tree
     pub fn new_from_snapshot(
         recovery_snapshot_file_path: PathBuf, //  The snapshot file to recover from
         use_snapshot: bool,
         new_snapshot_file_path: Option<PathBuf>, // The snapshot file of the newly recovered Bf-tree
         buffer_ptr: Option<*mut u8>,
         buffer_size: Option<usize>, // buffer size of the newly created Bf-tree
+        wal_config: Option<Arc<WalConfig>>,
     ) -> Result<BfTree, ConfigError> {
+        // Check the recovery file is valid
         if !recovery_snapshot_file_path.exists() {
             // if not already exist, we just create a new empty file at the location.
             return Err(ConfigError::SnapshotFileInvalid(
@@ -1019,7 +1053,10 @@ impl CPRSnapShotMgr {
             ));
         }
 
-        // Retrieve the header of the snapshot file and construct a valid Config of the to-be-recovered Bf-tree
+        // Create WAL, if specified
+        let wal = wal_config.as_ref().map(|s| WriteAheadLog::new(s.clone()));
+
+        // Retrieve the header of the snapshot file and construct a valid config for the to-be-recovered Bf-tree
         let reader = std::fs::File::open(recovery_snapshot_file_path.clone()).unwrap();
         let mut metadata = SectorAlignedVector::new_zeroed(DISK_PAGE_SIZE); // Metadata is at most one disk page in size
         #[cfg(unix)]
@@ -1037,8 +1074,7 @@ impl CPRSnapShotMgr {
 
         let mut bf_tree_config = Config::new_from_snapshot(&bf_meta);
 
-        // TODO, recover storage backend from snapshot file
-        let recovery_snapshot_file_backend = StorageBackend::Std;
+        let recovery_snapshot_file_backend = StorageBackend::Std; // TODO, recover storage backend from snapshot file
         if !bf_tree_config.cache_only {
             bf_tree_config.file_path(recovery_snapshot_file_path.clone());
             // The storage backend should use the same vfs system as the recovery snapshot file
@@ -1047,6 +1083,7 @@ impl CPRSnapShotMgr {
             bf_tree_config.storage_backend = StorageBackend::Memory;
         }
         bf_tree_config.use_snapshot = use_snapshot;
+
         bf_tree_config.snapshot_backend = StorageBackend::Std; // TODO, allow user chosen snapshot backend
 
         bf_tree_config.snapshot_file_path = match new_snapshot_file_path {
@@ -1064,9 +1101,8 @@ impl CPRSnapShotMgr {
             None
         };
 
-        match buffer_size {
-            Some(size) => bf_tree_config.cb_size_byte = size,
-            None => {}
+        if let Some(size) = buffer_size {
+            bf_tree_config.cb_size_byte = size
         }
 
         let size_classes = BfTree::create_mem_page_size_classes(
@@ -1077,20 +1113,20 @@ impl CPRSnapShotMgr {
             bf_tree_config.cache_only,
         );
 
-        bf_tree_config.write_ahead_log = None;
+        bf_tree_config.write_ahead_log = wal_config.clone();
         bf_tree_config.validate()?;
 
         let config = Arc::new(bf_tree_config);
 
-        // Creat a vfs over the recovery snapshot file and start re-constructing a new Bf-tree
+        // Start Bf-Tree re-construction using recovery_snapshot_file_path and the config
         let recovery_snapshot_vfs = make_vfs(
             &recovery_snapshot_file_backend,
             recovery_snapshot_file_path.clone(),
         );
-        let mut page_buffer = SectorAlignedVector::new_zeroed(INNER_NODE_SIZE);
 
         // Step 1: reconstruct inner nodes.
         let mut root_page_id = bf_meta.root_id;
+        let mut inner_node_page_buffer = SectorAlignedVector::new_zeroed(INNER_NODE_SIZE);
         if root_page_id.is_inner_node_pointer() {
             let inner_mapping: Vec<(*const InnerNode, usize)> = read_vec_from_offset(
                 bf_meta.inner_offset,
@@ -1103,13 +1139,14 @@ impl CPRSnapShotMgr {
                 inner_map.insert(m.0, m.1);
             }
             let offset = inner_map.get(&root_page_id.as_inner_node()).unwrap();
-            recovery_snapshot_vfs.read(*offset, &mut page_buffer);
-            let root_page = InnerNodeBuilder::new().build_from_slice(&page_buffer);
+            recovery_snapshot_vfs.read(*offset, &mut inner_node_page_buffer);
+            let root_page = InnerNodeBuilder::new().build_from_slice(&inner_node_page_buffer);
 
             // No need for disk offset of a inner node.
             unsafe {
                 (*root_page).set_disk_offset(INVALID_DISK_OFFSET as u64);
             }
+            // Mark the root node
             unsafe {
                 (*root_page).set_root(true);
             }
@@ -1124,8 +1161,9 @@ impl CPRSnapShotMgr {
                 }
                 for (idx, c) in inner.as_ref().get_child_iter().enumerate() {
                     let offset = inner_map.get(&c.as_inner_node()).unwrap();
-                    recovery_snapshot_vfs.read(*offset, &mut page_buffer);
-                    let inner_page = InnerNodeBuilder::new().build_from_slice(&page_buffer);
+                    recovery_snapshot_vfs.read(*offset, &mut inner_node_page_buffer);
+                    let inner_page =
+                        InnerNodeBuilder::new().build_from_slice(&inner_node_page_buffer);
                     unsafe {
                         (*inner_page).set_disk_offset(INVALID_DISK_OFFSET as u64);
                     }
@@ -1142,8 +1180,10 @@ impl CPRSnapShotMgr {
             root_page_id.raw()
         };
 
+        // Step 2. Reconstruct the page table and leaf pages.
+        // Here we differentiate cache-only from disk-backed Bf-trees as their recovery process differs.
         if !bf_meta.cache_only {
-            // For disk backed bf-tree, we first reconstruct the page table using base pages.
+            // For disk backed bf-tree, we reconstruct the page table using base pages.
             let base_mapping: Vec<(PageID, usize)> = if bf_meta.base_size > 0 {
                 read_vec_from_offset(
                     bf_meta.base_offset,
@@ -1154,14 +1194,14 @@ impl CPRSnapShotMgr {
                 Vec::new()
             };
 
-            let base_mapping = base_mapping.into_iter().map(|(pid, offset)| {
+            let base_page_loc_mapping = base_mapping.into_iter().map(|(pid, offset)| {
                 let loc = PageLocation::Base(offset);
                 (pid, loc)
             });
 
-            // Note: The vfs of the newly constructed Bf-tree is the recovery snapshot vfs
+            // The file system of the newly constructed Bf-tree is the recovery_snapshot_file
             let pt = PageTable::new_from_mapping(
-                base_mapping,
+                base_page_loc_mapping,
                 recovery_snapshot_vfs.clone(),
                 config.clone(),
                 snapshot_mgr.clone(),
@@ -1178,7 +1218,7 @@ impl CPRSnapShotMgr {
                 config.cache_only,
             );
 
-            // Second, we restore the mini-pages and wire them to corresponding base pages and update the page table.
+            // Next, we restore the mini-pages and wire them to the corresponding base pages and update the page table.
             let mini_mapping: Vec<(PageID, usize)> = if bf_meta.mini_size > 0 {
                 read_vec_from_offset(
                     bf_meta.mini_offset,
@@ -1188,6 +1228,7 @@ impl CPRSnapShotMgr {
             } else {
                 Vec::new()
             };
+
             let mini_size_mapping: Vec<(PageID, usize)> = if bf_meta.mini_size_size > 0 {
                 read_vec_from_offset(
                     bf_meta.mini_size_offset,
@@ -1203,25 +1244,24 @@ impl CPRSnapShotMgr {
                 mini_size_mapping_unique.insert(pid, size);
             }
 
-            // Note: The vfs of the newly constructed Bf-tree is the recovery snapshot vfs
+            // Create the storage system first before allocating mini-pages.
             let storage =
                 LeafStorage::new_inner(config.clone(), pt, circular_buffer, recovery_snapshot_vfs);
 
-            for i in 0..mini_mapping.len() {
-                let (pid, offset) = mini_mapping[i];
-                let mini_size = *mini_size_mapping_unique.get(&pid).unwrap();
+            for (pid, offset) in &mini_mapping {
+                let mini_size = *mini_size_mapping_unique.get(pid).unwrap();
 
-                // Allocate memory in storage
+                // Allocate space in memory for new mini-page
                 let mini_page_guard = match storage.alloc_mini_page(mini_size) {
                     Ok(mini_page_ptr) => mini_page_ptr,
                     Err(_) => {
-                        panic!("Please increase cb_size_byte in config");
+                        return Err(ConfigError::CircularBufferSize("buffer size set too small. Consider increasing it or not specifying at all".to_string()));
                     }
                 };
 
-                // Copy mini-page from snapshot to memory
+                // Copy mini-page from snapshot file to the newly allocated mini-page
                 let mut page_buffer = SectorAlignedVector::new_zeroed(mini_size);
-                storage.vfs.read(offset, &mut page_buffer);
+                storage.vfs.read(*offset, &mut page_buffer);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         page_buffer.as_ptr(),
@@ -1230,11 +1270,11 @@ impl CPRSnapShotMgr {
                     );
                 }
 
-                // Connect the mini-page to the corresponding base page in page table
+                // Connect the new mini-page to the corresponding base page in page table
                 let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
                 let mini_page = unsafe { &mut *new_mini_ptr };
 
-                let mut base_page = storage.page_table.get_mut(&pid);
+                let mut base_page = storage.page_table.get_mut(pid);
                 let page_loc = base_page.get_page_location().clone();
                 match page_loc {
                     PageLocation::Base(off) => {
@@ -1253,20 +1293,22 @@ impl CPRSnapShotMgr {
             Ok(BfTree {
                 storage,
                 root_page_id: AtomicU64::new(raw_root_id),
-                wal: None,                  // TODO: Allow users to configure WAl
-                write_load_full_page: true, //TODO: Save this flag in the snapshot file too.
+                wal,
+                write_load_full_page: config.write_load_full_page,
                 cache_only: false,
                 mini_page_size_classes: size_classes,
-                snapshot_mgr: snapshot_mgr,
-                config: config,
+                snapshot_mgr,
+                config,
                 #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
                 metrics_recorder: Some(Arc::new(ThreadLocal::new())),
             })
         } else {
-            // For cache-only mode, we create a new memory based vfs first
-            let storage_vfs = make_vfs(&config.storage_backend, PathBuf::new());
+            // For cache-only mode, we create a new page table with NULL pages
+            let mini_mapping_unallocated: Vec<(PageID, PageLocation)> = (0..bf_meta.leaf_page_num)
+                .map(|pid| (PageID::from_id(pid as u64), PageLocation::Null))
+                .collect();
 
-            // Then, we create a new page table with only Null pages
+            // Then we restore the mini-pages and replace the corresponding Null pages and update the page table.
             let mini_mapping: Vec<(PageID, usize)> = if bf_meta.mini_size > 0 {
                 read_vec_from_offset(
                     bf_meta.mini_offset,
@@ -1276,9 +1318,6 @@ impl CPRSnapShotMgr {
             } else {
                 Vec::new()
             };
-            let mini_mapping_unallocated: Vec<(PageID, PageLocation)> = (0..bf_meta.leaf_page_num)
-                .map(|pid| (PageID::from_id(pid as u64), PageLocation::Null))
-                .collect();
 
             let mini_size_mapping: Vec<(PageID, usize)> = if bf_meta.mini_size_size > 0 {
                 read_vec_from_offset(
@@ -1294,6 +1333,9 @@ impl CPRSnapShotMgr {
             for (pid, size) in mini_size_mapping {
                 mini_size_mapping_unique.insert(pid, size);
             }
+
+            // For cache-only mode, the file system of the new bf-tree is memory-based
+            let storage_vfs = make_vfs(&config.storage_backend, PathBuf::new());
 
             let pt = PageTable::new_from_mapping(
                 mini_mapping_unallocated.into_iter(),
@@ -1313,17 +1355,18 @@ impl CPRSnapShotMgr {
                 config.cache_only,
             );
 
+            // Create a memory-based storage system before allocating mini-pages.
             let storage = LeafStorage::new_inner(config.clone(), pt, circular_buffer, storage_vfs);
 
-            for i in 0..mini_mapping.len() {
-                let (pid, offset) = mini_mapping[i];
-                let mini_size = *mini_size_mapping_unique.get(&pid).unwrap();
+            for (pid, offset) in &mini_mapping {
+                let mini_size = *mini_size_mapping_unique.get(pid).unwrap();
 
-                if offset == NULL_PAGE_LOCATION_OFFSET {
+                // Skip over null pages as the default is Null in the page table already
+                if *offset == NULL_PAGE_LOCATION_OFFSET {
                     continue;
                 }
 
-                // Allocate memory in storage
+                // Allocate memory for a new mini-page in storage
                 let mini_page_guard = match storage.alloc_mini_page(mini_size) {
                     Ok(mini_page_ptr) => mini_page_ptr,
                     Err(_) => {
@@ -1331,9 +1374,9 @@ impl CPRSnapShotMgr {
                     }
                 };
 
-                // Copy mini-page from snapshot to memory
+                // Copy mini-page from snapshot file to the newly allocated space.
                 let mut page_buffer = SectorAlignedVector::new_zeroed(mini_size);
-                recovery_snapshot_vfs.read(offset, &mut page_buffer);
+                recovery_snapshot_vfs.read(*offset, &mut page_buffer);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         page_buffer.as_ptr(),
@@ -1348,7 +1391,7 @@ impl CPRSnapShotMgr {
                 mini_page.next_level = MiniPageNextLevel::new_null();
 
                 // Update the corresponding page location
-                let mut null_page = storage.page_table.get_mut(&pid);
+                let mut null_page = storage.page_table.get_mut(pid);
                 let page_loc = null_page.get_page_location().clone();
                 match page_loc {
                     PageLocation::Null => {
@@ -1363,12 +1406,12 @@ impl CPRSnapShotMgr {
             Ok(BfTree {
                 storage,
                 root_page_id: AtomicU64::new(raw_root_id),
-                wal: None,
-                write_load_full_page: true,
+                wal,
+                write_load_full_page: config.write_load_full_page,
                 cache_only: true,
                 mini_page_size_classes: size_classes,
-                snapshot_mgr: snapshot_mgr,
-                config: config,
+                snapshot_mgr,
+                config,
                 #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
                 metrics_recorder: Some(Arc::new(ThreadLocal::new())),
             })
@@ -1377,6 +1420,43 @@ impl CPRSnapShotMgr {
 }
 
 impl BfTree {
+    /// Recovery a Bf-Tree from a cpr snapshot and WAL files.
+    /// Incomplete function, internal use only
+    pub fn recovery(
+        recovery_snapshot_file_path: PathBuf, //  The snapshot file to recover from
+        wal_file: impl AsRef<Path>,
+        use_snapshot: bool,
+        new_snapshot_file_path: Option<PathBuf>, // The snapshot file of the newly recovered Bf-tree
+        buffer_ptr: Option<*mut u8>,
+        buffer_size: Option<usize>,
+        wal: Option<Arc<WalConfig>>,
+    ) {
+        let bf_tree = BfTree::new_from_cpr_snapshot(
+            recovery_snapshot_file_path,
+            use_snapshot,
+            new_snapshot_file_path,
+            buffer_ptr,
+            buffer_size,
+            wal,
+        )
+        .unwrap();
+        let wal_reader = WalReader::new(wal_file, 4096);
+
+        for seg in wal_reader.segment_iter() {
+            for entry in seg.entry_iter() {
+                let log_entry = LogEntry::read_from_buffer(entry.1);
+                match log_entry {
+                    LogEntry::Write(op) => {
+                        bf_tree.insert(op.key, op.value);
+                    }
+                    LogEntry::Split(_op) => {
+                        todo!("implement split op in wal!")
+                    }
+                }
+            }
+        }
+    }
+
     /// Take a new CPR snapshot
     pub fn cpr_snapshot(&self) {
         if !self.config.use_snapshot {
@@ -1387,7 +1467,6 @@ impl BfTree {
         snpshot_mgr.snapshot(self);
     }
 
-    
     /// Recover a BfTree from a CPR snapshot
     pub fn new_from_cpr_snapshot(
         recovery_snapshot_file_path: PathBuf, //  The snapshot file to recover from
@@ -1395,6 +1474,7 @@ impl BfTree {
         new_snapshot_file_path: Option<PathBuf>, // The snapshot file of the newly recovered Bf-tree
         buffer_ptr: Option<*mut u8>,
         buffer_size: Option<usize>,
+        wal: Option<Arc<WalConfig>>,
     ) -> Result<BfTree, ConfigError> {
         CPRSnapShotMgr::new_from_snapshot(
             recovery_snapshot_file_path,
@@ -1402,6 +1482,7 @@ impl BfTree {
             new_snapshot_file_path,
             buffer_ptr,
             buffer_size,
+            wal,
         )
     }
 
@@ -1659,6 +1740,7 @@ mod tests {
             Some(std::path::PathBuf::from_str(&(new_snapshot_file_path)).unwrap()),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1721,8 +1803,10 @@ mod tests {
         let leaf_page_size: usize = 8192;
         let num_threads: usize = 4;
 
-        let snapshot_file_path: String = "target/test_simple_snapshot.bftree".to_string();
-        let new_snapshot_file_path: String = "target/test_simple_new_snapshot.bftree".to_string();
+        let snapshot_file_path: String =
+            "target/test_simple_cache_only_snapshot.bftree".to_string();
+        let new_snapshot_file_path: String =
+            "target/test_simple_cache_only_new_snapshot.bftree".to_string();
         let tmp_snapshot_file_path = std::path::PathBuf::from_str(&snapshot_file_path).unwrap();
         let tmp_new_snapshot_file_path =
             std::path::PathBuf::from_str(&new_snapshot_file_path).unwrap();
@@ -1793,6 +1877,7 @@ mod tests {
             std::path::PathBuf::from_str(&snapshot_file_path).unwrap(),
             true,
             Some(std::path::PathBuf::from_str(&(new_snapshot_file_path)).unwrap()),
+            None,
             None,
             None,
         )

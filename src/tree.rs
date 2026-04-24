@@ -333,8 +333,8 @@ impl BfTree {
             let leaf_storage = LeafStorage::new(config.clone(), buffer_ptr, snapshot_mgr.clone());
 
             // CPR snapshot guard for proper snapshot version setting of the root page
-            // No need for CRP logic
-            let snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
+            // No need for CPR logic
+            let _snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
                 Ok(guard) => guard,
                 Err(()) => {
                     panic!("Failed to acquire a snapshot guard for root page initialization");
@@ -376,8 +376,8 @@ impl BfTree {
                     config.max_fence_len,
                     config.cache_only,
                 ),
-                snapshot_mgr: snapshot_mgr,
-                config: config,
+                snapshot_mgr,
+                config,
                 #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
                 metrics_recorder: Some(Arc::new(ThreadLocal::new())),
             });
@@ -396,8 +396,8 @@ impl BfTree {
         let leaf_storage = LeafStorage::new(config.clone(), buffer_ptr, snapshot_mgr.clone());
 
         // CPR snapshot guard for proper snapshot version setting of the root page
-        // No need for CRP logic
-        let snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
+        // No need for CPR logic
+        let _snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
             Ok(guard) => guard,
             Err(()) => {
                 panic!("Failed to acquire a snapshot guard for root page initialization");
@@ -422,8 +422,8 @@ impl BfTree {
                 config.max_fence_len,
                 config.cache_only,
             ),
-            snapshot_mgr: snapshot_mgr,
-            config: config,
+            snapshot_mgr,
+            config,
             #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
             metrics_recorder: Some(Arc::new(ThreadLocal::new())),
         })
@@ -949,11 +949,13 @@ impl BfTree {
                         }
                     };
 
-                // Snapshot the NULL page assuming it is of version v
-                // as we don't know whether the existing page has been snapshotted or not
-                // and the new page will be of version v+1.
-                // TODO: Versioning of NULL page
-                snapshot_guard.snapshot_mini_page(pid, &[], 0);
+                if snapshot_guard.is_protected() {
+                    // Snapshot the NULL page assuming it is of version v
+                    // as we don't know whether the existing page has been snapshotted or not
+                    // and the new page will be of version v+1.
+                    // TODO: Versioning of NULL page
+                    snapshot_guard.snapshot_mini_page(pid, &[], 0);
+                }
 
                 let mini_page_guard = self.storage.alloc_mini_page(mini_page_size)?;
                 LeafNode::initialize_mini_page(
@@ -1620,7 +1622,7 @@ mod tests {
             vec![128, 192, 256, 512, 960, 1856, 2048, 4096]
         );
 
-        size_classes = BfTree::create_mem_page_size_classes(1548, 1548, 3136, 64, true);
+        size_classes = BfTree::create_mem_page_size_classes(1544, 1544, 3136, 64, true);
         assert_eq!(size_classes, vec![1536, 3136]);
 
         size_classes = BfTree::create_mem_page_size_classes(48, 3072, 12288, 64, false);

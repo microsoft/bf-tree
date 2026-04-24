@@ -236,6 +236,7 @@ pub(crate) trait LeafOperations {
 pub(crate) struct LeafEntrySLocked<'a> {
     raw_guard: RwLockReadGuard<'a, PageLocation>,
     #[cfg(feature = "tracing")]
+    #[allow(dead_code)]
     pid: PageID,
     file_handle: &'a dyn VfsImpl,
     tmp_buffer_size: usize,
@@ -295,7 +296,7 @@ impl<'a> LeafEntrySLocked<'a> {
             Ok(g) => {
                 let x = LeafEntryXLocked {
                     raw_guard: g,
-                    pid: pid,
+                    pid,
                     file_handle: self.file_handle,
                     tmp_buffer_size: self.tmp_buffer_size,
                     tmp_buffer: self.tmp_buffer.take(),

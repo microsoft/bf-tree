@@ -154,7 +154,7 @@ impl Default for Config {
             write_ahead_log: None,
             write_load_full_page: true,
             cache_only: false,
-            snapshot_file_path: PathBuf::new(),
+            snapshot_file_path: PathBuf::from("targets/snapshot"),
         }
     }
 }
@@ -224,7 +224,7 @@ impl Config {
     }
 
     // Create a new config file from the metadata of a snapshot
-    pub fn new_from_snapshot(meta: &BfTreeMeta) -> Self {
+    pub(crate) fn new_from_snapshot(meta: &BfTreeMeta) -> Self {
         let mut config = Self::default();
 
         // Load config from the snapshot metadata
@@ -364,6 +364,11 @@ impl Config {
 
     pub fn file_path<P: AsRef<Path>>(&mut self, file_path: P) -> &mut Self {
         self.file_path = file_path.as_ref().to_path_buf();
+        self
+    }
+
+    pub fn snapshot_file_path<P: AsRef<Path>>(&mut self, file_path: P) -> &mut Self {
+        self.snapshot_file_path = file_path.as_ref().to_path_buf();
         self
     }
 
@@ -545,7 +550,10 @@ impl Config {
             ));
         }
 
-        if self.file_path == self.snapshot_file_path {
+        if self.use_snapshot
+            && self.file_path == self.snapshot_file_path
+            && self.snapshot_file_path != PathBuf::new()
+        {
             return Err(ConfigError::SnapshotFileInvalid(
                 "snapshot file path should not be the same as the main file path".to_string(),
             ));
