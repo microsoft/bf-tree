@@ -503,7 +503,9 @@ fn move_cursor_to_leaf<'a>(
     }
 
     // we need to merge mini page.
-    let mut x_leaf = leaf.try_upgrade().map_err(|_e| TreeError::Locked)?;
+    let mut x_leaf = leaf
+        .try_upgrade(tree.snapshot_mgr.clone(), pid)
+        .map_err(|_e| TreeError::Locked)?;
 
     let v = promote_or_merge_mini_page(tree, key, &mut x_leaf, parent.unwrap())?;
     Ok((v, ScanLock::X(x_leaf)))

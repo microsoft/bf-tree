@@ -227,10 +227,10 @@ mod test {
     #[test]
     fn test_add_and_remove() {
         let free_list = FreeList::new(32, 1952, 4096, 32, false);
-        let block = Box::into_raw(Box::new([0u8; 64])); // Allocate a block of 64 bytes.
-        let lock_guard = free_list.try_add(block as *mut u8, 64).unwrap();
+        let block = Box::into_raw(Box::new([0u8; 128])); // Allocate a block of 128 bytes.
+        let lock_guard = free_list.try_add(block as *mut u8, 128).unwrap();
         drop(lock_guard);
-        let removed = free_list.remove(64).unwrap();
+        let removed = free_list.remove(128).unwrap();
         assert_eq!(removed.as_ptr(), block as *mut u8);
         // Cleanup
         unsafe {
@@ -241,12 +241,12 @@ mod test {
     #[test]
     fn test_find_and_remove() {
         let free_list = FreeList::new(32, 1952, 4096, 32, false);
-        let block = Box::into_raw(Box::new([0u8; 64]));
-        let lock_guard = free_list.try_add(block as *mut u8, 64).unwrap();
+        let block = Box::into_raw(Box::new([0u8; 128]));
+        let lock_guard = free_list.try_add(block as *mut u8, 128).unwrap();
         drop(lock_guard);
-        assert!(free_list.find_and_remove(block as *mut u8, 64));
+        assert!(free_list.find_and_remove(block as *mut u8, 128));
         // Verify removal
-        assert!(!free_list.find_and_remove(block as *mut u8, 64));
+        assert!(!free_list.find_and_remove(block as *mut u8, 128));
         // Cleanup
         unsafe {
             _ = Box::from_raw(block);

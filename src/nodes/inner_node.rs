@@ -1,13 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{storage::DiskOffsetGuard, sync::atomic::AtomicU16};
+use crate::{snapshot::CPRSnapShotMgr, storage::DiskOffsetGuard, sync::atomic::AtomicU16};
 use std::cmp::Ordering;
 
 use super::{node_meta::NodeMeta, PageID, INNER_NODE_SIZE};
 use crate::utils::stats::InnerStats;
 
-const INVALID_DISK_OFFSET: usize = usize::MAX;
+pub(crate) const INVALID_DISK_OFFSET: usize = usize::MAX;
+const INNER_NODE_ROOT_FLAG: u64 = 0x8000_0000_0000_0000;
+const INNER_NODE_SNAPSHOT_VERSION_MASK: u64 = 0x7FFF_FFFF_FFFF_FFFF;
 
 #[repr(C)]
 pub(crate) struct InnerKVMeta {
@@ -41,11 +43,12 @@ pub(crate) struct InnerNode {
     pub(crate) meta: NodeMeta,
     pub(crate) version_lock: AtomicU16, // Is 16 bits enough?
     pub(crate) disk_offset: u64,
+    snapshot_version: u64,
     data: [u8; 0],
 }
 
 #[cfg(not(feature = "shuttle"))]
-const _: () = assert!(std::mem::size_of::<InnerNode>() == 16);
+const _: () = assert!(std::mem::size_of::<InnerNode>() == 24);
 
 struct InnerPtrGuard {
     ptr: *mut InnerNode,
@@ -136,6 +139,10 @@ impl<'a> InnerNodeBuilder<'a> {
             assert!(rt);
         }
 
+        // Note that, when snapshot is not enabled the version of a leaf node would be the INVALID_SNAPSHOT_VERSION
+        let snapshot_version = CPRSnapShotMgr::get_snapshot_thread_version();
+        node.set_snapshot_version(snapshot_version);
+
         self.raw_ptr.take()
     }
 
@@ -143,6 +150,9 @@ impl<'a> InnerNodeBuilder<'a> {
         let ptr = self.raw_ptr.take();
         unsafe {
             std::ptr::copy_nonoverlapping(slice.as_ptr(), ptr as *mut u8, INNER_NODE_SIZE);
+        }
+        unsafe {
+            (&mut *ptr).version_lock = AtomicU16::new(0);
         }
         ptr
     }
@@ -152,6 +162,10 @@ impl InnerNode {
     pub(crate) fn free_node(ptr: *mut InnerNode) {
         let layout = std::alloc::Layout::from_size_align(INNER_NODE_SIZE, INNER_NODE_SIZE).unwrap();
         unsafe { std::alloc::dealloc(ptr as *mut u8, layout) }
+    }
+
+    pub(crate) fn set_disk_offset(&mut self, offset: u64) {
+        self.disk_offset = offset;
     }
 
     /// Initialize the node with the left most page id and whether the children are leaf nodes.
@@ -226,6 +240,27 @@ impl InnerNode {
             assert!(min_offset == rt);
         }
         rt
+    }
+
+    pub(crate) fn get_snapshot_version(&self) -> u64 {
+        self.snapshot_version & INNER_NODE_SNAPSHOT_VERSION_MASK
+    }
+
+    pub(crate) fn set_snapshot_version(&mut self, snapshot_version: u64) {
+        let root_flag = self.snapshot_version & INNER_NODE_ROOT_FLAG;
+        self.snapshot_version = (snapshot_version & INNER_NODE_SNAPSHOT_VERSION_MASK) | root_flag;
+    }
+
+    pub(crate) fn is_root(&self) -> bool {
+        (self.snapshot_version & INNER_NODE_ROOT_FLAG) != 0
+    }
+
+    pub(crate) fn set_root(&mut self, is_root: bool) {
+        if is_root {
+            self.snapshot_version |= INNER_NODE_ROOT_FLAG;
+        } else {
+            self.snapshot_version &= INNER_NODE_SNAPSHOT_VERSION_MASK;
+        }
     }
 
     pub(crate) fn get_full_key(&self, meta: &InnerKVMeta) -> Vec<u8> {
@@ -398,6 +433,10 @@ impl InnerNode {
         let left_most_page_id = self.get_value(self.get_kv_meta(0));
         let children_is_leaf = self.meta.children_is_leaf();
         self.reinitialize(left_most_page_id, children_is_leaf, self.disk_offset);
+
+        // Note that, when snapshot is not enabled the version of a leaf node would be the INVALID_SNAPSHOT_VERSION
+        let snapshot_version = CPRSnapShotMgr::get_snapshot_thread_version();
+        self.set_snapshot_version(snapshot_version);
 
         for (key, id) in pairs {
             let tmp_k = key;

@@ -6,7 +6,7 @@ use std::{alloc::Layout, cmp::Ordering, sync::atomic};
 
 use crate::{
     circular_buffer::CircularBufferPtr, counter, error::TreeError, range_scan::ScanReturnField,
-    utils::stats::LeafStats,
+    snapshot::CPRSnapShotMgr, snapshot::INVALID_SNAPSHOT_VERSION, utils::stats::LeafStats,
 };
 
 use super::{node_meta::NodeMeta, FENCE_KEY_CNT};
@@ -215,10 +215,11 @@ pub(crate) struct LeafNode {
     prefix_len: u16,
     pub(crate) next_level: MiniPageNextLevel,
     pub(crate) lsn: u64,
+    snapshot_version: u64,
     data: [u8; 0],
 }
 
-const _: () = assert!(std::mem::size_of::<LeafNode>() == 24);
+const _: () = assert!(std::mem::size_of::<LeafNode>() == 32);
 
 impl LeafNode {
     fn max_data_size(node_size: usize) -> usize {
@@ -1544,6 +1545,14 @@ impl LeafNode {
         has_fence: bool,
         cache_only: bool,
     ) {
+        let snapshot_version = match CPRSnapShotMgr::get_snapshot_thread_id() {
+            Ok(_) => CPRSnapShotMgr::get_snapshot_thread_version(),
+            Err(_) => INVALID_SNAPSHOT_VERSION,
+        };
+
+        // The initial version of a page is marked as not changed
+        self.snapshot_version = snapshot_version & Self::SNAPSHOT_VERSION_MASK;
+
         if !has_fence {
             assert!(low_fence.is_empty());
             assert!(high_fence.is_empty());
@@ -1579,6 +1588,43 @@ impl LeafNode {
 
     pub(crate) fn get_split_flag(&self) -> bool {
         self.meta.get_split_flag()
+    }
+
+    // Highest bit (63) is used as "changed" indicator flag.
+    // Bits 0-62 hold the actual version value.
+    const SNAPSHOT_VERSION_CHANGED_FLAG: u64 = 0x8000_0000_0000_0000;
+    const SNAPSHOT_VERSION_MASK: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+
+    /// Get the snapshot version value without the "is_changed" flag.
+    pub(crate) fn get_snapshot_version(&self) -> u64 {
+        self.snapshot_version & Self::SNAPSHOT_VERSION_MASK
+    }
+
+    /// Set the snapshot version and mark whether it changed via the highest bit flag.
+    pub(crate) fn set_snapshot_version(&mut self, snapshot_version: u64, mark_changed: bool) {
+        let next_version = snapshot_version & Self::SNAPSHOT_VERSION_MASK;
+
+        if !mark_changed {
+            self.snapshot_version = next_version;
+            return;
+        }
+
+        let current_version = self.get_snapshot_version();
+
+        // Set changed flag only when version differs.
+        if next_version != current_version {
+            self.snapshot_version = next_version | Self::SNAPSHOT_VERSION_CHANGED_FLAG;
+        }
+    }
+
+    /// Check whether the snapshot version has changed.
+    pub(crate) fn is_snapshot_version_changed(&self) -> bool {
+        (self.snapshot_version & Self::SNAPSHOT_VERSION_CHANGED_FLAG) != 0
+    }
+
+    /// Set the "changed" flag without changing the version value.
+    pub(crate) fn set_snapshot_version_changed_flag(&mut self) {
+        self.snapshot_version |= Self::SNAPSHOT_VERSION_CHANGED_FLAG;
     }
 
     pub(crate) fn read_by_key(&self, search_key: &[u8], out_buffer: &mut [u8]) -> LeafReadResult {
@@ -1758,6 +1804,8 @@ impl LeafNode {
             return false;
         }
 
+        // Merge the snapshot version too.
+        self.snapshot_version = mini_page.get_snapshot_version();
         for meta in mini_page.meta_iter() {
             let c_key = mini_page.get_full_key(meta);
             let c_type = meta.op_type();

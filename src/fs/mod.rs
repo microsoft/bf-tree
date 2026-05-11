@@ -42,6 +42,8 @@ pub(crate) trait VfsImpl: Send + Sync {
     /// Flush the data to disk, similar to fsync on Linux.
     fn flush(&self);
 
+    fn reset(&self) {}
+
     fn open(path: impl AsRef<std::path::Path>) -> Self
     where
         Self: Sized;
@@ -110,5 +112,12 @@ impl OffsetAlloc {
 
     pub(crate) fn dealloc_offset(&self, _offset: usize) {
         // We don't need to do anything here.
+    }
+
+    pub(crate) fn reset(&self, mut offset: usize) {
+        if offset < DISK_PAGE_SIZE {
+            offset = DISK_PAGE_SIZE;
+        }
+        self.next_available_offset.store(offset, Ordering::Release);
     }
 }

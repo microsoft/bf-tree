@@ -30,6 +30,7 @@ use crate::{
         INNER_NODE_SIZE, MAX_KEY_LEN, MAX_LEAF_PAGE_SIZE, MAX_VALUE_LEN,
     },
     range_scan::{ScanIter, ScanIterMut, ScanReturnField},
+    snapshot::CPRSnapShotMgr,
     storage::{LeafStorage, PageLocation, PageTable},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -50,6 +51,7 @@ pub struct BfTree {
     pub(crate) write_load_full_page: bool,
     pub(crate) cache_only: bool, // If true, there is no permenant storage layer thus no durability guarantee of any upsert in the tree
     pub(crate) mini_page_size_classes: Vec<usize>, // Size classes of mini pages
+    pub(crate) snapshot_mgr: Option<Arc<CPRSnapShotMgr>>, // Manager of a CPR snapshot
     #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
     pub metrics_recorder: Option<Arc<ThreadLocal<UnsafeCell<TlsRecorder>>>>, // Per-tree metrics recorder under "metrics-rt-debug" feature
 }
@@ -318,7 +320,26 @@ impl BfTree {
 
         // In cache-only mode, the initial root page is a full mini-page
         if config.cache_only {
-            let leaf_storage = LeafStorage::new(config.clone(), buffer_ptr);
+            let snapshot_mgr = if config.use_snapshot {
+                Some(Arc::new(CPRSnapShotMgr::new(
+                    &config.snapshot_backend,
+                    config.snapshot_version,
+                    &config.snapshot_file_path,
+                )))
+            } else {
+                None
+            };
+
+            let leaf_storage = LeafStorage::new(config.clone(), buffer_ptr, snapshot_mgr.clone());
+
+            // CPR snapshot guard for proper snapshot version setting of the root page
+            // No need for CPR logic
+            let _snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
+                Ok(guard) => guard,
+                Err(()) => {
+                    panic!("Failed to acquire a snapshot guard for root page initialization");
+                }
+            };
 
             // Assuming CB can accommodate at least 2 leaf pages at the same time
             let mini_page_guard = (leaf_storage)
@@ -355,13 +376,34 @@ impl BfTree {
                     config.max_fence_len,
                     config.cache_only,
                 ),
+                snapshot_mgr,
                 config,
                 #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
                 metrics_recorder: Some(Arc::new(ThreadLocal::new())),
             });
         }
 
-        let leaf_storage = LeafStorage::new(config.clone(), buffer_ptr);
+        let snapshot_mgr = if config.use_snapshot {
+            Some(Arc::new(CPRSnapShotMgr::new(
+                &config.snapshot_backend,
+                config.snapshot_version,
+                &config.snapshot_file_path,
+            )))
+        } else {
+            None
+        };
+
+        let leaf_storage = LeafStorage::new(config.clone(), buffer_ptr, snapshot_mgr.clone());
+
+        // CPR snapshot guard for proper snapshot version setting of the root page
+        // No need for CPR logic
+        let _snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
+            Ok(guard) => guard,
+            Err(()) => {
+                panic!("Failed to acquire a snapshot guard for root page initialization");
+            }
+        };
+
         let (root_id, root_lock) = leaf_storage.mapping_table().alloc_base_page_mapping();
         drop(root_lock);
         assert_eq!(root_id.as_id(), 0);
@@ -380,6 +422,7 @@ impl BfTree {
                 config.max_fence_len,
                 config.cache_only,
             ),
+            snapshot_mgr,
             config,
             #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
             metrics_recorder: Some(Arc::new(ThreadLocal::new())),
@@ -449,11 +492,110 @@ impl BfTree {
         if !should_split {
             return Ok(false);
         }
+
+        // CPR snapshot guard
+        let snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(self.snapshot_mgr.clone()) {
+            Ok(guard) => guard,
+            Err(()) => {
+                return Err(TreeError::NeedRestart);
+            }
+        };
+
         match parent {
             Some(_) => {
                 unreachable!("Leaf node split should not happen here");
             }
             None => {
+                if snapshot_guard.is_protected() {
+                    let local_thread_snapshot_version =
+                        CPRSnapShotMgr::get_snapshot_thread_version();
+                    match snapshot_guard.get_local_phase_id() {
+                        // PREPARE
+                        1 => {
+                            if self.cache_only {
+                                let root_page_loc = cur_page.get_page_location().clone();
+                                match root_page_loc {
+                                    PageLocation::Mini(ptr) => {
+                                        let root_page = cur_page.load_cache_page_mut(ptr);
+                                        if root_page.get_snapshot_version()
+                                            > local_thread_snapshot_version
+                                        {
+                                            return Err(TreeError::NeedRestart);
+                                        }
+                                    }
+                                    _ => {
+                                        panic!(
+                                            "The root node is not a mini-page in cache-only mode"
+                                        )
+                                    }
+                                }
+                            } else {
+                                let root_page = cur_page.load_base_page_mut();
+                                if root_page.get_snapshot_version() > local_thread_snapshot_version
+                                {
+                                    return Err(TreeError::NeedRestart);
+                                }
+                            }
+                        }
+                        // INPROG or SWEEPING
+                        2 | 3 => {
+                            if self.cache_only {
+                                let root_page_loc = cur_page.get_page_location().clone();
+                                match root_page_loc {
+                                    PageLocation::Mini(ptr) => {
+                                        let root_page = cur_page.load_cache_page_mut(ptr);
+                                        if root_page.get_snapshot_version()
+                                            < local_thread_snapshot_version
+                                        {
+                                            let root_page_ptr = unsafe {
+                                                std::slice::from_raw_parts(
+                                                    root_page as *const LeafNode as *const u8,
+                                                    root_page.meta.node_size as usize,
+                                                )
+                                            };
+                                            snapshot_guard.snapshot_mini_page(
+                                                cur_page_id,
+                                                root_page_ptr,
+                                                root_page.meta.node_size as usize,
+                                            );
+                                            root_page.set_snapshot_version(
+                                                local_thread_snapshot_version,
+                                                false,
+                                            );
+                                            snapshot_guard.snapshot_root_page(cur_page_id);
+                                        }
+                                    }
+                                    _ => {
+                                        panic!(
+                                            "The root node is not a mini-page in cache-only mode"
+                                        )
+                                    }
+                                }
+                            } else {
+                                let root_page = cur_page.load_base_page_mut();
+                                if root_page.get_snapshot_version() < local_thread_snapshot_version
+                                {
+                                    let root_page_ptr = unsafe {
+                                        std::slice::from_raw_parts(
+                                            root_page as *const LeafNode as *const u8,
+                                            root_page.meta.node_size as usize,
+                                        )
+                                    };
+                                    snapshot_guard.snapshot_base_page(
+                                        cur_page_id,
+                                        root_page_ptr,
+                                        root_page.meta.node_size as usize,
+                                    );
+                                    root_page
+                                        .set_snapshot_version(local_thread_snapshot_version, false);
+                                    snapshot_guard.snapshot_root_page(cur_page_id);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 // only for the case of root node split
 
                 // In cache-only mode, the root mini-page node is split into two equal-sized mini-pages
@@ -494,7 +636,7 @@ impl BfTree {
                                 .add_record(split_key, sibling_id);
 
                             let new_root_ptr = new_root_builder.build();
-
+                            unsafe { (*new_root_ptr).set_root(true) };
                             self.root_page_id
                                 .store(PageID::from_pointer(new_root_ptr).raw(), Ordering::Release);
 
@@ -531,6 +673,8 @@ impl BfTree {
 
                 let new_root_ptr = new_root_builder.build();
 
+                unsafe { (*new_root_ptr).set_root(true) };
+
                 self.root_page_id
                     .store(PageID::from_pointer(new_root_ptr).raw(), Ordering::Release);
 
@@ -563,10 +707,71 @@ impl BfTree {
 
         info!(has_parent = parent.is_some(), "split inner node");
 
+        // CPR snapshot guard
+        let snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(self.snapshot_mgr.clone()) {
+            Ok(guard) => guard,
+            Err(()) => {
+                return Err(TreeError::NeedRestart);
+            }
+        };
+
         match parent {
             Some(p) => {
                 let mut x_cur = cur_node.upgrade().map_err(|(_x, e)| e)?;
                 let mut x_parent = p.upgrade().map_err(|(_x, e)| e)?;
+
+                // CPR snapshot
+                if snapshot_guard.is_protected() {
+                    let local_thread_snapshot_version =
+                        CPRSnapShotMgr::get_snapshot_thread_version();
+
+                    match snapshot_guard.get_local_phase_id() {
+                        // PREPARE
+                        1 => {
+                            // Abort if either page has been taken a snapshot before.
+                            if x_parent.as_ref().get_snapshot_version()
+                                > local_thread_snapshot_version
+                                || x_cur.as_ref().get_snapshot_version()
+                                    > local_thread_snapshot_version
+                            {
+                                return Err(TreeError::NeedRestart);
+                            }
+                        }
+                        // INPROG or SWEEPING
+                        2 | 3 => {
+                            if x_parent.as_ref().get_snapshot_version()
+                                < local_thread_snapshot_version
+                            {
+                                snapshot_guard.snapshot_inner_node(x_parent.as_ref());
+                                x_parent
+                                    .as_mut()
+                                    .set_snapshot_version(local_thread_snapshot_version);
+
+                                if x_parent.as_ref().is_root() {
+                                    let root_id = self.root_page_id.load(Ordering::Acquire);
+                                    assert_eq!(
+                                        root_id,
+                                        PageID::from_pointer(x_parent.as_ref() as *const InnerNode)
+                                            .raw()
+                                    );
+
+                                    snapshot_guard.snapshot_root_page(PageID::from_pointer(
+                                        x_parent.as_ref() as *const InnerNode,
+                                    ));
+                                }
+                            }
+
+                            if x_cur.as_ref().get_snapshot_version() < local_thread_snapshot_version
+                            {
+                                snapshot_guard.snapshot_inner_node(x_cur.as_ref());
+                                x_cur
+                                    .as_mut()
+                                    .set_snapshot_version(local_thread_snapshot_version);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
 
                 let split_key = x_cur.as_ref().get_split_key();
 
@@ -590,11 +795,52 @@ impl BfTree {
             None => {
                 let mut x_cur = cur_node.upgrade().map_err(|(_x, e)| e)?;
 
+                // CPR snapshot
+                if snapshot_guard.is_protected() {
+                    let local_thread_snapshot_version =
+                        CPRSnapShotMgr::get_snapshot_thread_version();
+
+                    match snapshot_guard.get_local_phase_id() {
+                        // PREPARE
+                        1 => {
+                            // Abort if either page has been taken a snapshot before.
+                            if x_cur.as_ref().get_snapshot_version() > local_thread_snapshot_version
+                            {
+                                return Err(TreeError::NeedRestart);
+                            }
+                        }
+                        // INPROG or SWEEPING
+                        2 | 3 => {
+                            if x_cur.as_ref().get_snapshot_version() < local_thread_snapshot_version
+                            {
+                                snapshot_guard.snapshot_inner_node(x_cur.as_ref());
+                                x_cur
+                                    .as_mut()
+                                    .set_snapshot_version(local_thread_snapshot_version);
+
+                                // snapshot root
+                                let root_id = self.root_page_id.load(Ordering::Acquire);
+                                assert!(x_cur.as_ref().is_root());
+                                assert_eq!(
+                                    root_id,
+                                    PageID::from_pointer(x_cur.as_ref() as *const InnerNode).raw()
+                                );
+
+                                snapshot_guard.snapshot_root_page(PageID::from_pointer(
+                                    x_cur.as_ref() as *const InnerNode,
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 let mut sibling_builder = InnerNodeBuilder::new();
                 sibling_builder.set_disk_offset(self.storage.alloc_disk_offset(INNER_NODE_SIZE));
                 let sibling_id = sibling_builder.get_page_id();
 
                 let split_key = x_cur.as_mut().split(&mut sibling_builder);
+                x_cur.as_mut().set_root(false);
 
                 let mut new_root_builder = InnerNodeBuilder::new();
                 new_root_builder
@@ -604,6 +850,9 @@ impl BfTree {
                     .add_record(split_key, sibling_id);
                 sibling_builder.build();
                 let new_root_ptr = new_root_builder.build();
+
+                unsafe { (*new_root_ptr).set_root(true) };
+
                 let _x_root = ReadGuard::try_read(new_root_ptr)
                     .unwrap()
                     .upgrade()
@@ -690,6 +939,24 @@ impl BfTree {
                     &self.mini_page_size_classes,
                     self.cache_only,
                 );
+
+                // CPR snapshot guard for proper snapshot version setting of the root page
+                let snapshot_guard =
+                    match CPRSnapShotMgr::get_snapshot_guard(self.snapshot_mgr.clone()) {
+                        Ok(guard) => guard,
+                        Err(()) => {
+                            return Err(TreeError::NeedRestart);
+                        }
+                    };
+
+                if snapshot_guard.is_protected() {
+                    // Snapshot the NULL page assuming it is of version v
+                    // as we don't know whether the existing page has been snapshotted or not
+                    // and the new page will be of version v+1.
+                    // TODO: Versioning of NULL page
+                    snapshot_guard.snapshot_mini_page(pid, &[], 0);
+                }
+
                 let mini_page_guard = self.storage.alloc_mini_page(mini_page_size)?;
                 LeafNode::initialize_mini_page(
                     &mini_page_guard,
@@ -1116,7 +1383,7 @@ impl BfTree {
         match out {
             ReadResult::Mini(r) | ReadResult::Full(r) => {
                 if leaf.cache_page_about_to_evict(&self.storage) {
-                    let mut x_leaf = match leaf.try_upgrade() {
+                    let mut x_leaf = match leaf.try_upgrade(self.snapshot_mgr.clone(), node) {
                         Ok(v) => v,
                         Err(_) => return Ok(r),
                     };
@@ -1144,7 +1411,7 @@ impl BfTree {
                     return Ok(r);
                 }
 
-                let mut x_leaf = match leaf.try_upgrade() {
+                let mut x_leaf = match leaf.try_upgrade(self.snapshot_mgr.clone(), node) {
                     Ok(x) => x,
                     Err(_) => {
                         return Ok(r);
@@ -1355,7 +1622,7 @@ mod tests {
             vec![128, 192, 256, 512, 960, 1856, 2048, 4096]
         );
 
-        size_classes = BfTree::create_mem_page_size_classes(1548, 1548, 3136, 64, true);
+        size_classes = BfTree::create_mem_page_size_classes(1544, 1544, 3136, 64, true);
         assert_eq!(size_classes, vec![1536, 3136]);
 
         size_classes = BfTree::create_mem_page_size_classes(48, 3072, 12288, 64, false);

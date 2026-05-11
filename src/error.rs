@@ -15,4 +15,6 @@ pub enum ConfigError {
     LeafPageSize(String),
     MaxKeyLen(String),
     CircularBufferSize(String),
+    SnapshotFileInvalid(String),
+    SnapshotDisabled,
 }

@@ -50,6 +50,7 @@ impl<T> RwLock<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn try_read(&self) -> Result<RwLockReadGuard<'_, T>, ()> {
         let v = self.lock_val.load(Ordering::Relaxed);
 

@@ -6,7 +6,7 @@ pub(crate) mod leaf_node;
 mod node_meta;
 mod page_id;
 
-pub(crate) use inner_node::{InnerNode, InnerNodeBuilder};
+pub(crate) use inner_node::{InnerNode, InnerNodeBuilder, INVALID_DISK_OFFSET};
 pub(crate) use leaf_node::LeafNode;
 pub(crate) use page_id::PageID;
 
