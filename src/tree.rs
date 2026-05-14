@@ -727,15 +727,13 @@ impl BfTree {
 
                     match snapshot_guard.get_local_phase_id() {
                         // PREPARE
-                        1 => {
+                        1 if x_parent.as_ref().get_snapshot_version()
+                            > local_thread_snapshot_version
+                            || x_cur.as_ref().get_snapshot_version()
+                                > local_thread_snapshot_version =>
+                        {
                             // Abort if either page has been taken a snapshot before.
-                            if x_parent.as_ref().get_snapshot_version()
-                                > local_thread_snapshot_version
-                                || x_cur.as_ref().get_snapshot_version()
-                                    > local_thread_snapshot_version
-                            {
-                                return Err(TreeError::NeedRestart);
-                            }
+                            return Err(TreeError::NeedRestart);
                         }
                         // INPROG or SWEEPING
                         2 | 3 => {
@@ -802,34 +800,33 @@ impl BfTree {
 
                     match snapshot_guard.get_local_phase_id() {
                         // PREPARE
-                        1 => {
+                        1 if x_cur.as_ref().get_snapshot_version()
+                            > local_thread_snapshot_version =>
+                        {
                             // Abort if either page has been taken a snapshot before.
-                            if x_cur.as_ref().get_snapshot_version() > local_thread_snapshot_version
-                            {
-                                return Err(TreeError::NeedRestart);
-                            }
+                            return Err(TreeError::NeedRestart);
                         }
                         // INPROG or SWEEPING
-                        2 | 3 => {
-                            if x_cur.as_ref().get_snapshot_version() < local_thread_snapshot_version
-                            {
-                                snapshot_guard.snapshot_inner_node(x_cur.as_ref());
-                                x_cur
-                                    .as_mut()
-                                    .set_snapshot_version(local_thread_snapshot_version);
+                        2 | 3
+                            if x_cur.as_ref().get_snapshot_version()
+                                < local_thread_snapshot_version =>
+                        {
+                            snapshot_guard.snapshot_inner_node(x_cur.as_ref());
+                            x_cur
+                                .as_mut()
+                                .set_snapshot_version(local_thread_snapshot_version);
 
-                                // snapshot root
-                                let root_id = self.root_page_id.load(Ordering::Acquire);
-                                assert!(x_cur.as_ref().is_root());
-                                assert_eq!(
-                                    root_id,
-                                    PageID::from_pointer(x_cur.as_ref() as *const InnerNode).raw()
-                                );
+                            // snapshot root
+                            let root_id = self.root_page_id.load(Ordering::Acquire);
+                            assert!(x_cur.as_ref().is_root());
+                            assert_eq!(
+                                root_id,
+                                PageID::from_pointer(x_cur.as_ref() as *const InnerNode).raw()
+                            );
 
-                                snapshot_guard.snapshot_root_page(PageID::from_pointer(
-                                    x_cur.as_ref() as *const InnerNode,
-                                ));
-                            }
+                            snapshot_guard.snapshot_root_page(PageID::from_pointer(
+                                x_cur.as_ref() as *const InnerNode
+                            ));
                         }
                         _ => {}
                     }
@@ -875,6 +872,8 @@ impl BfTree {
         &self,
         key: &[u8],
         aggressive_split: bool,
+        return_high_fence_key: bool,
+        mut high_fence: Option<&mut Vec<u8>>, // For cache-only mode, the high fence of the leaf node will be returned in this vector
     ) -> Result<(PageID, Option<ReadGuard<'_>>), TreeError> {
         let (mut cur_page, mut cur_is_leaf) = self.get_root_page();
         let mut parent: Option<ReadGuard> = None;
@@ -909,13 +908,28 @@ impl BfTree {
                 let kv_meta = next_node.get_kv_meta(pos as u16);
                 cur_page = next_node.get_value(kv_meta);
                 cur_is_leaf = next_is_leaf;
+
+                // If required and exists, the next key at (pos + 1) is the high fence key
+                if return_high_fence_key
+                    && ((pos + 1) as u16) < next_node.meta.meta_count_with_fence()
+                {
+                    let hk_kv_meta = next_node.get_kv_meta((pos + 1) as u16);
+                    let hk = next_node.get_full_key(hk_kv_meta);
+                    if let Some(v) = high_fence.as_deref_mut() {
+                        v.resize(hk.len(), 0u8);
+                        v.copy_from_slice(&hk);
+                    } else {
+                        panic!("high_fence is None, but return_high_fence_key is true");
+                    }
+                }
+
                 parent = Some(next);
             }
         }
     }
 
     fn write_inner(&self, write_op: WriteOp, aggressive_split: bool) -> Result<(), TreeError> {
-        let (pid, parent) = self.traverse_to_leaf(write_op.key, aggressive_split)?;
+        let (pid, parent) = self.traverse_to_leaf(write_op.key, aggressive_split, false, None)?;
 
         let mut leaf_entry = self.mapping_table().get_mut(&pid);
 
@@ -1234,11 +1248,6 @@ impl BfTree {
         cnt: usize,
         return_field: ScanReturnField,
     ) -> Result<ScanIter<'a, 'a>, ScanIterError> {
-        // In cache-only mode, scan is not supported
-        if self.cache_only {
-            return Err(ScanIterError::CacheOnlyMode);
-        }
-
         // The start key cannot exceed the configured max key length
         if key.len() > self.config.max_fence_len / 2 || key.len() > MAX_KEY_LEN {
             return Err(ScanIterError::InvalidStartKey);
@@ -1257,17 +1266,14 @@ impl BfTree {
         Ok(ScanIter::new_with_scan_count(self, key, cnt, return_field))
     }
 
+    /// Scan records in the tree, with start and end keys.
+    /// Returns a iterator that yields key-value pairs.
     pub fn scan_with_end_key<'a>(
         &'a self,
         start_key: &[u8],
         end_key: &[u8],
         return_field: ScanReturnField,
     ) -> Result<ScanIter<'a, 'a>, ScanIterError> {
-        // In cache-only mode, scan is not supported
-        if self.cache_only {
-            return Err(ScanIterError::CacheOnlyMode);
-        }
-
         // The start key cannot exceed the configured max key length
         if start_key.len() > self.config.max_fence_len / 2 || start_key.len() > MAX_KEY_LEN {
             return Err(ScanIterError::InvalidStartKey);
@@ -1368,7 +1374,7 @@ impl BfTree {
         out_buffer: &mut [u8],
         aggressive_split: bool,
     ) -> Result<LeafReadResult, TreeError> {
-        let (node, parent) = self.traverse_to_leaf(key, aggressive_split)?;
+        let (node, parent) = self.traverse_to_leaf(key, aggressive_split, false, None)?;
 
         let mut leaf = self.mapping_table().get(&node);
 
@@ -1552,7 +1558,7 @@ pub(crate) fn eviction_callback(
     };
 
     // Here we need to set aggressive split to true, because we would split parent node due to leaf split.
-    let (pid, parent) = tree.traverse_to_leaf(&key_to_this_page, true)?;
+    let (pid, parent) = tree.traverse_to_leaf(&key_to_this_page, true, false, None)?;
     info!(
         pid = pid.raw(),
         "starting to merge mini page in eviction call back"

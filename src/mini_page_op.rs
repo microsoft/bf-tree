@@ -120,6 +120,15 @@ pub(crate) trait LeafOperations {
                 let full = self.load_cache_page(page_ptr);
                 full.get_record_by_pos_with_bound(*pos, out_buffer, return_field, end_key)
             }
+            ScanPosition::Mini(pos) => {
+                let page_ptr = match self.get_page_location() {
+                    PageLocation::Mini(ptr) => *ptr,
+                    _ => panic!("scan_value_by_pos on non-mini page with mini pos"),
+                };
+                let mini_page = self.load_cache_page(page_ptr);
+                mini_page.get_record_by_pos_with_bound(*pos, out_buffer, return_field, end_key)
+            }
+            ScanPosition::Null => GetScanRecordByPosResult::EndOfLeaf,
         }
     }
 
@@ -212,7 +221,12 @@ pub(crate) trait LeafOperations {
     /// Returns the pos of the key when scanning, i.e., the keys[pos] >= key.
     ///
     /// If we hit a page with mini page, we need to merge it, consolidate it, then scan.
-    fn get_scan_position(&mut self, key: &[u8]) -> Result<ScanPosition, ScanError> {
+    /// except for the cache-only mode where we scan the mini-page directly without merging.
+    fn get_scan_position(
+        &mut self,
+        key: &[u8],
+        cache_only: bool,
+    ) -> Result<ScanPosition, ScanError> {
         let page_loc = self.get_page_location();
 
         match page_loc {
@@ -226,8 +240,19 @@ pub(crate) trait LeafOperations {
                 let pos = page_ref.lower_bound(key);
                 Ok(ScanPosition::Full(pos as u32))
             }
-            PageLocation::Mini(_ptr) => Err(ScanError::NeedMergeMiniPage),
-            PageLocation::Null => panic!("get_scan_position on Null page"),
+            PageLocation::Mini(ptr) => {
+                if cache_only {
+                    let mini_page = self.load_cache_page(*ptr);
+                    let pos = mini_page.lower_bound(key);
+                    Ok(ScanPosition::Mini(pos as u32))
+                } else {
+                    Err(ScanError::NeedMergeMiniPage)
+                }
+            }
+            PageLocation::Null => {
+                assert!(cache_only);
+                Ok(ScanPosition::Null)
+            }
         }
     }
 }
@@ -484,33 +509,32 @@ impl<'a> LeafEntryXLocked<'a> {
                     let base_page_ref = self.load_base_page_mut();
                     match snapshot_guard.get_local_phase_id() {
                         // PREPARE
-                        1 => {
-                            if base_page_ref.get_snapshot_version() > local_thread_snapshot_version
-                            {
-                                return Err(TreeError::NeedRestart);
-                            }
+                        1 if base_page_ref.get_snapshot_version()
+                            > local_thread_snapshot_version =>
+                        {
+                            return Err(TreeError::NeedRestart);
                         }
                         // INPROG or SWEEPING
-                        2 | 3 => {
-                            if base_page_ref.get_snapshot_version() < local_thread_snapshot_version
-                            {
-                                let base_page_ptr = unsafe {
-                                    std::slice::from_raw_parts(
-                                        base_page_ref as *const LeafNode as *const u8,
-                                        base_page_ref.meta.node_size as usize,
-                                    )
-                                };
-                                snapshot_guard.snapshot_base_page(
-                                    pid,
-                                    base_page_ptr,
+                        2 | 3
+                            if base_page_ref.get_snapshot_version()
+                                < local_thread_snapshot_version =>
+                        {
+                            let base_page_ptr = unsafe {
+                                std::slice::from_raw_parts(
+                                    base_page_ref as *const LeafNode as *const u8,
                                     base_page_ref.meta.node_size as usize,
-                                );
-                                base_page_ref
-                                    .set_snapshot_version(local_thread_snapshot_version, false);
+                                )
+                            };
+                            snapshot_guard.snapshot_base_page(
+                                pid,
+                                base_page_ptr,
+                                base_page_ref.meta.node_size as usize,
+                            );
+                            base_page_ref
+                                .set_snapshot_version(local_thread_snapshot_version, false);
 
-                                if parent.is_none() {
-                                    snapshot_guard.snapshot_root_page(pid);
-                                }
+                            if parent.is_none() {
+                                snapshot_guard.snapshot_root_page(pid);
                             }
                         }
                         _ => {}
@@ -578,28 +602,25 @@ impl<'a> LeafEntryXLocked<'a> {
 
                     match snapshot_guard.get_local_phase_id() {
                         // PREPARE
-                        1 => {
-                            if mini_page.get_snapshot_version() > local_thread_snapshot_version {
-                                return Err(TreeError::NeedRestart);
-                            }
+                        1 if mini_page.get_snapshot_version() > local_thread_snapshot_version => {
+                            return Err(TreeError::NeedRestart);
                         }
                         // INPROG or SWEEPING
-                        2 | 3 => {
-                            if mini_page.get_snapshot_version() < local_thread_snapshot_version {
-                                let mini_page_ptr = unsafe {
-                                    std::slice::from_raw_parts(
-                                        mini_page as *const LeafNode as *const u8,
-                                        mini_page.meta.node_size as usize,
-                                    )
-                                };
-                                snapshot_guard.snapshot_base_page(
-                                    pid,
-                                    mini_page_ptr,
+                        2 | 3
+                            if mini_page.get_snapshot_version() < local_thread_snapshot_version =>
+                        {
+                            let mini_page_ptr = unsafe {
+                                std::slice::from_raw_parts(
+                                    mini_page as *const LeafNode as *const u8,
                                     mini_page.meta.node_size as usize,
-                                );
-                                mini_page
-                                    .set_snapshot_version(local_thread_snapshot_version, false);
-                            }
+                                )
+                            };
+                            snapshot_guard.snapshot_base_page(
+                                pid,
+                                mini_page_ptr,
+                                mini_page.meta.node_size as usize,
+                            );
+                            mini_page.set_snapshot_version(local_thread_snapshot_version, false);
                         }
                         _ => {}
                     }
@@ -629,54 +650,52 @@ impl<'a> LeafEntryXLocked<'a> {
 
                     match snapshot_guard.get_local_phase_id() {
                         // PREPARE
-                        1 => {
-                            if mini_page.get_snapshot_version() > local_thread_snapshot_version {
-                                return Err(TreeError::NeedRestart);
-                            }
+                        1 if mini_page.get_snapshot_version() > local_thread_snapshot_version => {
+                            return Err(TreeError::NeedRestart);
                         }
                         // INPROG or SWEEPING
-                        2 | 3 => {
-                            if mini_page.get_snapshot_version() < local_thread_snapshot_version {
-                                let mini_page_ptr = unsafe {
+                        2 | 3
+                            if mini_page.get_snapshot_version() < local_thread_snapshot_version =>
+                        {
+                            let mini_page_ptr = unsafe {
+                                std::slice::from_raw_parts(
+                                    mini_page as *const LeafNode as *const u8,
+                                    mini_page.meta.node_size as usize,
+                                )
+                            };
+                            snapshot_guard.snapshot_mini_page(
+                                pid,
+                                mini_page_ptr,
+                                mini_page.meta.node_size as usize,
+                            );
+                            mini_page.set_snapshot_version(local_thread_snapshot_version, true);
+                            snapshot_version_changed = true;
+
+                            // Need to snapshot the base page as well.
+                            if !(*cache_only) {
+                                // No need to update the version on a base page as its mini-page has version updated already
+                                let base_page =
+                                    self.load_base_page(mini_page.next_level.as_offset());
+                                assert!(
+                                    base_page.get_snapshot_version()
+                                        < local_thread_snapshot_version
+                                );
+
+                                let base_page_ptr = unsafe {
                                     std::slice::from_raw_parts(
-                                        mini_page as *const LeafNode as *const u8,
-                                        mini_page.meta.node_size as usize,
+                                        base_page as *const LeafNode as *const u8,
+                                        base_page.meta.node_size as usize,
                                     )
                                 };
-                                snapshot_guard.snapshot_mini_page(
+                                snapshot_guard.snapshot_base_page(
                                     pid,
-                                    mini_page_ptr,
-                                    mini_page.meta.node_size as usize,
+                                    base_page_ptr,
+                                    base_page.meta.node_size as usize,
                                 );
-                                mini_page.set_snapshot_version(local_thread_snapshot_version, true);
-                                snapshot_version_changed = true;
+                            }
 
-                                // Need to snapshot the base page as well.
-                                if !(*cache_only) {
-                                    // No need to update the version on a base page as its mini-page has version updated already
-                                    let base_page =
-                                        self.load_base_page(mini_page.next_level.as_offset());
-                                    assert!(
-                                        base_page.get_snapshot_version()
-                                            < local_thread_snapshot_version
-                                    );
-
-                                    let base_page_ptr = unsafe {
-                                        std::slice::from_raw_parts(
-                                            base_page as *const LeafNode as *const u8,
-                                            base_page.meta.node_size as usize,
-                                        )
-                                    };
-                                    snapshot_guard.snapshot_base_page(
-                                        pid,
-                                        base_page_ptr,
-                                        base_page.meta.node_size as usize,
-                                    );
-                                }
-
-                                if *cache_only && parent.is_none() {
-                                    snapshot_guard.snapshot_root_page(pid);
-                                }
+                            if *cache_only && parent.is_none() {
+                                snapshot_guard.snapshot_root_page(pid);
                             }
                         }
                         _ => {}
@@ -828,30 +847,27 @@ impl<'a> LeafEntryXLocked<'a> {
                                 // PREPARE
                                 match snapshot_guard.get_local_phase_id() {
                                     // PREPARE
-                                    1 => {
-                                        if x_parent.as_ref().get_snapshot_version()
-                                            > local_thread_snapshot_version
-                                        {
-                                            return Err(TreeError::NeedRestart);
-                                        }
+                                    1 if x_parent.as_ref().get_snapshot_version()
+                                        > local_thread_snapshot_version =>
+                                    {
+                                        return Err(TreeError::NeedRestart);
                                     }
                                     // INPROG or SWEEPING
-                                    2 | 3 => {
+                                    2 | 3
                                         if x_parent.as_ref().get_snapshot_version()
-                                            < local_thread_snapshot_version
-                                        {
-                                            snapshot_guard.snapshot_inner_node(x_parent.as_ref());
-                                            x_parent.as_mut().set_snapshot_version(
-                                                local_thread_snapshot_version,
-                                            );
+                                            < local_thread_snapshot_version =>
+                                    {
+                                        snapshot_guard.snapshot_inner_node(x_parent.as_ref());
+                                        x_parent
+                                            .as_mut()
+                                            .set_snapshot_version(local_thread_snapshot_version);
 
-                                            if x_parent.as_ref().is_root() {
-                                                snapshot_guard.snapshot_root_page(
-                                                    PageID::from_pointer(
-                                                        x_parent.as_ref() as *const InnerNode
-                                                    ),
-                                                );
-                                            }
+                                        if x_parent.as_ref().is_root() {
+                                            snapshot_guard.snapshot_root_page(
+                                                PageID::from_pointer(
+                                                    x_parent.as_ref() as *const InnerNode
+                                                ),
+                                            );
                                         }
                                     }
                                     _ => {}
@@ -1186,13 +1202,11 @@ impl<'a> LeafEntryXLocked<'a> {
             // PREPARE
             match snapshot_guard.get_local_phase_id() {
                 // PREPARE
-                1 => {
+                1 if x_parent.as_ref().get_snapshot_version() > local_thread_snapshot_version
+                    || mini_page.get_snapshot_version() > local_thread_snapshot_version =>
+                {
                     // Abort if either page has been taken a snapshot before.
-                    if x_parent.as_ref().get_snapshot_version() > local_thread_snapshot_version
-                        || mini_page.get_snapshot_version() > local_thread_snapshot_version
-                    {
-                        return Err(TreeError::NeedRestart);
-                    }
+                    return Err(TreeError::NeedRestart);
                 }
                 // INPROG or SWEEPING
                 2 | 3 => {
