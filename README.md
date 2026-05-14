@@ -37,6 +37,65 @@ assert_eq!(read_size, LeafReadResult::Found(5));
 assert_eq!(&buffer[..5], b"value");
 ```
 
+### Snapshots and Recovery
+
+Bf-Tree supports CPR-style consistent snapshots. A snapshot captures a
+consistent prefix of all in-flight transactions to a file, and a tree can later
+be reconstructed from such a snapshot file.
+
+To enable snapshots, set `use_snapshot(true)` on the `Config` before creating
+the tree. Once enabled, call [`BfTree::cpr_snapshot`] with the destination path
+to take a snapshot at any point. Snapshots can be taken concurrently with
+ongoing reads and writes; only one snapshot may be in progress at a time.
+
+```rust
+use bf_tree::{BfTree, Config};
+
+let mut config = Config::default();
+config.use_snapshot(true);
+let tree = BfTree::with_config(config, None).unwrap();
+
+tree.insert(b"key", b"value");
+
+// Take a CPR snapshot of the current tree state.
+tree.cpr_snapshot("snapshot.bftree");
+```
+
+To recover a tree from a snapshot file, use
+[`BfTree::new_from_cpr_snapshot`]. The snapshot file embeds most configuration
+fields (record sizes, leaf page size, cache-only flag, etc.), so the caller
+only needs to specify the recovery-time options:
+
+- `recovery_snapshot_file_path`: path of the snapshot file to recover from.
+- `use_snapshot`: whether the recovered tree should itself support taking new
+  snapshots.
+- `buffer_ptr`: optional pointer to a pre-allocated cache buffer; pass `None`
+  to let Bf-Tree allocate one.
+- `buffer_size`: optional override of the cache size stored in the snapshot.
+  If smaller than the original, recovery may fail because cached pages from
+  the snapshot must fit in memory.
+- `wal`: optional write-ahead log configuration for the recovered tree.
+
+```rust
+use bf_tree::BfTree;
+use std::path::PathBuf;
+
+let tree = BfTree::new_from_cpr_snapshot(
+    "snapshot.bftree",
+    /* use_snapshot */ true,
+    /* buffer_ptr */ None,
+    /* buffer_size */ None,
+    /* wal */ None,
+).unwrap();
+std::fs::remove_file("snapshot.bftree");
+```
+
+Notes:
+- The snapshot file path passed to `cpr_snapshot` must be different from the
+  path used by any concurrent recovery.
+- For more on the snapshot/recovery design, see
+  [doc/snapshot-recovery.md](doc/snapshot-recovery.md).
+
 PRs are accepted and preferred over feature requests. Feel free to reach out if you have any design questions.
 
 
