@@ -9,6 +9,7 @@ use std::panic;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 #[cfg(not(all(feature = "shuttle", test)))]
 use rand::Rng;
@@ -80,8 +81,10 @@ pub struct CPRSnapShotMgr {
         UnsafeCell<[Vec<(PageID, usize)>; DEFAULT_MAX_SNAPSHOT_THREAD_NUM]>,
     root_id: AtomicU64, // Page ID of the root node.
     pause_snapshot: AtomicBool,
-    // The physical file of snapshot
-    vfs: Arc<dyn VfsImpl>,
+    // The physical file of snapshot. Wrapped in RwLock so the underlying
+    // vfs can be swapped when taking a new snapshot.
+    // Arc<Box<dyn VfsImpl>> is another option.
+    vfs: RwLock<Arc<dyn VfsImpl>>,
     // Ensuring only one snapshot is in progress at a time.
     snapshot_in_progress: AtomicBool,
 }
@@ -214,8 +217,8 @@ impl CPRSnapShotMgr {
     }
 
     /// Initialize a new snapshot instance.
-    pub fn new(storage_backend: &StorageBackend, version: u64, file_path: &PathBuf) -> Self {
-        let vfs: Arc<dyn VfsImpl> = make_vfs(storage_backend, file_path);
+    pub fn new(version: u64) -> Self {
+        let vfs: Arc<dyn VfsImpl> = make_vfs(&StorageBackend::Memory, ":memory:");
         Self {
             global_state: AtomicU64::new(Self::new_snapshot_state(0, version)), // Initial state: (REST, version)
             thread_slots: [const { AtomicBool::new(false) }; DEFAULT_MAX_SNAPSHOT_THREAD_NUM],
@@ -235,7 +238,7 @@ impl CPRSnapShotMgr {
             ),
             root_id: AtomicU64::new(0),
             pause_snapshot: AtomicBool::new(false),
-            vfs,
+            vfs: RwLock::new(vfs),
             snapshot_in_progress: AtomicBool::new(false),
         }
     }
@@ -423,10 +426,11 @@ impl CPRSnapShotMgr {
     /// by the underlying vfs. (E.g., io_uring_vfs requires 512B alignment)
     pub fn snapshot_page(&self, ptr: &[u8], size: usize) -> usize {
         // Allocate space in the snapshot file
-        let offset = self.vfs.alloc_offset(size);
+        let vfs = self.vfs.read().unwrap().clone();
+        let offset = vfs.alloc_offset(size);
 
         // Copy the page (ptr) to the new space
-        self.vfs.write(offset, ptr);
+        vfs.write(offset, ptr);
 
         // Return the offset
         offset
@@ -846,26 +850,29 @@ impl CPRSnapShotMgr {
         let mut file_size = std::mem::size_of::<BfTreeMeta>() as u64;
 
         // Flush various mappings into the snapshot file
-        let (inner_offset, inner_size) = serialize_vec_to_disk(&final_inner_mapping, &self.vfs);
+        let (inner_offset, inner_size) =
+            serialize_vec_to_disk(&final_inner_mapping, &self.vfs.read().unwrap());
 
         if inner_offset != 0 {
             file_size = (inner_offset + align_to_sector_size(inner_size)) as u64;
         }
 
-        let (mini_offset, mini_size) = serialize_vec_to_disk(&final_mini_mapping, &self.vfs);
+        let (mini_offset, mini_size) =
+            serialize_vec_to_disk(&final_mini_mapping, &self.vfs.read().unwrap());
 
         if mini_offset != 0 {
             file_size = (mini_offset + align_to_sector_size(mini_size)) as u64;
         }
 
         let (mini_size_offset, mini_size_size) =
-            serialize_vec_to_disk(&final_mini_size_mapping, &self.vfs);
+            serialize_vec_to_disk(&final_mini_size_mapping, &self.vfs.read().unwrap());
 
         if mini_size_offset != 0 {
             file_size = (mini_size_offset + align_to_sector_size(mini_size_size)) as u64;
         }
 
-        let (base_offset, base_size) = serialize_vec_to_disk(&final_sorted_base_mapping, &self.vfs);
+        let (base_offset, base_size) =
+            serialize_vec_to_disk(&final_sorted_base_mapping, &self.vfs.read().unwrap());
 
         if base_offset != 0 {
             file_size = (base_offset + align_to_sector_size(base_size)) as u64;
@@ -903,14 +910,15 @@ impl CPRSnapShotMgr {
             magic_end: *BF_TREE_MAGIC_END,
         };
 
-        self.vfs.write(META_DATA_PAGE_OFFSET, metadata.as_slice());
-        self.vfs.flush();
+        let vfs = self.vfs.read().unwrap();
+        vfs.write(META_DATA_PAGE_OFFSET, metadata.as_slice());
+        vfs.flush();
 
         self.reset();
     }
 
     /// Take a CPR snapshot of a Bf-Tree
-    pub fn snapshot(&self, tree: &BfTree) {
+    pub fn snapshot(&self, tree: &BfTree, snapshot_file_path: impl AsRef<Path>) {
         // Allowing only one active snapshot at a time.
         if self
             .snapshot_in_progress
@@ -920,8 +928,17 @@ impl CPRSnapShotMgr {
             return;
         }
 
-        // Clear previous snapshots from the snapshot file
-        self.vfs.reset();
+        // Create a vfs for the snapshot
+        let mut vfs_guard = self.vfs.write().unwrap();
+        let snapshot_vfs = make_vfs(&tree.config.snapshot_backend, snapshot_file_path);
+        let old_vfs = std::mem::replace(&mut *vfs_guard, snapshot_vfs);
+        drop(old_vfs);
+
+        // Reset the snapshot vfs before use
+        vfs_guard.reset();
+
+        // Drop the guard
+        drop(vfs_guard);
 
         // Initialize a inner node and leaf node mapping for the sweep
         let mut sweep_inner_mapping: Vec<(*const InnerNode, usize)> = Vec::new();
@@ -962,6 +979,13 @@ impl CPRSnapShotMgr {
                             leaf_node_count_upper_bound,
                             tree.config.clone(),
                         );
+
+                        // Close the snapshot vfs
+                        let mut vfs_guard = self.vfs.write().unwrap();
+                        let snapshot_vfs = make_vfs(&StorageBackend::Memory, ":memory:");
+                        let old_vfs = std::mem::replace(&mut *vfs_guard, snapshot_vfs);
+                        drop(old_vfs);
+                        drop(vfs_guard);
 
                         // The snapshot is done.
                         break;
@@ -1033,23 +1057,17 @@ impl CPRSnapShotMgr {
     ///    of the tree at the moment of snapshot are reinstated into memory too.
     /// 5. wal_config: optional write-ahead log configuration for the newly recovered Bf-tree
     pub fn new_from_snapshot(
-        recovery_snapshot_file_path: PathBuf, //  The snapshot file to recover from
+        recovery_snapshot_file_path: impl AsRef<Path>, //  The snapshot file to recover from
         use_snapshot: bool,
-        new_snapshot_file_path: Option<PathBuf>, // The snapshot file of the newly recovered Bf-tree
         buffer_ptr: Option<*mut u8>,
         buffer_size: Option<usize>, // buffer size of the newly created Bf-tree
         wal_config: Option<Arc<WalConfig>>,
     ) -> Result<BfTree, ConfigError> {
         // Check the recovery file is valid
-        if !recovery_snapshot_file_path.exists() {
+        if !recovery_snapshot_file_path.as_ref().exists() {
             // if not already exist, we just create a new empty file at the location.
             return Err(ConfigError::SnapshotFileInvalid(
-                "Not found ".to_string()
-                    + &recovery_snapshot_file_path
-                        .clone()
-                        .into_os_string()
-                        .into_string()
-                        .unwrap(),
+                "Not found ".to_string() + recovery_snapshot_file_path.as_ref().to_str().unwrap(),
             ));
         }
 
@@ -1057,7 +1075,7 @@ impl CPRSnapShotMgr {
         let wal = wal_config.as_ref().map(|s| WriteAheadLog::new(s.clone()));
 
         // Retrieve the header of the snapshot file and construct a valid config for the to-be-recovered Bf-tree
-        let reader = std::fs::File::open(recovery_snapshot_file_path.clone()).unwrap();
+        let reader = std::fs::File::open(recovery_snapshot_file_path.as_ref()).unwrap();
         let mut metadata = SectorAlignedVector::new_zeroed(DISK_PAGE_SIZE); // Metadata is at most one disk page in size
         #[cfg(unix)]
         {
@@ -1076,7 +1094,7 @@ impl CPRSnapShotMgr {
 
         let recovery_snapshot_file_backend = StorageBackend::Std; // TODO, recover storage backend from snapshot file
         if !bf_tree_config.cache_only {
-            bf_tree_config.file_path(recovery_snapshot_file_path.clone());
+            bf_tree_config.file_path(recovery_snapshot_file_path.as_ref());
             // The storage backend should use the same vfs system as the recovery snapshot file
             bf_tree_config.storage_backend = recovery_snapshot_file_backend.clone();
         } else {
@@ -1086,16 +1104,9 @@ impl CPRSnapShotMgr {
 
         bf_tree_config.snapshot_backend = StorageBackend::Std; // TODO, allow user chosen snapshot backend
 
-        bf_tree_config.snapshot_file_path = match new_snapshot_file_path {
-            Some(path) => path,
-            None => PathBuf::new(),
-        };
-
         let snapshot_mgr = if bf_tree_config.use_snapshot {
             Some(Arc::new(CPRSnapShotMgr::new(
-                &bf_tree_config.snapshot_backend,
                 bf_tree_config.snapshot_version,
-                &bf_tree_config.snapshot_file_path,
             )))
         } else {
             None
@@ -1121,7 +1132,7 @@ impl CPRSnapShotMgr {
         // Start Bf-Tree re-construction using recovery_snapshot_file_path and the config
         let recovery_snapshot_vfs = make_vfs(
             &recovery_snapshot_file_backend,
-            recovery_snapshot_file_path.clone(),
+            recovery_snapshot_file_path.as_ref(),
         );
 
         // Step 1: reconstruct inner nodes.
@@ -1426,7 +1437,6 @@ impl BfTree {
         recovery_snapshot_file_path: PathBuf, //  The snapshot file to recover from
         wal_file: impl AsRef<Path>,
         use_snapshot: bool,
-        new_snapshot_file_path: Option<PathBuf>, // The snapshot file of the newly recovered Bf-tree
         buffer_ptr: Option<*mut u8>,
         buffer_size: Option<usize>,
         wal: Option<Arc<WalConfig>>,
@@ -1434,7 +1444,6 @@ impl BfTree {
         let bf_tree = BfTree::new_from_cpr_snapshot(
             recovery_snapshot_file_path,
             use_snapshot,
-            new_snapshot_file_path,
             buffer_ptr,
             buffer_size,
             wal,
@@ -1458,20 +1467,19 @@ impl BfTree {
     }
 
     /// Take a new CPR snapshot
-    pub fn cpr_snapshot(&self) {
+    pub fn cpr_snapshot(&self, snapshot_file_path: impl AsRef<Path>) {
         if !self.config.use_snapshot {
             panic!("Snapshots are not enabled in the configuration");
         }
 
         let snpshot_mgr = self.snapshot_mgr.clone().unwrap();
-        snpshot_mgr.snapshot(self);
+        snpshot_mgr.snapshot(self, snapshot_file_path);
     }
 
     /// Recover a BfTree from a CPR snapshot
     pub fn new_from_cpr_snapshot(
-        recovery_snapshot_file_path: PathBuf, //  The snapshot file to recover from
+        recovery_snapshot_file_path: impl AsRef<Path>, //  The snapshot file to recover from
         use_snapshot: bool,
-        new_snapshot_file_path: Option<PathBuf>, // The snapshot file of the newly recovered Bf-tree
         buffer_ptr: Option<*mut u8>,
         buffer_size: Option<usize>,
         wal: Option<Arc<WalConfig>>,
@@ -1479,7 +1487,6 @@ impl BfTree {
         CPRSnapShotMgr::new_from_snapshot(
             recovery_snapshot_file_path,
             use_snapshot,
-            new_snapshot_file_path,
             buffer_ptr,
             buffer_size,
             wal,
@@ -1666,12 +1673,9 @@ mod tests {
         let num_threads: usize = 4;
         let file_path: String = "target/test_simple.bftree".to_string();
         let snapshot_file_path: String = "target/test_simple_snapshot.bftree".to_string();
-        let new_snapshot_file_path: String = "target/test_simple_new_snapshot.bftree".to_string();
 
         let tmp_file_path = std::path::PathBuf::from_str(&file_path).unwrap();
         let tmp_snapshot_file_path = std::path::PathBuf::from_str(&snapshot_file_path).unwrap();
-        let tmp_new_snapshot_file_path =
-            std::path::PathBuf::from_str(&new_snapshot_file_path).unwrap();
 
         let mut config = Config::new(&tmp_file_path, 128 * 1024); // 128KB buffer pool. insert/split/eviction all triggered
         config.storage_backend(crate::StorageBackend::Std);
@@ -1679,7 +1683,6 @@ mod tests {
         config.cb_max_record_size = max_record_size;
         config.leaf_page_size = leaf_page_size;
         config.max_fence_len = max_record_size;
-        config.snapshot_file_path = tmp_snapshot_file_path.clone();
         config.use_snapshot(true);
 
         let bftree = Arc::new(BfTree::with_config(config.clone(), None).unwrap());
@@ -1719,7 +1722,8 @@ mod tests {
         thread::sleep(std::time::Duration::from_secs(5));
         for _ in 0..snapshot_num {
             // take a snapshot
-            bftree.cpr_snapshot();
+            let _ = std::fs::remove_file(&tmp_snapshot_file_path);
+            bftree.cpr_snapshot(&tmp_snapshot_file_path);
             thread::sleep(std::time::Duration::from_secs(5));
         }
 
@@ -1737,7 +1741,6 @@ mod tests {
         let bftree = BfTree::new_from_cpr_snapshot(
             std::path::PathBuf::from_str(&snapshot_file_path).unwrap(),
             true,
-            Some(std::path::PathBuf::from_str(&(new_snapshot_file_path)).unwrap()),
             None,
             None,
             None,
@@ -1792,7 +1795,6 @@ mod tests {
         }
 
         std::fs::remove_file(tmp_file_path).unwrap();
-        std::fs::remove_file(tmp_new_snapshot_file_path).unwrap();
         std::fs::remove_file(tmp_snapshot_file_path).unwrap();
     }
 
@@ -1805,11 +1807,7 @@ mod tests {
 
         let snapshot_file_path: String =
             "target/test_simple_cache_only_snapshot.bftree".to_string();
-        let new_snapshot_file_path: String =
-            "target/test_simple_cache_only_new_snapshot.bftree".to_string();
         let tmp_snapshot_file_path = std::path::PathBuf::from_str(&snapshot_file_path).unwrap();
-        let tmp_new_snapshot_file_path =
-            std::path::PathBuf::from_str(&new_snapshot_file_path).unwrap();
 
         let mut config = Config::default(); // Creat a CB that can hold 16 full pages
         config.storage_backend(crate::StorageBackend::Memory);
@@ -1820,7 +1818,6 @@ mod tests {
         config.cb_max_record_size = max_record_size;
         config.leaf_page_size = leaf_page_size;
         config.max_fence_len = max_record_size;
-        config.snapshot_file_path = tmp_snapshot_file_path.clone();
         config.use_snapshot(true);
 
         let bftree = Arc::new(BfTree::with_config(config.clone(), None).unwrap());
@@ -1859,7 +1856,7 @@ mod tests {
 
         thread::sleep(std::time::Duration::from_secs(5));
         // take a snapshot
-        bftree.cpr_snapshot();
+        bftree.cpr_snapshot(&tmp_snapshot_file_path);
         thread::sleep(std::time::Duration::from_secs(5));
 
         // Stop all writer threads
@@ -1876,7 +1873,6 @@ mod tests {
         let bftree = BfTree::new_from_cpr_snapshot(
             std::path::PathBuf::from_str(&snapshot_file_path).unwrap(),
             true,
-            Some(std::path::PathBuf::from_str(&(new_snapshot_file_path)).unwrap()),
             None,
             None,
             None,
@@ -1931,6 +1927,5 @@ mod tests {
         }
 
         std::fs::remove_file(tmp_snapshot_file_path).unwrap();
-        std::fs::remove_file(tmp_new_snapshot_file_path).unwrap();
     }
 }

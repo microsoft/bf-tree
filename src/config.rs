@@ -49,7 +49,6 @@ pub struct Config {
     pub(crate) file_path: PathBuf,
     pub(crate) use_snapshot: bool,
     pub(crate) snapshot_version: u64,
-    pub(crate) snapshot_file_path: PathBuf,
     pub(crate) max_mini_page_size: usize,
     pub(crate) mini_page_binary_search: bool,
     pub(crate) write_ahead_log: Option<Arc<WalConfig>>,
@@ -75,7 +74,6 @@ impl Clone for Config {
             cb_copy_on_access_ratio: self.cb_copy_on_access_ratio,
             read_record_cache: self.read_record_cache,
             file_path: self.file_path.clone(),
-            snapshot_file_path: self.snapshot_file_path.clone(),
             max_mini_page_size: self.max_mini_page_size,
             mini_page_binary_search: self.mini_page_binary_search,
             write_ahead_log: self.write_ahead_log.clone(),
@@ -109,7 +107,6 @@ pub struct ConfigFile {
     pub(crate) cb_max_key_len: usize,
     pub(crate) leaf_page_size: usize,
     pub(crate) index_file_path: String,
-    pub(crate) snapshot_file_path: String,
     pub(crate) use_snapshot: bool,
     pub(crate) snapshot_version: u64,
     pub(crate) backend_storage: String,
@@ -154,7 +151,6 @@ impl Default for Config {
             write_ahead_log: None,
             write_load_full_page: true,
             cache_only: false,
-            snapshot_file_path: PathBuf::from("targets/snapshot"),
         }
     }
 }
@@ -211,7 +207,6 @@ impl Config {
             max_fence_len: config_file.cb_max_key_len * 2,
             cb_copy_on_access_ratio: DEFAULT_COPY_ON_ACCESS_RATIO,
             file_path: PathBuf::from(config_file.index_file_path),
-            snapshot_file_path: PathBuf::from(config_file.snapshot_file_path),
             read_record_cache: true,
             max_mini_page_size: DEFAULT_MAX_MINI_PAGE_SIZE,
             mini_page_binary_search: true,
@@ -259,14 +254,6 @@ impl Config {
 
     pub fn write_load_full_page(&mut self, load_full_page: bool) -> &mut Self {
         self.write_load_full_page = load_full_page;
-        self
-    }
-
-    /// Default: Std
-    ///
-    /// Override the storage backend used for snapshot files.
-    pub fn snapshot_backend(&mut self, backend: StorageBackend) -> &mut Self {
-        self.snapshot_backend = backend;
         self
     }
 
@@ -364,11 +351,6 @@ impl Config {
 
     pub fn file_path<P: AsRef<Path>>(&mut self, file_path: P) -> &mut Self {
         self.file_path = file_path.as_ref().to_path_buf();
-        self
-    }
-
-    pub fn snapshot_file_path<P: AsRef<Path>>(&mut self, file_path: P) -> &mut Self {
-        self.snapshot_file_path = file_path.as_ref().to_path_buf();
         self
     }
 
@@ -547,15 +529,6 @@ impl Config {
             return Err(ConfigError::CircularBufferSize(
                 "In non cache-only mode, cb_size_byte should be at least 2 times of leaf_page_size"
                     .to_string(),
-            ));
-        }
-
-        if self.use_snapshot
-            && self.file_path == self.snapshot_file_path
-            && self.snapshot_file_path != PathBuf::new()
-        {
-            return Err(ConfigError::SnapshotFileInvalid(
-                "snapshot file path should not be the same as the main file path".to_string(),
             ));
         }
 

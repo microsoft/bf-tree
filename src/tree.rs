@@ -321,11 +321,7 @@ impl BfTree {
         // In cache-only mode, the initial root page is a full mini-page
         if config.cache_only {
             let snapshot_mgr = if config.use_snapshot {
-                Some(Arc::new(CPRSnapShotMgr::new(
-                    &config.snapshot_backend,
-                    config.snapshot_version,
-                    &config.snapshot_file_path,
-                )))
+                Some(Arc::new(CPRSnapShotMgr::new(config.snapshot_version)))
             } else {
                 None
             };
@@ -384,11 +380,7 @@ impl BfTree {
         }
 
         let snapshot_mgr = if config.use_snapshot {
-            Some(Arc::new(CPRSnapShotMgr::new(
-                &config.snapshot_backend,
-                config.snapshot_version,
-                &config.snapshot_file_path,
-            )))
+            Some(Arc::new(CPRSnapShotMgr::new(config.snapshot_version)))
         } else {
             None
         };

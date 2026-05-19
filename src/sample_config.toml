@@ -6,7 +6,6 @@ cb_max_record_size = 2048
 cb_max_key_len = 8
 leaf_page_size = 4096
 index_file_path = "c/d/E"
-snapshot_file_path = "c/d/F"
 backend_storage = "disk"
 read_promotion_rate = 100
 write_load_full_page = true
