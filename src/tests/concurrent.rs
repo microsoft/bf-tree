@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use rand_test::{
+use rand::{
     distr::{Distribution, StandardUniform, Uniform},
     rngs::StdRng,
     SeedableRng,
@@ -21,7 +21,7 @@ use crate::{BfTree, Config, StorageBackend};
 use shuttle::rand::{thread_rng, Rng};
 
 #[cfg(not(feature = "shuttle"))]
-use rand::{thread_rng, Rng};
+use rand::Rng;
 
 fn make_key(key: u32, len: usize) -> Vec<u8> {
     let bytes = key.to_ne_bytes();
@@ -58,22 +58,22 @@ fn concurrent_ops() {
         let handle = thread::spawn(move || {
             let mut buffer = vec![0u8; 4096];
 
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             let current_tid = thread::current().id();
             black_box(current_tid);
 
             for op_n in 0..config.op_cnt_per_thread {
                 black_box(op_n);
-                match rng.gen_range(0..OP_RANGE) {
+                match rng.random_range(0..OP_RANGE) {
                     0..=1 => {
                         // insert
-                        let key = rng.gen_range(0..config.key_range);
+                        let key = rng.random_range(0..config.key_range);
                         let kv = make_key(key, config.key_len);
                         let _unused = tree_clone.insert(&kv, &kv);
                     }
                     2 => {
                         // read
-                        let key = rng.gen_range(0..config.key_range);
+                        let key = rng.random_range(0..config.key_range);
                         let kv = make_key(key, config.key_len);
                         let cnt = tree_clone.read(&kv, &mut buffer);
 
@@ -86,7 +86,7 @@ fn concurrent_ops() {
                     }
                     3 => {
                         // delete
-                        let key = rng.gen_range(0..config.key_range);
+                        let key = rng.random_range(0..config.key_range);
                         let kv = make_key(key, config.key_len);
                         tree_clone.delete(&kv);
                     }

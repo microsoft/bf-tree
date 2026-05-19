@@ -452,11 +452,11 @@ impl BfTree {
     }
 
     pub(crate) fn should_promote_read(&self) -> bool {
-        get_rng().gen_range(0..100) < self.config.read_promotion_rate.load(Ordering::Relaxed)
+        get_rng().random_range(0..100) < self.config.read_promotion_rate.load(Ordering::Relaxed)
     }
 
     pub(crate) fn should_promote_scan_page(&self) -> bool {
-        get_rng().gen_range(0..100) < self.config.scan_promotion_rate.load(Ordering::Relaxed)
+        get_rng().random_range(0..100) < self.config.scan_promotion_rate.load(Ordering::Relaxed)
     }
 
     /// Chance% to promote a base read record to mini page.
