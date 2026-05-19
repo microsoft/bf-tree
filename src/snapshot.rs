@@ -361,7 +361,7 @@ impl CPRSnapShotMgr {
             return Err(());
         }
 
-        let start = get_rng().gen_range(0..DEFAULT_MAX_SNAPSHOT_THREAD_NUM);
+        let start = get_rng().random_range(0..DEFAULT_MAX_SNAPSHOT_THREAD_NUM);
         let end = 2 * DEFAULT_MAX_SNAPSHOT_THREAD_NUM;
 
         for i in start..end {

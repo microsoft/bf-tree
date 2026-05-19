@@ -92,7 +92,7 @@ impl Default for Backoff {
 use std::rc::Rc;
 
 use rand::rngs::SmallRng;
-use rand::{Error, RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng};
 
 use crate::nodes::PageID;
 use crate::BfTree;
@@ -143,13 +143,6 @@ impl RngCore for SmallThreadRng {
         // creates another mutable reference
         let rng = unsafe { &mut *self.rng.get() };
         rng.fill_bytes(dest)
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
-        // SAFETY: We must make sure to stop using `rng` before anyone else
-        // creates another mutable reference
-        let rng = unsafe { &mut *self.rng.get() };
-        rng.try_fill_bytes(dest)
     }
 }
 
