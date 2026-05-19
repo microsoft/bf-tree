@@ -36,11 +36,13 @@ pub enum Counter {
     ScanGoNextLeaf = 25,
     ScanFullPage = 26,
     ScanBasePage = 27,
-    ScanPromoteBaseToFull = 28,
-    ScanMergeMiniPage = 29,
-    InsertLocked = 30,
-    InsertCircularBufferFull = 31,
-    InsertNeedRestart = 32,
+    ScanMiniPage = 28,
+    ScanNullPage = 29,
+    ScanPromoteBaseToFull = 30,
+    ScanMergeMiniPage = 31,
+    InsertLocked = 32,
+    InsertCircularBufferFull = 33,
+    InsertNeedRestart = 34,
 }
 
 #[derive(Debug, Clone)]
