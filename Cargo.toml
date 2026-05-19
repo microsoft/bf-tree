@@ -1,6 +1,6 @@
 [package]
 name = "bf-tree"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT"
 description = "Bf-Tree is a modern read-write-optimized concurrent larger-than-memory range index in Rust from Microsoft Research."
@@ -8,10 +8,9 @@ description = "Bf-Tree is a modern read-write-optimized concurrent larger-than-m
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rand = { version = "0.8.5", features = ["small_rng"] }
-rand_test = {package = "rand", version = "0.9.2"}
+rand = { version = "0.9.4", features = ["small_rng"] }
 tracing = { version = "0.1", optional = true }
-serde = { version = "1", features = ["derive"]}
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.116"
 auto_ops = { version = "0.3", optional = true }
 hdrhistogram = { version = "7.5.4", optional = true }
@@ -28,7 +27,10 @@ libc = "0.2.155"
 #crossbeam-queue = { version = "0.3.11", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59.0", features = ["Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys = { version = "0.59.0", features = [
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
 
 [dev-dependencies]
 proptest = "1.6.0"
@@ -45,16 +47,36 @@ tracing = ["dep:tracing"]
 #spdk = ["dep:spdk-rs", "dep:crossbeam-queue"]
 
 # Whether to compile metrics or not
-metrics = ["dep:auto_ops", "dep:hdrhistogram", "dep:chrono", "dep:variant_count"]
+metrics = [
+    "dep:auto_ops",
+    "dep:hdrhistogram",
+    "dep:chrono",
+    "dep:variant_count",
+]
 # Whether to enable release metrics at runtime
 # Release metrics are saved in static crate-level tls and each thread can only access its own copy of metrics. Low overhead
-metrics-rt = ["dep:auto_ops", "dep:hdrhistogram", "dep:chrono", "dep:variant_count"]
+metrics-rt = [
+    "dep:auto_ops",
+    "dep:hdrhistogram",
+    "dep:chrono",
+    "dep:variant_count",
+]
 # Whether to enable debug all metrics at runtime
 # Debug metrics are bf-tree level tls. A thread can exclusively access (mut) all tls copies of the metrics of a bf-tree. High overhead
-metrics-rt-debug-all = ["dep:auto_ops", "dep:hdrhistogram", "dep:chrono", "dep:variant_count"]
+metrics-rt-debug-all = [
+    "dep:auto_ops",
+    "dep:hdrhistogram",
+    "dep:chrono",
+    "dep:variant_count",
+]
 # Whether to enable only the debug timer metrics at runtime
 # Only enable debug timer metrics. This is useful as r/w timers could be affected by counter/gauge metrics when all are enabled
-metrics-rt-debug-timer = ["dep:auto_ops", "dep:hdrhistogram", "dep:chrono", "dep:variant_count"]
+metrics-rt-debug-timer = [
+    "dep:auto_ops",
+    "dep:hdrhistogram",
+    "dep:chrono",
+    "dep:variant_count",
+]
 
 [profile.release]
 debug = true
