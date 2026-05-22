@@ -947,21 +947,13 @@ impl BfTree {
                 );
 
                 // CPR snapshot guard for proper snapshot version setting of the root page
-                let snapshot_guard =
+                let _snapshot_guard =
                     match CPRSnapShotMgr::get_snapshot_guard(self.snapshot_mgr.clone()) {
                         Ok(guard) => guard,
                         Err(()) => {
                             return Err(TreeError::NeedRestart);
                         }
                     };
-
-                if snapshot_guard.is_protected() {
-                    // Snapshot the NULL page assuming it is of version v
-                    // as we don't know whether the existing page has been snapshotted or not
-                    // and the new page will be of version v+1.
-                    // TODO: Versioning of NULL page
-                    snapshot_guard.snapshot_mini_page(pid, &[], 0);
-                }
 
                 let mini_page_guard = self.storage.alloc_mini_page(mini_page_size)?;
                 LeafNode::initialize_mini_page(
