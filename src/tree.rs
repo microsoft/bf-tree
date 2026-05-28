@@ -30,7 +30,7 @@ use crate::{
         INNER_NODE_SIZE, MAX_KEY_LEN, MAX_LEAF_PAGE_SIZE, MAX_VALUE_LEN,
     },
     range_scan::{ScanIter, ScanIterMut, ScanReturnField},
-    snapshot::CPRSnapShotMgr,
+    snapshot::{CPRSnapShotMgr, PhaseId},
     storage::{LeafStorage, PageLocation, PageTable},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -330,7 +330,7 @@ impl BfTree {
 
             // CPR snapshot guard for proper snapshot version setting of the root page
             // No need for CPR logic
-            let _snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
+            let snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
                 Ok(guard) => guard,
                 Err(()) => {
                     panic!("Failed to acquire a snapshot guard for root page initialization");
@@ -346,6 +346,7 @@ impl BfTree {
                 config.leaf_page_size,
                 MiniPageNextLevel::new_null(),
                 true,
+                snapshot_guard.snapshot_version(),
             );
             let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
             let mini_loc = PageLocation::Mini(new_mini_ptr);
@@ -389,14 +390,16 @@ impl BfTree {
 
         // CPR snapshot guard for proper snapshot version setting of the root page
         // No need for CPR logic
-        let _snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
+        let snapshot_guard = match CPRSnapShotMgr::get_snapshot_guard(snapshot_mgr.clone()) {
             Ok(guard) => guard,
             Err(()) => {
                 panic!("Failed to acquire a snapshot guard for root page initialization");
             }
         };
 
-        let (root_id, root_lock) = leaf_storage.mapping_table().alloc_base_page_mapping();
+        let (root_id, root_lock) = leaf_storage
+            .mapping_table()
+            .alloc_base_page_mapping(snapshot_guard.snapshot_version());
         drop(root_lock);
         assert_eq!(root_id.as_id(), 0);
 
@@ -499,17 +502,46 @@ impl BfTree {
             }
             None => {
                 if snapshot_guard.is_protected() {
-                    let local_thread_snapshot_version =
-                        CPRSnapShotMgr::get_snapshot_thread_version();
+                    let local_thread_snapshot_version = snapshot_guard.snapshot_version();
                     match snapshot_guard.get_local_phase_id() {
-                        // PREPARE
-                        1 => {
+                        PhaseId::Rest => {
                             if self.cache_only {
                                 let root_page_loc = cur_page.get_page_location().clone();
                                 match root_page_loc {
                                     PageLocation::Mini(ptr) => {
                                         let root_page = cur_page.load_cache_page_mut(ptr);
-                                        if root_page.get_snapshot_version()
+                                        if root_page.get_clean_snapshot_version()
+                                            < local_thread_snapshot_version
+                                        {
+                                            root_page.set_snapshot_version(
+                                                local_thread_snapshot_version,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        panic!(
+                                            "The root node is not a mini-page in cache-only mode"
+                                        )
+                                    }
+                                }
+                            } else {
+                                let root_page = cur_page.load_base_page_mut();
+                                if root_page.get_clean_snapshot_version()
+                                    < local_thread_snapshot_version
+                                {
+                                    root_page
+                                        .set_snapshot_version(local_thread_snapshot_version, false);
+                                }
+                            }
+                        }
+                        PhaseId::Prepare => {
+                            if self.cache_only {
+                                let root_page_loc = cur_page.get_page_location().clone();
+                                match root_page_loc {
+                                    PageLocation::Mini(ptr) => {
+                                        let root_page = cur_page.load_cache_page_mut(ptr);
+                                        if root_page.get_clean_snapshot_version()
                                             > local_thread_snapshot_version
                                         {
                                             return Err(TreeError::NeedRestart);
@@ -523,20 +555,20 @@ impl BfTree {
                                 }
                             } else {
                                 let root_page = cur_page.load_base_page_mut();
-                                if root_page.get_snapshot_version() > local_thread_snapshot_version
+                                if root_page.get_clean_snapshot_version()
+                                    > local_thread_snapshot_version
                                 {
                                     return Err(TreeError::NeedRestart);
                                 }
                             }
                         }
-                        // INPROG or SWEEPING
-                        2 | 3 => {
+                        PhaseId::InProgress | PhaseId::Sweep => {
                             if self.cache_only {
                                 let root_page_loc = cur_page.get_page_location().clone();
                                 match root_page_loc {
                                     PageLocation::Mini(ptr) => {
                                         let root_page = cur_page.load_cache_page_mut(ptr);
-                                        if root_page.get_snapshot_version()
+                                        if root_page.get_clean_snapshot_version()
                                             < local_thread_snapshot_version
                                         {
                                             let root_page_ptr = unsafe {
@@ -565,7 +597,8 @@ impl BfTree {
                                 }
                             } else {
                                 let root_page = cur_page.load_base_page_mut();
-                                if root_page.get_snapshot_version() < local_thread_snapshot_version
+                                if root_page.get_clean_snapshot_version()
+                                    < local_thread_snapshot_version
                                 {
                                     let root_page_ptr = unsafe {
                                         std::slice::from_raw_parts(
@@ -584,7 +617,6 @@ impl BfTree {
                                 }
                             }
                         }
-                        _ => {}
                     }
                 }
 
@@ -603,6 +635,7 @@ impl BfTree {
                         self.config.leaf_page_size,
                         MiniPageNextLevel::new_null(),
                         true,
+                        snapshot_guard.snapshot_version(),
                     );
                     let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
                     let mini_loc = PageLocation::Mini(new_mini_ptr);
@@ -619,7 +652,11 @@ impl BfTree {
                         PageLocation::Mini(ptr) => {
                             let cur_mini_page = cur_page.load_cache_page_mut(ptr);
                             let sibling_page = unsafe { &mut *new_mini_ptr };
-                            let split_key = cur_mini_page.split(sibling_page, true);
+                            let split_key = cur_mini_page.split(
+                                sibling_page,
+                                true,
+                                snapshot_guard.snapshot_version(),
+                            );
 
                             let mut new_root_builder = InnerNodeBuilder::new();
                             new_root_builder
@@ -627,7 +664,8 @@ impl BfTree {
                                 .set_children_is_leaf(true)
                                 .add_record(split_key, sibling_id);
 
-                            let new_root_ptr = new_root_builder.build();
+                            let new_root_ptr =
+                                new_root_builder.build(snapshot_guard.snapshot_version());
                             unsafe { (*new_root_ptr).set_root(true) };
                             self.root_page_id
                                 .store(PageID::from_pointer(new_root_ptr).raw(), Ordering::Release);
@@ -647,15 +685,18 @@ impl BfTree {
 
                 let mut x_page = cur_page;
 
-                let (sibling_id, mut sibling_entry) = self.alloc_base_page_and_lock();
+                // Guarantee: the new sibling node has the same snapshot version as the current thread.
+                let (sibling_id, mut sibling_entry) =
+                    self.alloc_base_page_and_lock(snapshot_guard.snapshot_version());
 
                 info!(sibling = sibling_id.raw(), "Splitting root node!");
 
                 let sibling = sibling_entry.load_base_page_mut();
 
                 let leaf_node = x_page.load_base_page_mut();
-                let split_key = leaf_node.split(sibling, false);
+                let split_key = leaf_node.split(sibling, false, snapshot_guard.snapshot_version());
 
+                // Guarantee: The new root node has the same snapshot version as the current thread.
                 let mut new_root_builder = InnerNodeBuilder::new();
                 new_root_builder
                     .set_disk_offset(self.storage.alloc_disk_offset(INNER_NODE_SIZE))
@@ -663,7 +704,7 @@ impl BfTree {
                     .set_children_is_leaf(true)
                     .add_record(split_key, sibling_id);
 
-                let new_root_ptr = new_root_builder.build();
+                let new_root_ptr = new_root_builder.build(snapshot_guard.snapshot_version());
 
                 unsafe { (*new_root_ptr).set_root(true) };
 
@@ -676,8 +717,10 @@ impl BfTree {
         }
     }
 
-    fn alloc_base_page_and_lock(&self) -> (PageID, LeafEntryXLocked<'_>) {
-        let (pid, base_entry) = self.mapping_table().alloc_base_page_mapping();
+    fn alloc_base_page_and_lock(&self, snapshot_version: u64) -> (PageID, LeafEntryXLocked<'_>) {
+        let (pid, base_entry) = self
+            .mapping_table()
+            .alloc_base_page_mapping(snapshot_version);
 
         (pid, base_entry)
     }
@@ -714,22 +757,37 @@ impl BfTree {
 
                 // CPR snapshot
                 if snapshot_guard.is_protected() {
-                    let local_thread_snapshot_version =
-                        CPRSnapShotMgr::get_snapshot_thread_version();
+                    let local_thread_snapshot_version = snapshot_guard.snapshot_version();
 
                     match snapshot_guard.get_local_phase_id() {
-                        // PREPARE
-                        1 if x_parent.as_ref().get_snapshot_version()
-                            > local_thread_snapshot_version
-                            || x_cur.as_ref().get_snapshot_version()
-                                > local_thread_snapshot_version =>
+                        PhaseId::Rest => {
+                            if x_parent.as_ref().get_clean_snapshot_version()
+                                < local_thread_snapshot_version
+                            {
+                                x_parent
+                                    .as_mut()
+                                    .set_snapshot_version(local_thread_snapshot_version);
+                            }
+
+                            if x_cur.as_ref().get_clean_snapshot_version()
+                                < local_thread_snapshot_version
+                            {
+                                x_cur
+                                    .as_mut()
+                                    .set_snapshot_version(local_thread_snapshot_version);
+                            }
+                        }
+                        PhaseId::Prepare
+                            if x_parent.as_ref().get_clean_snapshot_version()
+                                > local_thread_snapshot_version
+                                || x_cur.as_ref().get_clean_snapshot_version()
+                                    > local_thread_snapshot_version =>
                         {
                             // Abort if either page has been taken a snapshot before.
                             return Err(TreeError::NeedRestart);
                         }
-                        // INPROG or SWEEPING
-                        2 | 3 => {
-                            if x_parent.as_ref().get_snapshot_version()
+                        PhaseId::InProgress | PhaseId::Sweep => {
+                            if x_parent.as_ref().get_clean_snapshot_version()
                                 < local_thread_snapshot_version
                             {
                                 snapshot_guard.snapshot_inner_node(x_parent.as_ref());
@@ -751,7 +809,8 @@ impl BfTree {
                                 }
                             }
 
-                            if x_cur.as_ref().get_snapshot_version() < local_thread_snapshot_version
+                            if x_cur.as_ref().get_clean_snapshot_version()
+                                < local_thread_snapshot_version
                             {
                                 snapshot_guard.snapshot_inner_node(x_cur.as_ref());
                                 x_cur
@@ -765,6 +824,7 @@ impl BfTree {
 
                 let split_key = x_cur.as_ref().get_split_key();
 
+                // Guarantee: the new sibling node has the same snapshot version as the current thread.
                 let mut sibling_builder = InnerNodeBuilder::new();
                 sibling_builder.set_disk_offset(self.storage.alloc_disk_offset(INNER_NODE_SIZE));
 
@@ -776,9 +836,11 @@ impl BfTree {
                     return Err(TreeError::NeedRestart);
                 }
 
-                x_cur.as_mut().split(&mut sibling_builder);
+                x_cur
+                    .as_mut()
+                    .split(&mut sibling_builder, snapshot_guard.snapshot_version());
 
-                sibling_builder.build();
+                sibling_builder.build(snapshot_guard.snapshot_version());
 
                 Ok((true, Some(x_parent.downgrade())))
             }
@@ -787,20 +849,26 @@ impl BfTree {
 
                 // CPR snapshot
                 if snapshot_guard.is_protected() {
-                    let local_thread_snapshot_version =
-                        CPRSnapShotMgr::get_snapshot_thread_version();
+                    let local_thread_snapshot_version = snapshot_guard.snapshot_version();
 
                     match snapshot_guard.get_local_phase_id() {
-                        // PREPARE
-                        1 if x_cur.as_ref().get_snapshot_version()
-                            > local_thread_snapshot_version =>
+                        PhaseId::Rest
+                            if x_cur.as_ref().get_clean_snapshot_version()
+                                < local_thread_snapshot_version =>
+                        {
+                            x_cur
+                                .as_mut()
+                                .set_snapshot_version(local_thread_snapshot_version);
+                        }
+                        PhaseId::Prepare
+                            if x_cur.as_ref().get_clean_snapshot_version()
+                                > local_thread_snapshot_version =>
                         {
                             // Abort if either page has been taken a snapshot before.
                             return Err(TreeError::NeedRestart);
                         }
-                        // INPROG or SWEEPING
-                        2 | 3
-                            if x_cur.as_ref().get_snapshot_version()
+                        PhaseId::InProgress | PhaseId::Sweep
+                            if x_cur.as_ref().get_clean_snapshot_version()
                                 < local_thread_snapshot_version =>
                         {
                             snapshot_guard.snapshot_inner_node(x_cur.as_ref());
@@ -824,21 +892,25 @@ impl BfTree {
                     }
                 }
 
+                // Guarantee: The new root node has the same snapshot version as the current thread.
                 let mut sibling_builder = InnerNodeBuilder::new();
                 sibling_builder.set_disk_offset(self.storage.alloc_disk_offset(INNER_NODE_SIZE));
                 let sibling_id = sibling_builder.get_page_id();
 
-                let split_key = x_cur.as_mut().split(&mut sibling_builder);
+                let split_key = x_cur
+                    .as_mut()
+                    .split(&mut sibling_builder, snapshot_guard.snapshot_version());
                 x_cur.as_mut().set_root(false);
 
+                // Guarantee: The new root node has the same snapshot version as the current thread.
                 let mut new_root_builder = InnerNodeBuilder::new();
                 new_root_builder
                     .set_disk_offset(self.storage.alloc_disk_offset(INNER_NODE_SIZE))
                     .set_left_most_page_id(cur_page)
                     .set_children_is_leaf(false)
                     .add_record(split_key, sibling_id);
-                sibling_builder.build();
-                let new_root_ptr = new_root_builder.build();
+                sibling_builder.build(snapshot_guard.snapshot_version());
+                let new_root_ptr = new_root_builder.build(snapshot_guard.snapshot_version());
 
                 unsafe { (*new_root_ptr).set_root(true) };
 
@@ -946,8 +1018,8 @@ impl BfTree {
                     self.cache_only,
                 );
 
-                // CPR snapshot guard for proper snapshot version setting of the root page
-                let _snapshot_guard =
+                // CPR snapshot guard for proper snapshot version setting of the new mini-page
+                let snapshot_guard =
                     match CPRSnapShotMgr::get_snapshot_guard(self.snapshot_mgr.clone()) {
                         Ok(guard) => guard,
                         Err(()) => {
@@ -961,6 +1033,7 @@ impl BfTree {
                     mini_page_size,
                     MiniPageNextLevel::new_null(),
                     true,
+                    snapshot_guard.snapshot_version(),
                 );
                 let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
                 let mini_loc = PageLocation::Mini(new_mini_ptr);

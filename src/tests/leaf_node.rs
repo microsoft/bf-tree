@@ -17,7 +17,8 @@ enum LeafTestOp {
 
 fn leaf_insert_read(input: Vec<(Vec<u8>, Vec<u8>, LeafTestOp)>) {
     let mut model = HashMap::<Vec<u8>, Vec<u8>>::new();
-    let leaf = unsafe { &mut *LeafNode::make_base_page(4096) };
+    let leaf =
+        unsafe { &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION) };
     let mut out_buffer = vec![0u8; 1024]; // Buffer for reading from LeafNode
 
     for (k, v, op) in input.iter() {
@@ -59,7 +60,7 @@ fn leaf_insert_read(input: Vec<(Vec<u8>, Vec<u8>, LeafTestOp)>) {
         assert_eq!(&out_buffer[0..v.len()], v);
     }
 
-    leaf.consolidate();
+    leaf.consolidate(crate::snapshot::INVALID_SNAPSHOT_VERSION);
     let leaf_cnt = leaf.meta.meta_count_without_fence();
     assert_eq!(model_cnt, leaf_cnt as usize);
 

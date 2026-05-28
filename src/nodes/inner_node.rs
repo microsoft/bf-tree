@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{snapshot::CPRSnapShotMgr, storage::DiskOffsetGuard, sync::atomic::AtomicU16};
+use crate::{storage::DiskOffsetGuard, sync::atomic::AtomicU64};
 use std::cmp::Ordering;
 
 use super::{node_meta::NodeMeta, PageID, INNER_NODE_SIZE};
@@ -41,14 +41,14 @@ impl InnerKVMeta {
 #[repr(C)]
 pub(crate) struct InnerNode {
     pub(crate) meta: NodeMeta,
-    pub(crate) version_lock: AtomicU16, // Is 16 bits enough?
+    pub(crate) version_lock: AtomicU64,
     pub(crate) disk_offset: u64,
     snapshot_version: u64,
     data: [u8; 0],
 }
 
 #[cfg(not(feature = "shuttle"))]
-const _: () = assert!(std::mem::size_of::<InnerNode>() == 24);
+const _: () = assert!(std::mem::size_of::<InnerNode>() == 32);
 
 struct InnerPtrGuard {
     ptr: *mut InnerNode,
@@ -119,7 +119,7 @@ impl<'a> InnerNodeBuilder<'a> {
         PageID::from_pointer(self.raw_ptr.ptr)
     }
 
-    pub(crate) fn build(self) -> *mut InnerNode {
+    pub(crate) fn build(self, snapshot_version: u64) -> *mut InnerNode {
         let node = unsafe { &mut *self.raw_ptr.ptr };
         let offset = match self.disk_offset {
             Some(x) => x.take(),
@@ -127,8 +127,10 @@ impl<'a> InnerNodeBuilder<'a> {
         };
 
         unsafe {
-            std::ptr::write(&mut node.version_lock, AtomicU16::new(0));
+            std::ptr::write(&mut node.version_lock, AtomicU64::new(0));
         }
+        // Zero snapshot_version to clear any garbage (including root flag) from uninitialized memory
+        node.snapshot_version = 0;
         node.reinitialize(
             self.left_most_page_id.unwrap(),
             self.children_is_leaf.unwrap(),
@@ -140,7 +142,6 @@ impl<'a> InnerNodeBuilder<'a> {
         }
 
         // Note that, when snapshot is not enabled the version of a leaf node would be the INVALID_SNAPSHOT_VERSION
-        let snapshot_version = CPRSnapShotMgr::get_snapshot_thread_version();
         node.set_snapshot_version(snapshot_version);
 
         self.raw_ptr.take()
@@ -152,7 +153,7 @@ impl<'a> InnerNodeBuilder<'a> {
             std::ptr::copy_nonoverlapping(slice.as_ptr(), ptr as *mut u8, INNER_NODE_SIZE);
         }
         unsafe {
-            (&mut *ptr).version_lock = AtomicU16::new(0);
+            (&mut *ptr).version_lock = AtomicU64::new(0);
         }
         ptr
     }
@@ -242,11 +243,12 @@ impl InnerNode {
         rt
     }
 
-    pub(crate) fn get_snapshot_version(&self) -> u64 {
+    pub(crate) fn get_clean_snapshot_version(&self) -> u64 {
         self.snapshot_version & INNER_NODE_SNAPSHOT_VERSION_MASK
     }
 
     pub(crate) fn set_snapshot_version(&mut self, snapshot_version: u64) {
+        assert_eq!(snapshot_version & INNER_NODE_ROOT_FLAG, 0);
         let root_flag = self.snapshot_version & INNER_NODE_ROOT_FLAG;
         self.snapshot_version = (snapshot_version & INNER_NODE_SNAPSHOT_VERSION_MASK) | root_flag;
     }
@@ -423,7 +425,7 @@ impl InnerNode {
         true
     }
 
-    pub(crate) fn consolidate(&mut self) {
+    pub(crate) fn consolidate(&mut self, snapshot_version: u64) {
         let mut pairs: Vec<(Vec<u8>, PageID)> = Vec::new();
         for i in 1..self.meta.meta_count_with_fence() {
             let meta = self.get_kv_meta(i);
@@ -435,7 +437,6 @@ impl InnerNode {
         self.reinitialize(left_most_page_id, children_is_leaf, self.disk_offset);
 
         // Note that, when snapshot is not enabled the version of a leaf node would be the INVALID_SNAPSHOT_VERSION
-        let snapshot_version = CPRSnapShotMgr::get_snapshot_thread_version();
         self.set_snapshot_version(snapshot_version);
 
         for (key, id) in pairs {
@@ -450,7 +451,11 @@ impl InnerNode {
         self.get_full_key(split_meta)
     }
 
-    pub(crate) fn split(&mut self, new_node: &mut InnerNodeBuilder) -> Vec<u8> {
+    pub(crate) fn split(
+        &mut self,
+        new_node: &mut InnerNodeBuilder,
+        snapshot_version: u64,
+    ) -> Vec<u8> {
         let current_count = self.meta.meta_count_with_fence();
         let sibling_node_count = current_count / 2;
         let new_node_count = current_count - sibling_node_count;
@@ -475,7 +480,7 @@ impl InnerNode {
         }
 
         self.meta.set_value_count(new_node_count);
-        self.consolidate();
+        self.consolidate(snapshot_version);
 
         split_key
     }

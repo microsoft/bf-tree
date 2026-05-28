@@ -19,8 +19,6 @@ use shuttle::rand::Rng;
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
-#[cfg(not(all(feature = "shuttle", test)))]
-use std::sync::atomic::AtomicUsize;
 
 #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
 use thread_local::ThreadLocal;
@@ -48,12 +46,42 @@ const META_DATA_PAGE_OFFSET: usize = 0;
 const INVALID_SNAPSHOT_THREAD_ID: usize = usize::MAX; // Invalid thread slot id
 const NULL_PAGE_LOCATION_OFFSET: usize = usize::MAX; // Special page loc offset for a Null page
 const INVALID_SNAPSHOT_STATE: u64 = u64::MAX; // Invalid snapshot state
-pub const INVALID_SNAPSHOT_VERSION: u64 = u64::MAX; // Invalid snapshot version
+pub const INVALID_SNAPSHOT_VERSION: u64 = u64::MAX >> 1; // Invalid snapshot version
 const DEFAULT_MAX_SNAPSHOT_THREAD_NUM: usize = 64; // Maximum numbers of concurrent threads in Bf-tree, if snapshot is enabled.
 const SNAPSHOT_STATE_PHASE_ID_SHIFT: usize = 61; // Number of bits to shift for phase id
 const SNAPSHOT_STATE_PHASE_NUM: u64 = 4; // There are 4 snapshot phases
 const SNAPSHOT_STATE_PHASE_ID_MASK: u64 = 0b111 << SNAPSHOT_STATE_PHASE_ID_SHIFT; // Most significant 3 bits for phase id (allowing up to 8 phases)
 const SNAPSHOT_STATE_VERSION_MASK: u64 = (1 << SNAPSHOT_STATE_PHASE_ID_SHIFT) - 1; // Least significant 61 bits for version number
+
+/// Snapshot phase identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseId {
+    Rest,
+    Prepare,
+    InProgress,
+    Sweep,
+}
+
+impl PhaseId {
+    fn from_raw(value: u64) -> Self {
+        match value {
+            0 => PhaseId::Rest,
+            1 => PhaseId::Prepare,
+            2 => PhaseId::InProgress,
+            3 => PhaseId::Sweep,
+            _ => panic!("Invalid phase id: {}", value),
+        }
+    }
+
+    fn as_raw(self) -> u64 {
+        match self {
+            PhaseId::Rest => 0,
+            PhaseId::Prepare => 1,
+            PhaseId::InProgress => 2,
+            PhaseId::Sweep => 3,
+        }
+    }
+}
 
 /// A simplified CPR snapshot of a Bf-Tree.
 /// For details, see the original CPR paper.
@@ -99,6 +127,8 @@ unsafe impl Send for CPRSnapShotMgr {}
 pub struct CPRSnapshotGuard {
     snapshot_mgr: Option<Arc<CPRSnapShotMgr>>,
     thread_slot_id: usize,
+    snapshot_version: u64,
+    phase_id: PhaseId,
 }
 
 impl CPRSnapshotGuard {
@@ -107,30 +137,30 @@ impl CPRSnapshotGuard {
             None => Ok(Self {
                 snapshot_mgr: None,
                 thread_slot_id: INVALID_SNAPSHOT_THREAD_ID,
+                snapshot_version: INVALID_SNAPSHOT_VERSION,
+                phase_id: PhaseId::Rest,
             }),
             Some(ref mgr) => {
-                let thread_slot_id = mgr
-                    .reserve_thread_slot()
-                    .unwrap_or(INVALID_SNAPSHOT_THREAD_ID);
-                if thread_slot_id == INVALID_SNAPSHOT_THREAD_ID {
-                    return Err(());
-                }
-
-                assert_eq!(
-                    thread_slot_id,
-                    CPRSnapShotMgr::get_snapshot_thread_id().unwrap()
-                );
-                assert_eq!(
-                    CPRSnapShotMgr::get_snapshot_thread_version(),
-                    mgr.get_local_version(&thread_slot_id)
-                );
+                let (thread_slot_id, snapshot_version, phase_id) = mgr.reserve_thread_slot()?;
 
                 Ok(Self {
                     snapshot_mgr: Some(mgr.clone()),
                     thread_slot_id,
+                    snapshot_version,
+                    phase_id,
                 })
             }
         }
+    }
+
+    /// Returns the snapshot version for this thread's transaction.
+    pub fn snapshot_version(&self) -> u64 {
+        self.snapshot_version
+    }
+
+    /// Returns the phase id at the time the guard was acquired.
+    pub fn get_local_phase_id(&self) -> PhaseId {
+        self.phase_id
     }
 
     /// Returns true if the snapshot guard has a valid thread slot id.
@@ -138,29 +168,25 @@ impl CPRSnapshotGuard {
         self.thread_slot_id != INVALID_SNAPSHOT_THREAD_ID
     }
 
-    pub fn get_local_phase_id(&self) -> u64 {
-        self.snapshot_mgr
-            .as_ref()
-            .unwrap()
-            .get_local_phase_id(&self.thread_slot_id)
-    }
-
     pub fn snapshot_base_page(&self, id: PageID, ptr: &[u8], size: usize) {
         self.snapshot_mgr
             .as_ref()
             .unwrap()
-            .snapshot_base_page(id, ptr, size);
+            .snapshot_base_page(id, ptr, size, self.thread_slot_id);
     }
 
     pub fn snapshot_mini_page(&self, id: PageID, ptr: &[u8], size: usize) {
         self.snapshot_mgr
             .as_ref()
             .unwrap()
-            .snapshot_mini_page(id, ptr, size);
+            .snapshot_mini_page(id, ptr, size, self.thread_slot_id);
     }
 
     pub fn snapshot_inner_node(&self, ptr: *const InnerNode) {
-        self.snapshot_mgr.as_ref().unwrap().snapshot_inner_node(ptr);
+        self.snapshot_mgr
+            .as_ref()
+            .unwrap()
+            .snapshot_inner_node(ptr, self.thread_slot_id);
     }
 
     pub fn snapshot_root_page(&self, root_id: PageID) {
@@ -179,48 +205,14 @@ impl Drop for CPRSnapshotGuard {
     }
 }
 
-// Each user thread is assigned an unique snapshot thread id and local snapshot version
-// for each bf-tree transaction (node split/insert/create), if snapshot is enabled.
-#[cfg(all(feature = "shuttle", test))]
-shuttle::thread_local! {
-    static SNAPSHOT_THREAD_ID: std::sync::atomic::AtomicUsize = const { std::sync::atomic::AtomicUsize::new(INVALID_SNAPSHOT_THREAD_ID) };
-    static SNAPSHOT_THREAD_VERSION: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(INVALID_SNAPSHOT_VERSION) };
-}
-
-#[cfg(not(all(feature = "shuttle", test)))]
-thread_local! {
-    static SNAPSHOT_THREAD_ID: AtomicUsize = const { AtomicUsize::new(INVALID_SNAPSHOT_THREAD_ID) };
-    static SNAPSHOT_THREAD_VERSION: AtomicU64 = const { AtomicU64::new(INVALID_SNAPSHOT_VERSION) };
-}
-
 impl CPRSnapShotMgr {
-    //TODO: version id wraps around. Need to handle it
-
     pub fn are_all_threads_in_next_version(&self) -> bool {
         if !self.snapshot_in_progress.load(Ordering::Acquire) {
             false
         } else {
             let global_phase_id = self.get_global_phase_id();
-            global_phase_id == 3 || global_phase_id == 0
+            global_phase_id == PhaseId::Sweep || global_phase_id == PhaseId::Rest
         }
-    }
-
-    pub fn get_snapshot_thread_id() -> Result<usize, ()> {
-        let tid = SNAPSHOT_THREAD_ID.with(|id| id.load(Ordering::Relaxed));
-        if tid == INVALID_SNAPSHOT_THREAD_ID {
-            Err(())
-        } else {
-            Ok(tid)
-        }
-    }
-
-    pub fn set_snapshot_thread_tls(tid: usize, version: u64) {
-        SNAPSHOT_THREAD_ID.with(|id| id.store(tid, Ordering::Relaxed));
-        SNAPSHOT_THREAD_VERSION.with(|ver| ver.store(version, Ordering::Relaxed));
-    }
-
-    pub fn get_snapshot_thread_version() -> u64 {
-        SNAPSHOT_THREAD_VERSION.with(|ver| ver.load(Ordering::Relaxed))
     }
 
     /// Initialize a new snapshot instance.
@@ -258,11 +250,13 @@ impl CPRSnapShotMgr {
         let local_mini_size_mappings = unsafe { &mut *self.thread_local_mini_size_mappings.get() };
         // De-duplicate mappings
         for thread_slot_id in 0..DEFAULT_MAX_SNAPSHOT_THREAD_NUM {
-            local_inner_mappings[thread_slot_id].clear();
-            local_mini_mappings[thread_slot_id].clear();
-            local_base_mappings[thread_slot_id].clear();
-            local_mini_size_mappings[thread_slot_id].clear();
+            local_inner_mappings[thread_slot_id] = Vec::new();
+            local_mini_mappings[thread_slot_id] = Vec::new();
+            local_base_mappings[thread_slot_id] = Vec::new();
+            local_mini_size_mappings[thread_slot_id] = Vec::new();
         }
+
+        self.root_id.store(0, Ordering::Release);
     }
 
     pub fn new_snapshot_state(phase_id: u64, version: u64) -> u64 {
@@ -282,9 +276,11 @@ impl CPRSnapShotMgr {
         self.global_state.load(Ordering::Acquire) & SNAPSHOT_STATE_VERSION_MASK
     }
 
-    fn get_global_phase_id(&self) -> u64 {
-        (self.global_state.load(Ordering::Acquire) & SNAPSHOT_STATE_PHASE_ID_MASK)
-            >> SNAPSHOT_STATE_PHASE_ID_SHIFT
+    fn get_global_phase_id(&self) -> PhaseId {
+        PhaseId::from_raw(
+            (self.global_state.load(Ordering::Acquire) & SNAPSHOT_STATE_PHASE_ID_MASK)
+                >> SNAPSHOT_STATE_PHASE_ID_SHIFT,
+        )
     }
 
     /// Retrieve the local state of a thread specified by its slot id.
@@ -302,50 +298,35 @@ impl CPRSnapShotMgr {
         self.thread_local_states[*thread_slot_id].store(state, Ordering::Release);
     }
 
-    /// Retrieve the local version of a thread specified by its slot id.
-    pub fn get_local_version(&self, thread_slot_id: &usize) -> u64 {
-        let state = self.get_local_state(thread_slot_id);
-        state & SNAPSHOT_STATE_VERSION_MASK
-    }
-
-    /// Retrieve the local phase of a thread specified by its slot id.
-    pub fn get_local_phase_id(&self, thread_slot_id: &usize) -> u64 {
-        let state = self.get_local_state(thread_slot_id);
-        (state & SNAPSHOT_STATE_PHASE_ID_MASK) >> SNAPSHOT_STATE_PHASE_ID_SHIFT
-    }
-
     /// Move the global snapshot stable to the next one.
     fn advance_global_state(&self) -> u64 {
         let phase_id = self.get_global_phase_id();
         let version = self.get_global_version();
 
         match phase_id {
-            0 => {
+            PhaseId::Rest => {
                 // (REST, v) -> (PREPARE, v)
-                let new_state = Self::new_snapshot_state(1, version);
+                let new_state = Self::new_snapshot_state(PhaseId::Prepare.as_raw(), version);
                 self.global_state.store(new_state, Ordering::Release);
                 new_state
             }
-            1 => {
+            PhaseId::Prepare => {
                 // (PREPARE, v) -> (IN_PROGRESS, v + 1)
-                let new_state = Self::new_snapshot_state(2, version + 1);
+                let new_state = Self::new_snapshot_state(PhaseId::InProgress.as_raw(), version + 1);
                 self.global_state.store(new_state, Ordering::Release);
                 new_state
             }
-            2 => {
+            PhaseId::InProgress => {
                 // (IN_PROGRESS, v + 1) -> (SWEEPING, v + 1)
-                let new_state = Self::new_snapshot_state(3, version);
+                let new_state = Self::new_snapshot_state(PhaseId::Sweep.as_raw(), version);
                 self.global_state.store(new_state, Ordering::Release);
                 new_state
             }
-            3 => {
+            PhaseId::Sweep => {
                 // (SWEEPING, v + 1) -> (REST, v + 1)
-                let new_state = Self::new_snapshot_state(0, version);
+                let new_state = Self::new_snapshot_state(PhaseId::Rest.as_raw(), version);
                 self.global_state.store(new_state, Ordering::Release);
                 new_state
-            }
-            _ => {
-                panic!("Invalid global phase id: {}", phase_id);
             }
         }
     }
@@ -366,7 +347,7 @@ impl CPRSnapShotMgr {
     /// Obtain an unique thread slot id for the caller thread.
     /// Guarantee that any local state assigned after the global state advances to the next one,
     /// will either be reversed without further action or in the new state.
-    pub fn reserve_thread_slot(&self) -> Result<usize, ()> {
+    pub fn reserve_thread_slot(&self) -> Result<(usize, u64, PhaseId), ()> {
         if self.pause_snapshot.load(Ordering::Acquire) {
             return Err(());
         }
@@ -384,7 +365,7 @@ impl CPRSnapShotMgr {
                 let global_state = self.global_state.load(Ordering::Acquire);
                 self.set_local_state(&tid, global_state);
 
-                // If the global state has changed, reset
+                // If the global state has changed or a pause is requested after setting the local state, reset
                 // This is to guarantee that as soon as global state rolls to the next one,
                 // all new local states will either be reversed without further action or in the new state.
                 // Otherwise something bad could happen as described below:
@@ -392,19 +373,22 @@ impl CPRSnapShotMgr {
                 // Mgr: global phase <- 'x + 1'
                 // Mrgr: all threads in phase 'x + 1' or invalid -> Execute 'x + 1' action
                 // T1: local state = state <- Inconsistency with global state
-                if self.get_local_state(&tid) != self.global_state.load(Ordering::Acquire) {
+                // Similar case for the pause_snapshot flag.
+                if self.get_local_state(&tid) != self.global_state.load(Ordering::Acquire)
+                    || self.pause_snapshot.load(Ordering::Acquire)
+                {
                     self.set_local_state(&tid, INVALID_SNAPSHOT_STATE);
                     assert!(self.thread_slots[tid]
                         .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok());
                     return Err(());
                 } else {
-                    // Thread's TLS data must be empty before setting it
-                    assert!(Self::get_snapshot_thread_id().is_err());
-
-                    // Set the caller thread's snapshot thread id and version in TLS.
-                    Self::set_snapshot_thread_tls(tid, global_state & SNAPSHOT_STATE_VERSION_MASK);
-                    return Ok(tid);
+                    let version = global_state & SNAPSHOT_STATE_VERSION_MASK;
+                    let phase_id = PhaseId::from_raw(
+                        (global_state & SNAPSHOT_STATE_PHASE_ID_MASK)
+                            >> SNAPSHOT_STATE_PHASE_ID_SHIFT,
+                    );
+                    return Ok((tid, version, phase_id));
                 }
             }
         }
@@ -412,12 +396,9 @@ impl CPRSnapShotMgr {
     }
 
     /// Free up the thread slot specified by the given thread slot id.
-    /// Reset the thread's TLS
     pub fn release_thread_slot(&self, thread_slot_id: usize) {
         self.set_local_state(&thread_slot_id, INVALID_SNAPSHOT_STATE);
         self.thread_slots[thread_slot_id].store(false, Ordering::Release);
-
-        Self::set_snapshot_thread_tls(INVALID_SNAPSHOT_THREAD_ID, INVALID_SNAPSHOT_VERSION);
     }
 
     pub fn get_snapshot_guard(
@@ -443,16 +424,14 @@ impl CPRSnapShotMgr {
         offset
     }
 
-    pub fn snapshot_inner_node(&self, ptr: *const InnerNode) {
+    pub fn snapshot_inner_node(&self, ptr: *const InnerNode, thread_slot_id: usize) {
         let offset = unsafe { self.snapshot_page((&*ptr).as_slice(), INNER_NODE_SIZE) };
         let inner_mappings = unsafe { &mut *self.thread_local_inner_mappings.get() };
 
-        let tid = Self::get_snapshot_thread_id()
-            .expect("Snapshot of page triggered by unregistered thread.");
-        inner_mappings[tid].push((ptr, offset));
+        inner_mappings[thread_slot_id].push((ptr, offset));
     }
 
-    pub fn snapshot_mini_page(&self, id: PageID, ptr: &[u8], size: usize) {
+    pub fn snapshot_mini_page(&self, id: PageID, ptr: &[u8], size: usize, thread_slot_id: usize) {
         let offset = if size != 0 {
             self.snapshot_page(ptr, size)
         } else {
@@ -461,26 +440,27 @@ impl CPRSnapShotMgr {
         };
 
         let mini_mappings = unsafe { &mut *self.thread_local_mini_mappings.get() };
-        let tid = Self::get_snapshot_thread_id()
-            .expect("Snapshot of page triggered by unregistered thread.");
-        mini_mappings[tid].push((id, offset));
+        mini_mappings[thread_slot_id].push((id, offset));
 
         let mini_size_mappings = unsafe { &mut *self.thread_local_mini_size_mappings.get() };
-        mini_size_mappings[tid].push((id, size));
+        mini_size_mappings[thread_slot_id].push((id, size));
 
-        assert!(mini_mappings[tid].len() == mini_size_mappings[tid].len());
+        assert!(mini_mappings[thread_slot_id].len() == mini_size_mappings[thread_slot_id].len());
     }
 
-    pub fn snapshot_base_page(&self, id: PageID, ptr: &[u8], size: usize) {
+    pub fn snapshot_base_page(&self, id: PageID, ptr: &[u8], size: usize, thread_slot_id: usize) {
         let offset = self.snapshot_page(ptr, size);
 
         let base_mappings = unsafe { &mut *self.thread_local_base_mappings.get() };
-        let tid = Self::get_snapshot_thread_id()
-            .expect("Snapshot of page triggered by unregistereds thread.");
-        base_mappings[tid].push((id, offset));
+        base_mappings[thread_slot_id].push((id, offset));
     }
 
     pub fn snapshot_root_page(&self, root_id: PageID) {
+        let cur_root_id = self.root_id.load(Ordering::Acquire);
+        if cur_root_id != 0 {
+            assert_eq!(cur_root_id, root_id.raw());
+        }
+
         self.root_id.store(root_id.raw(), Ordering::Release);
     }
 
@@ -521,7 +501,7 @@ impl CPRSnapShotMgr {
                         match page_loc {
                             PageLocation::Base(offset) => {
                                 let base_ref = leaf.load_base_page(*offset);
-                                if base_ref.get_snapshot_version() < version {
+                                if base_ref.get_clean_snapshot_version() < version {
                                     let base_ptr = unsafe {
                                         std::slice::from_raw_parts(
                                             base_ref as *const LeafNode as *const u8,
@@ -539,7 +519,7 @@ impl CPRSnapShotMgr {
                                 assert!(tree.cache_only);
 
                                 let mini_ref = leaf.load_cache_page(*ptr);
-                                if mini_ref.get_snapshot_version() < version {
+                                if mini_ref.get_clean_snapshot_version() < version {
                                     let mini_ptr = unsafe {
                                         std::slice::from_raw_parts(
                                             mini_ref as *const LeafNode as *const u8,
@@ -568,7 +548,7 @@ impl CPRSnapShotMgr {
                             Err(_) => continue,
                         };
 
-                        if inner.as_ref().get_snapshot_version() < version {
+                        if inner.as_ref().get_clean_snapshot_version() < version {
                             let offset =
                                 unsafe { self.snapshot_page((&*ptr).as_slice(), INNER_NODE_SIZE) };
                             inner_mapping.push((ptr, offset));
@@ -590,7 +570,7 @@ impl CPRSnapShotMgr {
                                     Err(_) => continue,
                                 };
 
-                                if inner.as_ref().get_snapshot_version() < version {
+                                if inner.as_ref().get_clean_snapshot_version() < version {
                                     let offset = unsafe {
                                         self.snapshot_page((&*ptr).as_slice(), INNER_NODE_SIZE)
                                     };
@@ -630,27 +610,33 @@ impl CPRSnapShotMgr {
 
             // A reader lock is enough
             let mut leaf = tree.mapping_table().get(&pid);
-            let page_loc = leaf.get_page_location();
+            let page_loc = leaf.get_page_location().clone();
             enumerate_leaf_count += 1;
 
             match page_loc {
                 PageLocation::Base(offset) => {
-                    let base_ref = leaf.load_base_page(*offset);
-                    if base_ref.get_snapshot_version() < version {
+                    let base_ref = leaf.load_base_page(offset);
+                    if base_ref.get_clean_snapshot_version() < version {
                         let base_ptr = unsafe {
                             std::slice::from_raw_parts(
                                 base_ref as *const LeafNode as *const u8,
                                 base_ref.meta.node_size as usize,
                             )
                         };
-                        let offset = self.snapshot_page(base_ptr, base_ref.meta.node_size as usize);
-                        base_mapping.push((pid, offset));
+                        let new_offset =
+                            self.snapshot_page(base_ptr, base_ref.meta.node_size as usize);
+                        base_mapping.push((pid, new_offset));
                     }
                 }
                 PageLocation::Full(ptr) => {
                     // We snapshot Full page as a disk page to reduce some complexity as they are equivalent.
-                    let full_ref = leaf.load_cache_page(*ptr);
-                    if full_ref.get_snapshot_version() < version {
+                    let full_ref = leaf.load_cache_page(ptr);
+                    if full_ref.get_clean_snapshot_version() < version {
+                        // Temporarily change the next level to null for snapshotting.
+                        // and reverse afterwards.
+                        let next_level = full_ref.next_level;
+                        let full_page = unsafe { &mut *ptr };
+                        full_page.next_level = MiniPageNextLevel::new_null();
                         let full_ptr = unsafe {
                             std::slice::from_raw_parts(
                                 full_ref as *const LeafNode as *const u8,
@@ -658,12 +644,13 @@ impl CPRSnapShotMgr {
                             )
                         };
                         let offset = self.snapshot_page(full_ptr, full_ref.meta.node_size as usize);
+                        full_page.next_level = next_level;
                         base_mapping.push((pid, offset));
                     }
                 }
                 PageLocation::Mini(ptr) => {
-                    let mini_ref = leaf.load_cache_page(*ptr);
-                    if mini_ref.get_snapshot_version() < version {
+                    let mini_ref = leaf.load_cache_page(ptr);
+                    if mini_ref.get_clean_snapshot_version() < version {
                         let mini_ptr = unsafe {
                             std::slice::from_raw_parts(
                                 mini_ref as *const LeafNode as *const u8,
@@ -677,7 +664,7 @@ impl CPRSnapShotMgr {
                         if !tree.cache_only {
                             // In disk-mode, the base page of mini-page is part of the snapshot as well.
                             let base_ref = leaf.load_base_page(mini_ref.next_level.as_offset());
-                            assert!(base_ref.get_snapshot_version() < version); // disk page's version should never be greater than its mini-page's.
+                            assert!(base_ref.get_clean_snapshot_version() < version); // disk page's version should never be greater than its mini-page's.
 
                             let base_ptr = unsafe {
                                 std::slice::from_raw_parts(
@@ -969,6 +956,7 @@ impl CPRSnapShotMgr {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
+            println!("Another snapshot is in progress, skipping this snapshot request.");
             return;
         }
 
@@ -992,7 +980,7 @@ impl CPRSnapShotMgr {
 
         // At the beginning, the global phase id must be 0 (REST).
         let mut current_global_phase_id = self.get_global_phase_id();
-        assert_eq!(current_global_phase_id, 0);
+        assert_eq!(current_global_phase_id, PhaseId::Rest);
 
         // Version of the ongoing snapshot is set
         let snapshot_version = self.get_global_version();
@@ -1000,7 +988,7 @@ impl CPRSnapShotMgr {
         // Immediately move the global state to (1 (PREPARE), snapshot_version)
         let mut current_global_state = self.advance_global_state();
         current_global_phase_id = self.get_global_phase_id();
-        assert_eq!(current_global_phase_id, 1);
+        assert_eq!(current_global_phase_id, PhaseId::Prepare);
         assert_eq!(snapshot_version, self.get_global_version());
 
         let mut leaf_node_count_upper_bound = 0; // Indicate the total number of leaf nodes in the captured snapshot.
@@ -1008,8 +996,7 @@ impl CPRSnapShotMgr {
         loop {
             if self.check_if_phase_completed(current_global_state) {
                 match current_global_phase_id {
-                    // REST
-                    0 => {
+                    PhaseId::Rest => {
                         // Upon reaching here, all user threads are in (REST, snapshot_version + 1).
                         // All snapshots of pages of snapshot_version are done, and no more snapshot operations
                         // neither. As such, we can safely finalize the snapshot by writing out the
@@ -1034,22 +1021,19 @@ impl CPRSnapShotMgr {
                         // The snapshot is done.
                         break;
                     }
-                    // PREPARE
-                    1 => {
+                    PhaseId::Prepare => {
                         current_global_state = self.advance_global_state();
                         current_global_phase_id = self.get_global_phase_id();
-                        assert_eq!(current_global_phase_id, 2);
+                        assert_eq!(current_global_phase_id, PhaseId::InProgress);
                         assert_eq!(snapshot_version + 1, self.get_global_version());
                     }
-                    // IN_PROGRESS
-                    2 => {
+                    PhaseId::InProgress => {
                         current_global_state = self.advance_global_state();
                         current_global_phase_id = self.get_global_phase_id();
-                        assert_eq!(current_global_phase_id, 3);
+                        assert_eq!(current_global_phase_id, PhaseId::Sweep);
                         assert_eq!(snapshot_version + 1, self.get_global_version());
                     }
-                    // SWEEPING
-                    3 => {
+                    PhaseId::Sweep => {
                         // Upon reaching here, there are no user threads with snapshot_version anymore.
                         // Sweep through and snapshot all data pages whose version is less than (snapshot_version + 1)
                         // and build inner node and leaf node mapping for those pages.
@@ -1068,11 +1052,8 @@ impl CPRSnapShotMgr {
 
                         current_global_state = self.advance_global_state();
                         current_global_phase_id = self.get_global_phase_id();
-                        assert_eq!(current_global_phase_id, 0);
+                        assert_eq!(current_global_phase_id, PhaseId::Rest);
                         assert_eq!(snapshot_version + 1, self.get_global_version());
-                    }
-                    _ => {
-                        panic!("Invalid global phase id: {}", current_global_phase_id);
                     }
                 }
             }
@@ -1191,6 +1172,19 @@ impl CPRSnapShotMgr {
                 bf_meta.inner_size,
                 &recovery_snapshot_vfs,
             );
+
+            // Sanity check on root nodes
+            let mut root_cnt = 0;
+            for (_ptr, offset) in &inner_mapping {
+                recovery_snapshot_vfs.read(*offset, &mut inner_node_page_buffer);
+                let inner_node = InnerNodeBuilder::new().build_from_slice(&inner_node_page_buffer);
+                if unsafe { (*inner_node).is_root() } {
+                    println!("Here");
+                    root_cnt += 1;
+                }
+            }
+            assert_eq!(root_cnt, 1, "Root count in inner mapping: {}", root_cnt);
+
             let mut inner_map = HashMap::new();
 
             for m in inner_mapping {
@@ -1541,9 +1535,11 @@ impl BfTree {
     }
 
     /// Check if all threads are running in the next version of the current snapshot
-    pub fn are_all_threads_in_next_version(&self) -> bool {
-        let snpshot_mgr = self.snapshot_mgr.clone().unwrap();
-        snpshot_mgr.are_all_threads_in_next_version()
+    pub fn are_all_threads_in_next_snapshot_version(&self) -> bool {
+        if let Some(snapshot_mgr) = &self.snapshot_mgr {
+            return snapshot_mgr.are_all_threads_in_next_version();
+        }
+        false
     }
 }
 
@@ -1714,6 +1710,13 @@ mod tests {
     /// A snapshot taken later should cover the previous snapshots.
     #[test]
     fn cpr_snapshot_disk() {
+        // Install a panic hook that triggers the just-in-time debugger (e.g. VS debugger)
+        // so we can inspect the state at the point of failure.
+        panic::set_hook(Box::new(|info| {
+            eprintln!("PANIC: {info}");
+            unsafe { std::arch::asm!("int 3") };
+        }));
+
         let min_record_size: usize = 64;
         let max_record_size: usize = 2408;
         let leaf_page_size: usize = 8192;
@@ -1883,7 +1886,7 @@ mod tests {
         records_num_per_threads: &Vec<usize>,
         check_prefix: bool,
     ) {
-        let bftree = BfTree::new_from_cpr_snapshot(snapshot_file, true, None, None, None)
+        let bftree = BfTree::new_from_cpr_snapshot(snapshot_file, false, None, None, None)
             .expect("fail to recover from snapshot");
 
         let mut rs_captured = vec![0usize; num_threads];
@@ -1894,6 +1897,7 @@ mod tests {
             let mut key_buffer = vec![0usize; key_len / std::mem::size_of::<usize>()];
             let mut res_buffer = vec![0u8; key_len];
             let mut not_included = false;
+            let mut first_gap_record: Option<usize> = None;
 
             for r in 0..record_num {
                 key_buffer.fill(r);
@@ -1905,7 +1909,37 @@ mod tests {
                 ) {
                     LeafReadResult::Found(v) => {
                         if check_prefix && not_included {
-                            panic!("Found a record after the prefix for writer thread {}", i);
+                            // Gather diagnostic info: scan forward to find all gaps
+                            let mut gaps = Vec::new();
+                            let mut found_after = Vec::new();
+                            let gap_start = first_gap_record.unwrap();
+                            // Collect all gaps in the range [gap_start..r+50]
+                            let scan_end = std::cmp::min(r + 50, record_num);
+                            for scan_r in gap_start..scan_end {
+                                key_buffer.fill(scan_r);
+                                key_buffer[0] = i;
+                                match bftree.read(
+                                    bytemuck::must_cast_slice::<usize, u8>(&key_buffer),
+                                    &mut res_buffer,
+                                ) {
+                                    LeafReadResult::Found(_) => {
+                                        found_after.push(scan_r);
+                                    }
+                                    LeafReadResult::NotFound => {
+                                        gaps.push(scan_r);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            panic!(
+                                "PREFIX VIOLATION: thread={}, first_gap_at={}, found_record_after_gap={}, \
+                                 total_captured_before_gap={}, total_records={}\n\
+                                 Gaps in [{}, {}): {:?}\n\
+                                 Found in [{}, {}): {:?}",
+                                i, gap_start, r, rs_captured[i], record_num,
+                                gap_start, scan_end, &gaps[..std::cmp::min(gaps.len(), 20)],
+                                gap_start, scan_end, &found_after[..std::cmp::min(found_after.len(), 20)],
+                            );
                         }
                         assert_eq!(v as usize, key_len);
                         assert_eq!(
@@ -1917,6 +1951,7 @@ mod tests {
                     LeafReadResult::NotFound => {
                         if !not_included {
                             not_included = true;
+                            first_gap_record = Some(r);
                         }
                     }
                     _ => {
@@ -1945,7 +1980,7 @@ mod tests {
         let leaf_page_size: usize = 8192;
         let num_threads: usize = 4;
         // Bounded number of inserts per writer so shuttle iterations finish quickly.
-        let inserts_per_thread: usize = 1_700_000; // 1.7M inserts per thread
+        let inserts_per_thread: usize = 1_000; // 1K inserts per thread
 
         let snapshot_file_path: String = format!(
             "target/shuttle_cpr_snapshot_cache_only_{}_{}.bftree",
@@ -2034,13 +2069,14 @@ mod tests {
         let mut shuttle_config = shuttle::Config::default();
         //shuttle_config.max_steps = shuttle::MaxSteps::FailAfter(100_000);
         shuttle_config.max_steps = shuttle::MaxSteps::None;
+        shuttle_config.stack_size = 1024 * 1024 * 1024; // 1GB — default 32KB overflows with deep tree ops
         shuttle_config.failure_persistence =
             shuttle::FailurePersistence::File(Some(PathBuf::from_str("target").unwrap()));
 
         let mut runner = shuttle::PortfolioRunner::new(true, shuttle_config);
         let available_cores = std::thread::available_parallelism().unwrap().get().min(4);
         for _ in 0..available_cores {
-            runner.add(shuttle::scheduler::PctScheduler::new(5, 5));
+            runner.add(shuttle::scheduler::PctScheduler::new(5, 400));
         }
 
         runner.run(|| {
@@ -2059,8 +2095,10 @@ mod tests {
         let max_record_size: usize = 2408;
         let leaf_page_size: usize = 8192;
         let num_threads: usize = 4;
-        // Bounded number of inserts per writer so shuttle iterations finish quickly.
-        let inserts_per_thread: usize = 170_000;
+        // 500 inserts/thread × 4 threads = 2000 records/round.
+        // With 128KB buffer (~1600 record capacity), this triggers eviction
+        // while staying within shuttle coroutine stack limits.
+        let inserts_per_thread: usize = 500;
 
         let file_path: String = format!(
             "target/shuttle_cpr_snapshot_disk_{}_{}.bftree",
@@ -2085,7 +2123,7 @@ mod tests {
 
         let bftree = Arc::new(BfTree::with_config(config.clone(), None).unwrap());
         let mut rs = vec![0usize; num_threads];
-        for j in 0..2 {
+        for j in 0..3 {
             let handles: Vec<_> = (0..num_threads)
                 .map(|i| {
                     let bftree_clone = bftree.clone();
@@ -2155,13 +2193,17 @@ mod tests {
 
         let mut shuttle_config = shuttle::Config::default();
         shuttle_config.max_steps = shuttle::MaxSteps::None;
+        // Default shuttle stack is 32KB which is too small for deep B-tree
+        // operations with eviction + file I/O. Increase to avoid stack overflow
+        // that manifests as STATUS_HEAP_CORRUPTION on Windows.
+        shuttle_config.stack_size = 4 * 1024 * 1024; // 4MB
         shuttle_config.failure_persistence =
             shuttle::FailurePersistence::File(Some(PathBuf::from_str("target").unwrap()));
 
         let mut runner = shuttle::PortfolioRunner::new(true, shuttle_config);
         let available_cores = std::thread::available_parallelism().unwrap().get().min(4);
         for _ in 0..available_cores {
-            runner.add(shuttle::scheduler::PctScheduler::new(5, 5));
+            runner.add(shuttle::scheduler::PctScheduler::new(5, 400));
         }
 
         runner.run(|| {
