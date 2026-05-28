@@ -16,7 +16,7 @@ $ cargo add bf_tree
 Which will add bf_tree as a dependency to your Cargo.toml
 ```toml
 [dependencies]
-bf-tree = "0.5.2"
+bf-tree = "0.5.3"
 ```
 
 An example use of Bf-Tree:
