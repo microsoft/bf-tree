@@ -23,7 +23,7 @@ fn make_inner_node() -> *mut InnerNode {
         .set_disk_offset(DiskOffsetGuard::new(0, &test_vfs))
         .set_children_is_leaf(true)
         .set_left_most_page_id(PageID::new(0));
-    inner_builder.build()
+    inner_builder.build(crate::snapshot::INVALID_SNAPSHOT_VERSION)
 }
 
 fn inner_insert_read(input: Vec<(Vec<u8>, u64, InnerTestOp)>) {
@@ -73,7 +73,7 @@ fn inner_insert_read(input: Vec<(Vec<u8>, u64, InnerTestOp)>) {
         assert_eq!(value, v);
     }
 
-    inner.consolidate();
+    inner.consolidate(crate::snapshot::INVALID_SNAPSHOT_VERSION);
     let inner_cnt = inner.meta.value_count_inner();
     assert_eq!(model_cnt, inner_cnt as usize);
 

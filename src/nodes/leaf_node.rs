@@ -6,7 +6,7 @@ use std::{alloc::Layout, cmp::Ordering, sync::atomic};
 
 use crate::{
     circular_buffer::CircularBufferPtr, counter, error::TreeError, range_scan::ScanReturnField,
-    snapshot::CPRSnapShotMgr, snapshot::INVALID_SNAPSHOT_VERSION, utils::stats::LeafStats,
+    utils::stats::LeafStats,
 };
 
 use super::{node_meta::NodeMeta, FENCE_KEY_CNT};
@@ -231,6 +231,7 @@ impl LeafNode {
         node_size: usize,
         next_level: MiniPageNextLevel,
         cache_only: bool,
+        snapshot_version: u64,
     ) {
         unsafe {
             Self::init_node_with_fence(
@@ -241,11 +242,12 @@ impl LeafNode {
                 next_level,
                 false,
                 cache_only,
+                snapshot_version,
             )
         }
     }
 
-    pub(crate) fn make_base_page(node_size: usize) -> *mut Self {
+    pub(crate) fn make_base_page(node_size: usize, snapshot_version: u64) -> *mut Self {
         let layout = Layout::from_size_align(node_size, std::mem::align_of::<LeafNode>()).unwrap();
         let ptr = unsafe { std::alloc::alloc(layout) };
         unsafe {
@@ -257,6 +259,7 @@ impl LeafNode {
                 MiniPageNextLevel::new_null(),
                 true,
                 false,
+                snapshot_version,
             );
         }
         ptr as *mut Self
@@ -310,6 +313,7 @@ impl LeafNode {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn init_node_with_fence(
         ptr: *mut u8,
         low_fence: &[u8],
@@ -318,11 +322,18 @@ impl LeafNode {
         next_level: MiniPageNextLevel,
         has_fence: bool,
         cache_only: bool,
+        snapshot_version: u64,
     ) {
         let ptr = ptr as *mut Self;
 
         { &mut *ptr }.initialize(
-            low_fence, high_fence, node_size, next_level, has_fence, cache_only,
+            low_fence,
+            high_fence,
+            node_size,
+            next_level,
+            has_fence,
+            cache_only,
+            snapshot_version,
         );
     }
 
@@ -1208,7 +1219,12 @@ impl LeafNode {
     /// Returns the splitting key after splitting self
     /// The new high fence key of self (left-side node) and low fence
     /// of the new base page (right-side node) equal to the splitting key
-    pub fn split(&mut self, sibling: &mut LeafNode, cache_only: bool) -> Vec<u8> {
+    pub fn split(
+        &mut self,
+        sibling: &mut LeafNode,
+        cache_only: bool,
+        snapshot_version: u64,
+    ) -> Vec<u8> {
         if cache_only {
             assert!(self.meta.is_cache_only_leaf() && !self.has_fence());
         } else {
@@ -1246,6 +1262,7 @@ impl LeafNode {
                 MiniPageNextLevel::new_null(),
                 true,
                 cache_only,
+                snapshot_version,
             );
         } else {
             sibling.initialize(
@@ -1255,6 +1272,7 @@ impl LeafNode {
                 MiniPageNextLevel::new_null(),
                 false,
                 cache_only,
+                snapshot_version,
             );
         }
 
@@ -1279,7 +1297,7 @@ impl LeafNode {
             self.meta.set_value_count(new_cur_count);
         }
 
-        self.consolidate_after_split(&splitting_key);
+        self.consolidate_after_split(&splitting_key, snapshot_version);
 
         splitting_key
     }
@@ -1293,6 +1311,7 @@ impl LeafNode {
         sibling: &mut LeafNode,
         merge_split_key: &Vec<u8>,
         cache_only: bool,
+        snapshot_version: u64,
     ) {
         if cache_only {
             assert!(self.meta.is_cache_only_leaf() && !self.has_fence());
@@ -1328,6 +1347,7 @@ impl LeafNode {
                 MiniPageNextLevel::new_null(),
                 true,
                 cache_only,
+                snapshot_version,
             );
         } else {
             sibling.initialize(
@@ -1337,6 +1357,7 @@ impl LeafNode {
                 MiniPageNextLevel::new_null(),
                 false,
                 cache_only,
+                snapshot_version,
             );
         }
 
@@ -1359,7 +1380,7 @@ impl LeafNode {
         }
 
         self.meta.set_value_count(new_cur_count);
-        self.consolidate_after_split(merge_split_key);
+        self.consolidate_after_split(merge_split_key, snapshot_version);
 
         if !cache_only {
             // Assert the high fence of the left side node and the low fence of the right side node
@@ -1380,6 +1401,7 @@ impl LeafNode {
         skip_tombstone: bool,
         cache_only: bool,
         skip_key: Option<&[u8]>,
+        snapshot_version: u64,
     ) {
         let mut pairs = Vec::new();
 
@@ -1429,6 +1451,7 @@ impl LeafNode {
             self.next_level,
             has_fence,
             cache_only,
+            snapshot_version,
         );
 
         for (key, value, op_type) in pairs {
@@ -1442,20 +1465,21 @@ impl LeafNode {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn consolidate(&mut self) {
+    pub(crate) fn consolidate(&mut self, snapshot_version: u64) {
         self.consolidate_inner(
             OpType::Insert,
             None,
             true,
             self.meta.is_cache_only_leaf(),
             None,
+            snapshot_version,
         );
     }
 
     /// For mini page only.
     /// After consolidation, every tombstone records are removed, every insert records become cache records.
     #[allow(dead_code)]
-    pub(crate) fn consolidate_after_merge(&mut self) {
+    pub(crate) fn consolidate_after_merge(&mut self, snapshot_version: u64) {
         assert!(!self.is_base_page());
         self.consolidate_inner(
             OpType::Cache,
@@ -1463,6 +1487,7 @@ impl LeafNode {
             false,
             self.meta.is_cache_only_leaf(),
             None,
+            snapshot_version,
         );
     }
 
@@ -1471,7 +1496,7 @@ impl LeafNode {
     /// Re-organize the key-value pairs to remove the holes in the data.
     /// A delete/split operation will leave holes in the data field, which is not good for space efficiency.
     /// The easiest (but not most efficient) way to do this is to first populate every key value out, then reset the node state, then insert them back.
-    fn consolidate_after_split(&mut self, high_fence: &[u8]) {
+    fn consolidate_after_split(&mut self, high_fence: &[u8], snapshot_version: u64) {
         assert!(self.meta.is_cache_only_leaf() || self.is_base_page());
         self.consolidate_inner(
             OpType::Insert,
@@ -1479,13 +1504,14 @@ impl LeafNode {
             true,
             self.meta.is_cache_only_leaf(),
             None,
+            snapshot_version,
         );
     }
 
     /// For mini page only in cache-only mode only.
     /// Note that this operation could empty the page so the caller needs to ensure it won't lead to an empty mini page in memory.
     /// Same as consolidate(), except that any record with the given key is dropped
-    pub(crate) fn consolidate_skip_key(&mut self, key: &[u8]) {
+    pub(crate) fn consolidate_skip_key(&mut self, key: &[u8], snapshot_version: u64) {
         assert!(!self.is_base_page());
         assert!(self.meta.is_cache_only_leaf());
         self.consolidate_inner(
@@ -1494,6 +1520,7 @@ impl LeafNode {
             true,
             self.meta.is_cache_only_leaf(),
             Some(key),
+            snapshot_version,
         );
     }
 
@@ -1503,6 +1530,7 @@ impl LeafNode {
         dst_node: *mut LeafNode,
         dst_size: usize,
         discard_cold_cache: bool,
+        snapshot_version: u64,
     ) {
         assert!(!self.is_base_page());
         assert!(self.meta.node_size as usize <= dst_size);
@@ -1516,6 +1544,7 @@ impl LeafNode {
             self.next_level,
             false, // Mini-page only, thus no fence
             self.meta.is_cache_only_leaf(),
+            snapshot_version,
         );
 
         for meta in self.meta_iter() {
@@ -1536,6 +1565,7 @@ impl LeafNode {
     }
 
     /// Initialize a LeafNode
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn initialize(
         &mut self,
         low_fence: &[u8],
@@ -1544,14 +1574,10 @@ impl LeafNode {
         next_level: MiniPageNextLevel,
         has_fence: bool,
         cache_only: bool,
+        snapshot_version: u64,
     ) {
-        let snapshot_version = match CPRSnapShotMgr::get_snapshot_thread_id() {
-            Ok(_) => CPRSnapShotMgr::get_snapshot_thread_version(),
-            Err(_) => INVALID_SNAPSHOT_VERSION,
-        };
-
         // The initial version of a page is marked as not changed
-        self.snapshot_version = snapshot_version & Self::SNAPSHOT_VERSION_MASK;
+        self.snapshot_version = snapshot_version & Self::LEAF_SNAPSHOT_VERSION_MASK;
 
         if !has_fence {
             assert!(low_fence.is_empty());
@@ -1592,39 +1618,39 @@ impl LeafNode {
 
     // Highest bit (63) is used as "changed" indicator flag.
     // Bits 0-62 hold the actual version value.
-    const SNAPSHOT_VERSION_CHANGED_FLAG: u64 = 0x8000_0000_0000_0000;
-    const SNAPSHOT_VERSION_MASK: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+    const LEAF_SNAPSHOT_VERSION_CHANGED_FLAG: u64 = 0x8000_0000_0000_0000;
+    const LEAF_SNAPSHOT_VERSION_MASK: u64 = 0x7FFF_FFFF_FFFF_FFFF;
 
     /// Get the snapshot version value without the "is_changed" flag.
-    pub(crate) fn get_snapshot_version(&self) -> u64 {
-        self.snapshot_version & Self::SNAPSHOT_VERSION_MASK
+    pub(crate) fn get_clean_snapshot_version(&self) -> u64 {
+        self.snapshot_version & Self::LEAF_SNAPSHOT_VERSION_MASK
     }
 
     /// Set the snapshot version and mark whether it changed via the highest bit flag.
     pub(crate) fn set_snapshot_version(&mut self, snapshot_version: u64, mark_changed: bool) {
-        let next_version = snapshot_version & Self::SNAPSHOT_VERSION_MASK;
+        let next_version = snapshot_version & Self::LEAF_SNAPSHOT_VERSION_MASK;
 
         if !mark_changed {
             self.snapshot_version = next_version;
             return;
         }
 
-        let current_version = self.get_snapshot_version();
-
-        // Set changed flag only when version differs.
-        if next_version != current_version {
-            self.snapshot_version = next_version | Self::SNAPSHOT_VERSION_CHANGED_FLAG;
-        }
+        self.snapshot_version = next_version | Self::LEAF_SNAPSHOT_VERSION_CHANGED_FLAG;
     }
 
     /// Check whether the snapshot version has changed.
     pub(crate) fn is_snapshot_version_changed(&self) -> bool {
-        (self.snapshot_version & Self::SNAPSHOT_VERSION_CHANGED_FLAG) != 0
+        (self.snapshot_version & Self::LEAF_SNAPSHOT_VERSION_CHANGED_FLAG) != 0
     }
 
     /// Set the "changed" flag without changing the version value.
     pub(crate) fn set_snapshot_version_changed_flag(&mut self) {
-        self.snapshot_version |= Self::SNAPSHOT_VERSION_CHANGED_FLAG;
+        self.snapshot_version |= Self::LEAF_SNAPSHOT_VERSION_CHANGED_FLAG;
+    }
+
+    /// Clear the "changed" flag without changing the version value.
+    pub(crate) fn clear_snapshot_version_changed_flag(&mut self) {
+        self.snapshot_version &= Self::LEAF_SNAPSHOT_VERSION_MASK;
     }
 
     pub(crate) fn read_by_key(&self, search_key: &[u8], out_buffer: &mut [u8]) -> LeafReadResult {
@@ -1804,8 +1830,8 @@ impl LeafNode {
             return false;
         }
 
-        // Merge the snapshot version too.
-        self.snapshot_version = mini_page.get_snapshot_version();
+        // Merge the clean snapshot version too.
+        self.snapshot_version = mini_page.get_clean_snapshot_version();
         for meta in mini_page.meta_iter() {
             let c_key = mini_page.get_full_key(meta);
             let c_type = meta.op_type();
@@ -2071,8 +2097,12 @@ mod tests {
         #[case] mini_page_values: Vec<usize>,
         #[case] splitting_key: usize,
     ) {
-        let base = unsafe { &mut *LeafNode::make_base_page(4096) };
-        let mini = unsafe { &mut *LeafNode::make_base_page(4096) }; // Using base page as substitute
+        let base = unsafe {
+            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
+        };
+        let mini = unsafe {
+            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
+        }; // Using base page as substitute
 
         // Insert values to base page and mini page accordingly
         for i in 0..base_page_values.len() {
@@ -2114,8 +2144,12 @@ mod tests {
     #[case(vec![1], 2)]
     #[case(vec![2], 2)]
     fn test_split_with_key(#[case] base_page_values: Vec<usize>, #[case] splitting_key: usize) {
-        let base = unsafe { &mut *LeafNode::make_base_page(4096) };
-        let sibling = unsafe { &mut *LeafNode::make_base_page(4096) };
+        let base = unsafe {
+            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
+        };
+        let sibling = unsafe {
+            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
+        };
 
         // Insert values to base page
         for i in 0..base_page_values.len() {
@@ -2134,7 +2168,12 @@ mod tests {
         let splitting_key_byte_arrary = cast_slice::<usize, u8>(splitting_key_slice).to_vec();
 
         // Split the base page using the splitting key
-        base.split_with_key(sibling, &splitting_key_byte_arrary, false);
+        base.split_with_key(
+            sibling,
+            &splitting_key_byte_arrary,
+            false,
+            crate::snapshot::INVALID_SNAPSHOT_VERSION,
+        );
 
         // All values less than splitting key are in the left side node (self)
         // while those greater than or equal to the key are in the sibling node

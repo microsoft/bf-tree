@@ -17,7 +17,7 @@ use crate::{
     fs::{MemoryVfs, StdVfs, VfsImpl},
     mini_page_op::{LeafEntrySLocked, LeafEntryXLocked},
     nodes::{LeafNode, PageID},
-    snapshot::CPRSnapShotMgr,
+    snapshot::{CPRSnapShotMgr},
     utils::{rw_lock::RwLock, MappingTable},
     Config, StorageBackend,
 };
@@ -138,14 +138,17 @@ impl PageTable {
 
     /// Mostly, you need to clean up the offset, i.e., adding the offset to the free list.
     #[must_use = "this function allocates resources, your responsibility to cleanup if not used."]
-    pub(crate) fn alloc_base_page_mapping(&self) -> (PageID, LeafEntryXLocked<'_>) {
+    pub(crate) fn alloc_base_page_mapping(
+        &self,
+        snapshot_version: u64,
+    ) -> (PageID, LeafEntryXLocked<'_>) {
         counter!(AllocDiskID);
         let loc = PageLocation::Base(self.vfs.alloc_offset(self.config.leaf_page_size)); // Allocate space in disk for a full leaf page
         let entry = RwLock::new(loc);
         let (id, value) = self.table.insert(entry);
         let pid = PageID::from_id(id);
         let lock_guard = value.try_write().unwrap();
-        let base_ptr = LeafNode::make_base_page(self.config.leaf_page_size);
+        let base_ptr = LeafNode::make_base_page(self.config.leaf_page_size, snapshot_version);
         let x_locked = LeafEntryXLocked::with_buffer(
             lock_guard,
             self.vfs.as_ref(),
@@ -254,8 +257,11 @@ impl LeafStorage {
         Ok(v)
     }
 
-    pub(crate) fn alloc_base_page_and_lock(&self) -> (PageID, LeafEntryXLocked<'_>) {
-        let (pid, base_entry) = self.page_table.alloc_base_page_mapping();
+    pub(crate) fn alloc_base_page_and_lock(
+        &self,
+        snapshot_version: u64,
+    ) -> (PageID, LeafEntryXLocked<'_>) {
+        let (pid, base_entry) = self.page_table.alloc_base_page_mapping(snapshot_version);
 
         (pid, base_entry)
     }
@@ -337,16 +343,18 @@ impl LeafStorage {
         let new_page = self.circular_buffer.alloc(size)?;
 
         let mini_page_ptr = mini_page.ptr as *mut LeafNode;
+        let snapshot_ver = unsafe { &*mini_page_ptr }.get_clean_snapshot_version();
         unsafe { &*mini_page_ptr }.copy_initialize_to(
             new_page.as_ptr() as *mut LeafNode,
             size,
             true,
+            snapshot_ver,
         );
 
         // Ensure snapshot version does not change
         let dst_ref = unsafe { &mut *(new_page.as_ptr() as *mut LeafNode) };
         dst_ref.set_snapshot_version(
-            unsafe { &mut *(mini_page_ptr) }.get_snapshot_version(),
+            unsafe { &mut *(mini_page_ptr) }.get_clean_snapshot_version(),
             false,
         );
 
@@ -416,6 +424,7 @@ mod tests {
     use crate::{
         fs::{MemoryVfs, VfsImpl},
         mini_page_op::LeafOperations,
+        snapshot::INVALID_SNAPSHOT_VERSION,
         utils::MappingTable,
         Config,
     };
@@ -433,7 +442,7 @@ mod tests {
 
         let mut allocated = Vec::new();
         for _i in 0..2048 {
-            let (pid, leaf) = table.alloc_base_page_mapping();
+            let (pid, leaf) = table.alloc_base_page_mapping(INVALID_SNAPSHOT_VERSION);
             let loc = leaf.get_page_location();
             allocated.push((pid, loc.clone()));
         }

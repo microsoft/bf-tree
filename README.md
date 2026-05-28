@@ -87,6 +87,17 @@ let tree = BfTree::new_from_cpr_snapshot(
 std::fs::remove_file("snapshot.bftree");
 ```
 
+You can check whether all active threads have transitioned to the next
+snapshot version during a snapshot (i.e., all threads are operating in v + 1) with:
+
+```rust,ignore
+let ready = tree.are_all_threads_in_next_snapshot_version();
+```
+
+This is useful for coordinating external systems that need to wait until a
+snapshot's data is fully consistent but not the whole snapshot to finish
+before proceeding. Note that, this function returns false if no ongoing snapshot.
+
 Notes:
 - The snapshot file path passed to `cpr_snapshot` must be different from the
   path used by any concurrent recovery.
