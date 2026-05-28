@@ -6,18 +6,18 @@ use std::cell::UnsafeCell;
 
 use crate::{error::TreeError, nodes::InnerNode};
 
-pub(crate) fn is_locked(version: u16) -> bool {
+pub(crate) fn is_locked(version: u64) -> bool {
     (version & 0b10) == 0b10
 }
 
 #[derive(Debug)]
 pub(crate) struct ReadGuard<'a> {
-    version: u16,
+    version: u64,
     node: &'a UnsafeCell<InnerNode>,
 }
 
 impl<'a> ReadGuard<'a> {
-    pub(crate) fn new(v: u16, node: &'a InnerNode) -> Self {
+    pub(crate) fn new(v: u64, node: &'a InnerNode) -> Self {
         Self {
             version: v,
             node: unsafe { &*(node as *const InnerNode as *const UnsafeCell<InnerNode>) }, // todo: the caller should pass UnsafeCell<BaseNode> instead
@@ -33,7 +33,7 @@ impl<'a> ReadGuard<'a> {
         }
     }
 
-    pub(crate) fn check_version(&self) -> Result<u16, TreeError> {
+    pub(crate) fn check_version(&self) -> Result<u64, TreeError> {
         let v = self.as_ref().version_lock.load(Ordering::Acquire);
 
         if v == self.version {

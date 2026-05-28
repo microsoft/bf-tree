@@ -16,7 +16,7 @@ $ cargo add bf_tree
 Which will add bf_tree as a dependency to your Cargo.toml
 ```toml
 [dependencies]
-bf-tree = "0.4.0"
+bf-tree = "0.5.3"
 ```
 
 An example use of Bf-Tree:
@@ -48,19 +48,6 @@ the tree. Once enabled, call [`BfTree::cpr_snapshot`] with the destination path
 to take a snapshot at any point. Snapshots can be taken concurrently with
 ongoing reads and writes; only one snapshot may be in progress at a time.
 
-```rust
-use bf_tree::{BfTree, Config};
-
-let mut config = Config::default();
-config.use_snapshot(true);
-let tree = BfTree::with_config(config, None).unwrap();
-
-tree.insert(b"key", b"value");
-
-// Take a CPR snapshot of the current tree state.
-tree.cpr_snapshot("snapshot.bftree");
-```
-
 To recover a tree from a snapshot file, use
 [`BfTree::new_from_cpr_snapshot`]. The snapshot file embeds most configuration
 fields (record sizes, leaf page size, cache-only flag, etc.), so the caller
@@ -77,9 +64,19 @@ only needs to specify the recovery-time options:
 - `wal`: optional write-ahead log configuration for the recovered tree.
 
 ```rust
-use bf_tree::BfTree;
+use bf_tree::{BfTree, Config};
 use std::path::PathBuf;
 
+let mut config = Config::default();
+config.use_snapshot(true);
+let tree = BfTree::with_config(config, None).unwrap();
+
+tree.insert(b"key", b"value");
+
+// Take a CPR snapshot of the current tree state.
+tree.cpr_snapshot("snapshot.bftree");
+
+// Recover a bf-tree from a CPR snapshot
 let tree = BfTree::new_from_cpr_snapshot(
     "snapshot.bftree",
     /* use_snapshot */ true,
@@ -90,6 +87,17 @@ let tree = BfTree::new_from_cpr_snapshot(
 std::fs::remove_file("snapshot.bftree");
 ```
 
+You can check whether all active threads have transitioned to the next
+snapshot version during a snapshot (i.e., all threads are operating in v + 1) with:
+
+```rust,ignore
+let ready = tree.are_all_threads_in_next_snapshot_version();
+```
+
+This is useful for coordinating external systems that need to wait until a
+snapshot's data is fully consistent but not the whole snapshot to finish
+before proceeding. Note that, this function returns false if no ongoing snapshot.
+
 Notes:
 - The snapshot file path passed to `cpr_snapshot` must be different from the
   path used by any concurrent recovery.
@@ -97,7 +105,6 @@ Notes:
   [doc/snapshot-recovery.md](doc/snapshot-recovery.md).
 
 PRs are accepted and preferred over feature requests. Feel free to reach out if you have any design questions.
-
 
 ## Developer Guide
 
@@ -135,9 +142,21 @@ Concurrent systems are nondeterministic, and subject to exponential amount of di
 to deterministically and systematically explore different thread interleaving to uncover the bugs caused by subtle multithread interactions.
 
 ```bash
+# Core Bf-tree concurrent operations (~5 minutes)
 cargo test --features "shuttle" --release shuttle_bf_tree_concurrent_operations
+
+# CPR snapshot with disk-backed storage (fast, < 1s)
+cargo test --features "shuttle" --release shuttle_cpr_snapshot_disk
+
+# CPR snapshot with cache-only (in-memory) storage
+cargo test --features "shuttle" --release shuttle_cpr_snapshot_cache_only
 ```
-(Takes about 5 minute to run)
+
+To replay a specific failing schedule (generated automatically on failure into `target/schedule000.txt`):
+
+```bash
+cargo test --features "shuttle" --release shuttle_replay -- --nocapture
+```
 
 #### Fuzz Tests
 

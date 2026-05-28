@@ -17,7 +17,7 @@ use crate::{
         DISK_PAGE_SIZE,
     },
     range_scan::{ScanError, ScanPosition, ScanReturnField},
-    snapshot::CPRSnapShotMgr,
+    snapshot::{CPRSnapShotMgr, PhaseId},
     storage::{LeafStorage, PageLocation},
     tree::key_value_physical_size,
     utils::{
@@ -504,19 +504,24 @@ impl<'a> LeafEntryXLocked<'a> {
 
                 // If snapshot guard is valid and protected, then do CPR snapshot
                 if snapshot_guard.is_protected() {
-                    let local_thread_snapshot_version =
-                        CPRSnapShotMgr::get_snapshot_thread_version();
+                    let local_thread_snapshot_version = snapshot_guard.snapshot_version();
                     let base_page_ref = self.load_base_page_mut();
                     match snapshot_guard.get_local_phase_id() {
-                        // PREPARE
-                        1 if base_page_ref.get_snapshot_version()
-                            > local_thread_snapshot_version =>
+                        PhaseId::Rest
+                            if base_page_ref.get_clean_snapshot_version()
+                                < local_thread_snapshot_version =>
+                        {
+                            base_page_ref
+                                .set_snapshot_version(local_thread_snapshot_version, false);
+                        }
+                        PhaseId::Prepare
+                            if base_page_ref.get_clean_snapshot_version()
+                                > local_thread_snapshot_version =>
                         {
                             return Err(TreeError::NeedRestart);
                         }
-                        // INPROG or SWEEPING
-                        2 | 3
-                            if base_page_ref.get_snapshot_version()
+                        PhaseId::InProgress | PhaseId::Sweep
+                            if base_page_ref.get_clean_snapshot_version()
                                 < local_thread_snapshot_version =>
                         {
                             let base_page_ptr = unsafe {
@@ -563,6 +568,9 @@ impl<'a> LeafEntryXLocked<'a> {
                     mini_page_size_classes,
                     *cache_only,
                 );
+
+                // Guarantee: the new mini-page has the same snapshot version as the thread.
+                // No need to mark it as changed as the corresponding base page already has the updated snapshot version.
                 let mini_page_guard = storage.alloc_mini_page(mini_page_size)?;
 
                 LeafNode::initialize_mini_page(
@@ -570,6 +578,7 @@ impl<'a> LeafEntryXLocked<'a> {
                     mini_page_size,
                     MiniPageNextLevel::new(offset),
                     false,
+                    snapshot_guard.snapshot_version(),
                 );
 
                 let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
@@ -597,17 +606,24 @@ impl<'a> LeafEntryXLocked<'a> {
 
                 // Apply CPR snapshot, if enabled.
                 if snapshot_guard.is_protected() {
-                    let local_thread_snapshot_version =
-                        CPRSnapShotMgr::get_snapshot_thread_version();
+                    let local_thread_snapshot_version = snapshot_guard.snapshot_version();
 
                     match snapshot_guard.get_local_phase_id() {
-                        // PREPARE
-                        1 if mini_page.get_snapshot_version() > local_thread_snapshot_version => {
+                        PhaseId::Rest
+                            if mini_page.get_clean_snapshot_version()
+                                < local_thread_snapshot_version =>
+                        {
+                            mini_page.set_snapshot_version(local_thread_snapshot_version, true);
+                        }
+                        PhaseId::Prepare
+                            if mini_page.get_clean_snapshot_version()
+                                > local_thread_snapshot_version =>
+                        {
                             return Err(TreeError::NeedRestart);
                         }
-                        // INPROG or SWEEPING
-                        2 | 3
-                            if mini_page.get_snapshot_version() < local_thread_snapshot_version =>
+                        PhaseId::InProgress | PhaseId::Sweep
+                            if mini_page.get_clean_snapshot_version()
+                                < local_thread_snapshot_version =>
                         {
                             let mini_page_ptr = unsafe {
                                 std::slice::from_raw_parts(
@@ -615,12 +631,17 @@ impl<'a> LeafEntryXLocked<'a> {
                                     mini_page.meta.node_size as usize,
                                 )
                             };
+                            // Temporarily change the next level to none for snapshotting
+                            // and reverse back afterwards.
+                            let next_level = mini_page.next_level;
+                            mini_page.next_level = MiniPageNextLevel::new_null();
                             snapshot_guard.snapshot_base_page(
                                 pid,
                                 mini_page_ptr,
                                 mini_page.meta.node_size as usize,
                             );
-                            mini_page.set_snapshot_version(local_thread_snapshot_version, false);
+                            mini_page.set_snapshot_version(local_thread_snapshot_version, true);
+                            mini_page.next_level = next_level;
                         }
                         _ => {}
                     }
@@ -638,24 +659,31 @@ impl<'a> LeafEntryXLocked<'a> {
 
                 Err(TreeError::NeedRestart)
             }
-
             PageLocation::Mini(ptr) => {
-                let mut snapshot_version_changed = false;
-
                 // Apply CPR snapshot, if enabled.
                 if snapshot_guard.is_protected() {
-                    let local_thread_snapshot_version =
-                        CPRSnapShotMgr::get_snapshot_thread_version();
+                    let local_thread_snapshot_version = snapshot_guard.snapshot_version();
                     let mini_page = self.load_cache_page_mut(ptr);
 
                     match snapshot_guard.get_local_phase_id() {
-                        // PREPARE
-                        1 if mini_page.get_snapshot_version() > local_thread_snapshot_version => {
+                        PhaseId::Rest
+                            if mini_page.get_clean_snapshot_version()
+                                < local_thread_snapshot_version =>
+                        {
+                            mini_page.set_snapshot_version(
+                                local_thread_snapshot_version,
+                                !(*cache_only),
+                            ); // Keep version number clean for cache-only mode
+                        }
+                        PhaseId::Prepare
+                            if mini_page.get_clean_snapshot_version()
+                                > local_thread_snapshot_version =>
+                        {
                             return Err(TreeError::NeedRestart);
                         }
-                        // INPROG or SWEEPING
-                        2 | 3
-                            if mini_page.get_snapshot_version() < local_thread_snapshot_version =>
+                        PhaseId::InProgress | PhaseId::Sweep
+                            if mini_page.get_clean_snapshot_version()
+                                < local_thread_snapshot_version =>
                         {
                             let mini_page_ptr = unsafe {
                                 std::slice::from_raw_parts(
@@ -668,16 +696,19 @@ impl<'a> LeafEntryXLocked<'a> {
                                 mini_page_ptr,
                                 mini_page.meta.node_size as usize,
                             );
-                            mini_page.set_snapshot_version(local_thread_snapshot_version, true);
-                            snapshot_version_changed = true;
+                            mini_page.set_snapshot_version(
+                                local_thread_snapshot_version,
+                                !(*cache_only),
+                            ); // Keep version number clean for cache-only mode
 
                             // Need to snapshot the base page as well.
                             if !(*cache_only) {
                                 // No need to update the version on a base page as its mini-page has version updated already
+                                // Need to guarantee mini-page is already merged to the base page along with its snapshot version.
                                 let base_page =
                                     self.load_base_page(mini_page.next_level.as_offset());
                                 assert!(
-                                    base_page.get_snapshot_version()
+                                    base_page.get_clean_snapshot_version()
                                         < local_thread_snapshot_version
                                 );
 
@@ -713,7 +744,14 @@ impl<'a> LeafEntryXLocked<'a> {
                     // Consolidate first, and then try insert again
                     // We cannot split a root mini-page with a single key
                     if !success {
-                        root_page.consolidate_inner(OpType::Insert, None, true, *cache_only, None);
+                        root_page.consolidate_inner(
+                            OpType::Insert,
+                            None,
+                            true,
+                            *cache_only,
+                            None,
+                            snapshot_guard.snapshot_version(),
+                        );
                         success = root_page.insert(key, value, op_type, 0);
                         if !success {
                             // There are at least two distinctive INSERT keys in the root, safe for splitting.
@@ -753,23 +791,27 @@ impl<'a> LeafEntryXLocked<'a> {
 
                         let h = storage.begin_dealloc_mini_page(mini_page)?;
 
+                        // Guarantee: the new mini-page has the thread's snapshot version.
                         let mini_page_guard = storage.alloc_mini_page(s)?;
                         LeafNode::initialize_mini_page(
                             &mini_page_guard,
                             s,
                             mini_page.next_level,
                             *cache_only,
+                            snapshot_guard.snapshot_version(),
                         );
                         mini_page.copy_initialize_to(
                             mini_page_guard.as_ptr() as *mut LeafNode,
                             s,
                             true,
+                            snapshot_guard.snapshot_version(),
                         );
 
                         let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
 
-                        // If snapshot version changed, then it needs to be merged to the base page later.
-                        if snapshot_version_changed {
+                        // If snapshot version was updated for the original page, then it needs to carry over to the new page as well.
+                        // Otherwise, the updated snapshot version may not be merged into the base page.
+                        if mini_page.is_snapshot_version_changed() {
                             unsafe {
                                 (*new_mini_ptr).set_snapshot_version_changed_flag();
                             }
@@ -809,7 +851,9 @@ impl<'a> LeafEntryXLocked<'a> {
                             );
 
                             // Consolidate the existing node first while skipping the record with the same key as k, if exists
-                            cur_mini_page.consolidate_skip_key(key);
+                            // Guarantee: the current mini-page now has the same snapshot version as the thread's snapshot version.
+                            cur_mini_page
+                                .consolidate_skip_key(key, snapshot_guard.snapshot_version());
 
                             // Insert the k/v pair
                             let insert_success = cur_mini_page.insert(key, value, op_type, 0);
@@ -842,19 +886,25 @@ impl<'a> LeafEntryXLocked<'a> {
                             // Apply CPR snapshot to the parent node, if enabled.
                             if snapshot_guard.is_protected() {
                                 let local_thread_snapshot_version =
-                                    CPRSnapShotMgr::get_snapshot_thread_version();
+                                    snapshot_guard.snapshot_version();
 
-                                // PREPARE
                                 match snapshot_guard.get_local_phase_id() {
-                                    // PREPARE
-                                    1 if x_parent.as_ref().get_snapshot_version()
-                                        > local_thread_snapshot_version =>
+                                    PhaseId::Rest
+                                        if x_parent.as_ref().get_clean_snapshot_version()
+                                            < local_thread_snapshot_version =>
+                                    {
+                                        x_parent
+                                            .as_mut()
+                                            .set_snapshot_version(local_thread_snapshot_version);
+                                    }
+                                    PhaseId::Prepare
+                                        if x_parent.as_ref().get_clean_snapshot_version()
+                                            > local_thread_snapshot_version =>
                                     {
                                         return Err(TreeError::NeedRestart);
                                     }
-                                    // INPROG or SWEEPING
-                                    2 | 3
-                                        if x_parent.as_ref().get_snapshot_version()
+                                    PhaseId::InProgress | PhaseId::Sweep
+                                        if x_parent.as_ref().get_clean_snapshot_version()
                                             < local_thread_snapshot_version =>
                                     {
                                         snapshot_guard.snapshot_inner_node(x_parent.as_ref());
@@ -876,6 +926,7 @@ impl<'a> LeafEntryXLocked<'a> {
 
                             if x_parent.as_ref().have_space_for(&insert_split_key) {
                                 // Create a new mini-page of the same size as the current root node
+                                // Guarantee: the new mini-page has the same snapshot version as the thread.
                                 let mini_page_guard =
                                     storage.alloc_mini_page(storage.config.leaf_page_size)?;
                                 LeafNode::initialize_mini_page(
@@ -883,6 +934,7 @@ impl<'a> LeafEntryXLocked<'a> {
                                     storage.config.leaf_page_size,
                                     MiniPageNextLevel::new_null(),
                                     *cache_only,
+                                    snapshot_guard.snapshot_version(),
                                 );
                                 let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
                                 let mini_loc = PageLocation::Mini(new_mini_ptr);
@@ -900,6 +952,7 @@ impl<'a> LeafEntryXLocked<'a> {
                                             sibling_page,
                                             &insert_split_key,
                                             true,
+                                            snapshot_guard.snapshot_version(),
                                         );
                                         x_parent.as_mut().insert(&insert_split_key, sibling_id);
                                         {
@@ -964,6 +1017,7 @@ impl<'a> LeafEntryXLocked<'a> {
 
                                 // Avoid bringing back empty full page
                                 if base_page_ref.meta.meta_count_without_fence() != 0 {
+                                    // Guarantee: The new full page has the same snapshot version as the base page.
                                     let full_page_loc =
                                         upgrade_to_full_page(storage, base_page_ref, base_offset)?;
 
@@ -1097,12 +1151,16 @@ impl<'a> LeafEntryXLocked<'a> {
         let mini_page = self.load_cache_page_mut(mini_page_handle.as_ptr() as *mut LeafNode);
         assert!(mini_page.meta.node_size as usize == self.tmp_buffer_size);
 
-        if !mini_page.need_actually_merge_to_disk() {
+        // Beside the content, flush full page if its version changes as well to avoid duplicate snapshots of the same page.
+        if !mini_page.need_actually_merge_to_disk() && !mini_page.is_snapshot_version_changed() {
             self.change_to_base_loc();
             return;
         }
 
         mini_page.convert_cache_records_to_insert();
+
+        // set version changed to false before flushing
+        mini_page.clear_snapshot_version_changed_flag();
 
         self.change_to_base_loc();
         let buffer = self.tmp_buffer.take();
@@ -1164,8 +1222,15 @@ impl<'a> LeafEntryXLocked<'a> {
 
         // If base page has only one record, consolidate it first
         if base_ref.meta.meta_count_without_fence() == 1 {
-            let version = base_ref.get_snapshot_version();
-            base_ref.consolidate_inner(OpType::Insert, None, true, false, None);
+            let version = base_ref.get_clean_snapshot_version();
+            base_ref.consolidate_inner(
+                OpType::Insert,
+                None,
+                true,
+                false,
+                None,
+                base_ref.get_clean_snapshot_version(),
+            );
             base_ref.set_snapshot_version(version, false); // Ensure snapshot version does not change
         }
 
@@ -1189,30 +1254,38 @@ impl<'a> LeafEntryXLocked<'a> {
         // Choose a splitting key based on records in both mini-page and the correponding base page
         let merge_split_key = base_ref.get_merge_split_key(mini_page);
 
-        // Apply CPR snapshot, if enabled
-        // These operations form a transaction in terms of CPR snapshot thus subject to the snapshot consistency requirement.
-        // 1. Obtain a snapshot thread id
-        // 2. Check the version numbers of the parent and the mini-page, and determine what to do
-        //     a) If the local state is REST, proceed as normal
-        //     b) If the local state is PREPARE, proceed as normal if the version numbers of both are <= that of the thread. Otherwise, restart.
-        //     c) If the local state is INPROG or SWEEPING, first take a snapshot of the parent or mini-page if its version number <= that of the thread. Then proceed as normal.
         if snapshot_guard.is_protected() {
-            let local_thread_snapshot_version = CPRSnapShotMgr::get_snapshot_thread_version();
+            let local_thread_snapshot_version = snapshot_guard.snapshot_version();
 
-            // PREPARE
             match snapshot_guard.get_local_phase_id() {
-                // PREPARE
-                1 if x_parent.as_ref().get_snapshot_version() > local_thread_snapshot_version
-                    || mini_page.get_snapshot_version() > local_thread_snapshot_version =>
+                PhaseId::Rest => {
+                    if x_parent.as_ref().get_clean_snapshot_version()
+                        < local_thread_snapshot_version
+                    {
+                        x_parent
+                            .as_mut()
+                            .set_snapshot_version(local_thread_snapshot_version);
+                    }
+
+                    if mini_page.get_clean_snapshot_version() < local_thread_snapshot_version {
+                        mini_page.set_snapshot_version(local_thread_snapshot_version, true);
+                    }
+                }
+                PhaseId::Prepare
+                    if x_parent.as_ref().get_clean_snapshot_version()
+                        > local_thread_snapshot_version
+                        || mini_page.get_clean_snapshot_version()
+                            > local_thread_snapshot_version =>
                 {
                     // Abort if either page has been taken a snapshot before.
                     return Err(TreeError::NeedRestart);
                 }
-                // INPROG or SWEEPING
-                2 | 3 => {
+                PhaseId::InProgress | PhaseId::Sweep => {
                     // First take a snapshot of the inner node if it is of an older version.
                     // Then update its version
-                    if x_parent.as_ref().get_snapshot_version() < local_thread_snapshot_version {
+                    if x_parent.as_ref().get_clean_snapshot_version()
+                        < local_thread_snapshot_version
+                    {
                         snapshot_guard.snapshot_inner_node(x_parent.as_ref());
                         x_parent
                             .as_mut()
@@ -1225,9 +1298,9 @@ impl<'a> LeafEntryXLocked<'a> {
                         }
                     }
 
-                    // First take a snapshot of the mini page and the corresponding base page if they are of an older version.
+                    // Second take a snapshot of the mini page and the corresponding base page if they are of an older version.
                     // Then update their versions
-                    if mini_page.get_snapshot_version() < local_thread_snapshot_version {
+                    if mini_page.get_clean_snapshot_version() < local_thread_snapshot_version {
                         let mini_page_ptr = unsafe {
                             std::slice::from_raw_parts(
                                 mini_page as *const LeafNode as *const u8,
@@ -1239,8 +1312,8 @@ impl<'a> LeafEntryXLocked<'a> {
                             mini_page_ptr,
                             mini_page.meta.node_size as usize,
                         );
-                        // No need to mark version changed as base page's version is updated right away.
-                        mini_page.set_snapshot_version(local_thread_snapshot_version, false);
+
+                        mini_page.set_snapshot_version(local_thread_snapshot_version, true);
 
                         let base_page_ptr = unsafe {
                             std::slice::from_raw_parts(
@@ -1261,9 +1334,16 @@ impl<'a> LeafEntryXLocked<'a> {
         }
 
         if x_parent.as_ref().have_space_for(&merge_split_key) {
-            let (sibling_node_id, mut sibling_node) = storage.alloc_base_page_and_lock();
+            // Guarantee: the new base page has the same snapshot version as the current thread.
+            let (sibling_node_id, mut sibling_node) =
+                storage.alloc_base_page_and_lock(snapshot_guard.snapshot_version());
             let sibling_node_ref = sibling_node.load_base_page_mut();
-            base_ref.split_with_key(sibling_node_ref, &merge_split_key, false);
+            base_ref.split_with_key(
+                sibling_node_ref,
+                &merge_split_key,
+                false,
+                snapshot_guard.snapshot_version(),
+            );
             x_parent.as_mut().insert(&merge_split_key, sibling_node_id);
             {
                 // We are safe to drop parent here because both sibling nodes are already locked.

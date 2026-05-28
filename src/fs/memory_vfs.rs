@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::nodes::LeafNode;
+use crate::snapshot::INVALID_SNAPSHOT_VERSION;
 
 use super::VfsImpl;
 
@@ -35,7 +36,7 @@ impl VfsImpl for MemoryVfs {
     }
 
     fn alloc_offset(&self, size: usize) -> usize {
-        LeafNode::make_base_page(size) as usize
+        LeafNode::make_base_page(size, INVALID_SNAPSHOT_VERSION) as usize
     }
 
     fn dealloc_offset(&self, offset: usize) {
