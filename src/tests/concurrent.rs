@@ -23,6 +23,19 @@ use shuttle::rand::{thread_rng, Rng};
 #[cfg(not(feature = "shuttle"))]
 use rand::Rng;
 
+macro_rules! rand_range {
+    ($rng:expr, $range:expr) => {{
+        #[cfg(feature = "shuttle")]
+        {
+            $rng.gen_range($range)
+        }
+        #[cfg(not(feature = "shuttle"))]
+        {
+            $rng.random_range($range)
+        }
+    }};
+}
+
 fn make_key(key: u32, len: usize) -> Vec<u8> {
     let bytes = key.to_ne_bytes();
     bytes.into_iter().cycle().take(len).collect::<Vec<_>>()
@@ -58,22 +71,25 @@ fn concurrent_ops() {
         let handle = thread::spawn(move || {
             let mut buffer = vec![0u8; 4096];
 
+            #[cfg(feature = "shuttle")]
+            let mut rng = thread_rng();
+            #[cfg(not(feature = "shuttle"))]
             let mut rng = rand::rng();
             let current_tid = thread::current().id();
             black_box(current_tid);
 
             for op_n in 0..config.op_cnt_per_thread {
                 black_box(op_n);
-                match rng.random_range(0..OP_RANGE) {
+                match rand_range!(rng, 0..OP_RANGE) {
                     0..=1 => {
                         // insert
-                        let key = rng.random_range(0..config.key_range);
+                        let key = rand_range!(rng, 0..config.key_range);
                         let kv = make_key(key, config.key_len);
                         let _unused = tree_clone.insert(&kv, &kv);
                     }
                     2 => {
                         // read
-                        let key = rng.random_range(0..config.key_range);
+                        let key = rand_range!(rng, 0..config.key_range);
                         let kv = make_key(key, config.key_len);
                         let cnt = tree_clone.read(&kv, &mut buffer);
 
@@ -86,7 +102,7 @@ fn concurrent_ops() {
                     }
                     3 => {
                         // delete
-                        let key = rng.random_range(0..config.key_range);
+                        let key = rand_range!(rng, 0..config.key_range);
                         let kv = make_key(key, config.key_len);
                         tree_clone.delete(&kv);
                     }

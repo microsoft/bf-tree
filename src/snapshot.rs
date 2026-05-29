@@ -1179,9 +1179,9 @@ impl CPRSnapShotMgr {
                 recovery_snapshot_vfs.read(*offset, &mut inner_node_page_buffer);
                 let inner_node = InnerNodeBuilder::new().build_from_slice(&inner_node_page_buffer);
                 if unsafe { (*inner_node).is_root() } {
-                    println!("Here");
                     root_cnt += 1;
                 }
+                InnerNode::free_node(inner_node);
             }
             assert_eq!(root_cnt, 1, "Root count in inner mapping: {}", root_cnt);
 
@@ -2076,7 +2076,7 @@ mod tests {
         let mut runner = shuttle::PortfolioRunner::new(true, shuttle_config);
         let available_cores = std::thread::available_parallelism().unwrap().get().min(4);
         for _ in 0..available_cores {
-            runner.add(shuttle::scheduler::PctScheduler::new(5, 400));
+            runner.add(shuttle::scheduler::PctScheduler::new(10, 1000));
         }
 
         runner.run(|| {
@@ -2203,7 +2203,7 @@ mod tests {
         let mut runner = shuttle::PortfolioRunner::new(true, shuttle_config);
         let available_cores = std::thread::available_parallelism().unwrap().get().min(4);
         for _ in 0..available_cores {
-            runner.add(shuttle::scheduler::PctScheduler::new(5, 400));
+            runner.add(shuttle::scheduler::PctScheduler::new(10, 100));
         }
 
         runner.run(|| {
