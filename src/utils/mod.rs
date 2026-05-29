@@ -147,8 +147,18 @@ impl RngCore for SmallThreadRng {
 }
 
 #[cfg(all(feature = "shuttle", test))]
-pub(crate) fn get_rng() -> shuttle::rand::rngs::ThreadRng {
-    shuttle::rand::thread_rng()
+pub(crate) fn get_rng() -> ShuttleThreadRng {
+    ShuttleThreadRng(shuttle::rand::thread_rng())
+}
+
+#[cfg(all(feature = "shuttle", test))]
+pub(crate) struct ShuttleThreadRng(shuttle::rand::rngs::ThreadRng);
+
+#[cfg(all(feature = "shuttle", test))]
+impl ShuttleThreadRng {
+    pub(crate) fn random_range(&mut self, range: std::ops::Range<usize>) -> usize {
+        shuttle::rand::Rng::gen_range(&mut self.0, range)
+    }
 }
 
 pub(crate) enum NodeInfo {

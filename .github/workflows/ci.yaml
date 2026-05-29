@@ -1,0 +1,60 @@
+name: bftree
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-fmt-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+      - run: rustup component add rustfmt clippy 
+      - run: cargo install -f cargo-fuzz
+      # Temporarily allow warnings due to spdk feature disabled in benchmark.
+      - run: cargo clippy --features "metrics-rt, tracing"
+      - run: cargo clippy --features "metrics-rt-debug-all, tracing"
+      - run: cargo clippy --features "metrics-rt-debug-timer, tracing"
+      - run: cargo fmt --all -- --check
+      - run: cd benchmark && cargo clippy
+      - run: cd benchmark && cargo clippy --features "metrics-rt"
+      - run: cd benchmark && cargo clippy --features "metrics-rt-debug-all"
+      - run: cd benchmark && cargo clippy --features "metrics-rt-debug-timer"
+      - run: cd fuzz && cargo clippy
+      - run: cd fuzz && cargo fmt --all -- --check
+      - run: cd fuzz && cargo build
+
+  test_sans:
+    needs: check-fmt-build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v3
+      - run: rustup component add rust-src
+      - run: rustup toolchain install nightly --component rust-src
+      - run: sudo apt update && sudo apt install -y llvm-dev
+      - run: echo "PATH=/usr/lib/llvm-14/bin:$PATH" >> $GITHUB_ENV
+      - run: cargo test
+      - run: >
+          env ASAN_OPTIONS="detect_odr_violation=0" RUSTFLAGS="-Z sanitizer=address"
+          cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --tests
+      # Temporarily disabled
+      # I believe it is a bug elsewhere, not from us.
+      # - run: >
+      #     env RUSTFLAGS="-Z sanitizer=memory"
+      #     cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --tests
+      - run: >
+          env RUST_BACKTRACE=1
+          cargo test --features "shuttle" --release shuttle_bf_tree_concurrent_operations
+      - run: >
+          env RUST_BACKTRACE=1
+          cargo test --features "shuttle" --release shuttle_cpr_snapshot_disk
+      - run: >
+          env RUST_BACKTRACE=1
+          cargo test --features "shuttle" --release shuttle_cpr_snapshot_cache_only

@@ -17,7 +17,7 @@ use crate::{
     fs::{MemoryVfs, StdVfs, VfsImpl},
     mini_page_op::{LeafEntrySLocked, LeafEntryXLocked},
     nodes::{LeafNode, PageID},
-    snapshot::{CPRSnapShotMgr},
+    snapshot::CPRSnapShotMgr,
     utils::{rw_lock::RwLock, MappingTable},
     Config, StorageBackend,
 };

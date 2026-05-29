@@ -52,7 +52,7 @@ impl<T> Default for MappingTable<T> {
 impl<T> Drop for MappingTable<T> {
     fn drop(&mut self) {
         let mut states = self.states.lock().unwrap();
-        let initialized_records = states.next_id - 1;
+        let initialized_records = states.next_id;
         for i in 0..initialized_records {
             let batch_id = self.get_batch_id(i);
             let record_id = self.get_record_id(i);
