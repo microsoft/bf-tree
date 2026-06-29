@@ -18,7 +18,7 @@ chrono = { version = "0.4.38", optional = true }
 variant_count = { version = "1.1.0", optional = true }
 toml = "0.8.23"
 thread_local = "1.1.9"
-cfg-if = "=1.0.0"
+cfg-if = "1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6.4"
