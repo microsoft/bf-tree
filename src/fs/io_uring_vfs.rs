@@ -171,7 +171,7 @@ impl VfsImpl for IoUringVfs {
                         cqe.result(),
                         buf.len() as i32,
                         "Read cqe result error: {}",
-                        std::io::Error::last_os_error()
+                        std::io::Error::from_raw_os_error(-cqe.result())
                     );
                     break;
                 }
@@ -217,7 +217,7 @@ impl VfsImpl for IoUringVfs {
                         cqe.result(),
                         buf.len() as i32,
                         "Write cqe result error: {}",
-                        std::io::Error::last_os_error()
+                        std::io::Error::from_raw_os_error(-cqe.result())
                     );
                     break;
                 }
