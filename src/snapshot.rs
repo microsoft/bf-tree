@@ -301,6 +301,13 @@ impl CPRSnapShotMgr {
             return;
         }
 
+        // MEMORY BARRIER NEEDED HERE.
+        // This is the worker's announce store. It is followed in
+        // `reserve_thread_slot` by a load of `global_state`, and the manager
+        // does the mirror image: store `global_state`, then load these slots.
+        // `Release` orders each thread's own prior accesses but does not forbid
+        // a store being reordered past a later load of a *different* location,
+        // so both loads can miss both stores. See `reserve_thread_slot`.
         self.thread_local_states[*thread_slot_id].store(state, Ordering::Release);
     }
 
@@ -329,6 +336,11 @@ impl CPRSnapShotMgr {
         };
 
         // Advance the global state
+        // MEMORY BARRIER NEEDED HERE.
+        // The manager's half of the handshake: this store is followed by the
+        // scan in `check_if_phase_completed`. Without a StoreLoad barrier that
+        // scan can run against pre-store values while a worker's announce store
+        // is still invisible here. See `reserve_thread_slot`.
         self.global_state.store(new_state, Ordering::Release);
 
         new_state
@@ -338,6 +350,11 @@ impl CPRSnapShotMgr {
     /// This can only be invoked after the global state has advanced to the target_state.
     fn check_if_phase_completed(&self, target_state: u64) -> bool {
         // Checking all thread local states is sufficient because of the guarantee in `reserve_thread_slot`
+        // MEMORY BARRIER NEEDED HERE, before the loop.
+        // The guarantee `reserve_thread_slot` is cited for does not hold on
+        // x86-64: this scan is the load half of the manager's store-then-load,
+        // so it can complete before the store that precedes it is visible to
+        // the workers it is scanning.
         for thread_slot_id in 0..DEFAULT_MAX_SNAPSHOT_THREAD_NUM {
             let local_state = self.thread_local_states[thread_slot_id].load(Ordering::Acquire);
             if local_state != INVALID_SNAPSHOT_STATE && local_state != target_state {
@@ -429,6 +446,39 @@ impl CPRSnapShotMgr {
                 // Mrgr: all threads in phase 'x + 1' or invalid -> Execute 'x + 1' action
                 // T1: local state = state <- Inconsistency with global state
                 // Similar case for the pause_snapshot flag.
+                //
+                // MEMORY BARRIER NEEDED HERE, between the announce store above
+                // and this double-check load.
+                //
+                // The double-check does not prevent that interleaving. Both
+                // sides store to their own location and then load the other's,
+                // under Release/Acquire:
+                //
+                //   Worker                          Manager
+                //     STORE thread_local_states[tid]   STORE global_state
+                //     LOAD  global_state               LOAD  thread_local_states[..]
+                //
+                // Release/Acquire orders each thread's own accesses but does
+                // not forbid a store from being reordered past a later load of
+                // a different location, so both loads can miss both stores:
+                // this load returns the old global state and the manager's scan
+                // does not see the announce. The worker then commits to phase
+                // 'x' while the manager runs the 'x + 1' action.
+                //
+                // Only StoreLoad ordering rules that out -- SeqCst on both
+                // sides, or an explicit fence(SeqCst) between each store and
+                // the load that follows it.
+                //
+                // The `thread_slots` CAS above is a full barrier, but it sits
+                // *before* the announce store, so it orders nothing here.
+                //
+                // This is an x86-64 problem specifically. Release/Acquire
+                // lowers to stlr/ldar on ARM64, where RCsc semantics forbid the
+                // reordering; on x86-64 both are plain mov, and store-then-load
+                // is the one reordering TSO permits.
+                //
+                // `snapshot/cpr_handshake_miri.rs` reproduces both this and the
+                // `sweep` freeze under Miri, on this code, at iteration 0.
                 let current_global = self.global_state.load(Ordering::Acquire);
                 if self.get_local_state(&tid) != current_global
                     || self.pause_snapshot.load(Ordering::Acquire)
@@ -553,6 +603,12 @@ impl CPRSnapShotMgr {
         // Phase 3: Unblock snapshot id reservation.
         // Given that there are usually a very limited number of inner nodes, user workload should be affected minimally.
         // TODO: A complete block-free approach to scan all inner nodes.
+        // MEMORY BARRIER NEEDED HERE, between this store and the drain below.
+        // Phase 1 is the same store-then-load handshake as the phase
+        // transition, so the drain can report an empty thread table while a
+        // worker is still inside `reserve_thread_slot` and about to be handed a
+        // slot. The tree is then not actually frozen, and the inner-node
+        // pointers collected in phase 2 can be freed under a live writer.
         self.pause_snapshot.store(true, Ordering::Release);
         loop {
             if self.check_if_phase_completed(INVALID_SNAPSHOT_STATE) {
@@ -1763,6 +1819,9 @@ fn serialize_u8_slice_to_disk(slice: &[u8], vfs: &Arc<dyn VfsImpl>) -> usize {
     }
     start_offset.unwrap()
 }
+
+#[cfg(miri)]
+mod cpr_handshake_miri;
 
 #[cfg(test)]
 mod tests {
