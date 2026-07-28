@@ -58,3 +58,22 @@ jobs:
       - run: >
           env RUST_BACKTRACE=1
           cargo test --features "shuttle" --release shuttle_cpr_snapshot_cache_only
+
+  miri:
+    needs: check-fmt-build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v3
+      - run: rustup toolchain install nightly --component miri --component rust-src
+      - run: cargo +nightly miri setup
+      # CPR handshake weak-memory litmus tests. Weak-memory emulation is on by
+      # default (the meaningful configuration); seeds 0..3 match the controls
+      # documented in the `cpr_handshake_miri` module in src/snapshot.rs.
+      - name: CPR handshake Miri litmus tests
+        run: |
+          for seed in 0 1 2 3; do
+            MIRIFLAGS="-Zmiri-seed=$seed" cargo +nightly miri test --lib snapshot::cpr_handshake_miri
+          done

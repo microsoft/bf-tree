@@ -3,7 +3,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::panic;
 use std::path::Path;
@@ -337,6 +337,12 @@ impl CPRSnapShotMgr {
     /// If all thread local states are either invalid or equal to the target state, return true.
     /// This can only be invoked after the global state has advanced to the target_state.
     fn check_if_phase_completed(&self, target_state: u64) -> bool {
+        // This fence is needed to prevent the setting of global state to 'x + 1' to
+        // go after checking of each thread slot. Otherwise, right inbetween, a worker
+        // thread could set its local state to 'x' then the manager acts as if all threads
+        // are in 'x + 1' or 'INVALID', which is a violation of the CPR guarantee.
+        crate::sync::atomic::fence(Ordering::SeqCst);
+
         // Checking all thread local states is sufficient because of the guarantee in `reserve_thread_slot`
         for thread_slot_id in 0..DEFAULT_MAX_SNAPSHOT_THREAD_NUM {
             let local_state = self.thread_local_states[thread_slot_id].load(Ordering::Acquire);
@@ -419,6 +425,14 @@ impl CPRSnapShotMgr {
                 // Set the caller thread's snapshot local state to the global state
                 let global_state = self.global_state.load(Ordering::Acquire);
                 self.set_local_state(&tid, global_state);
+
+                // This fence is needed to prevent the second re-check load of global_state
+                // to go before the store of local_state. Otherwise, a worker thread could
+                // deem it safe to enter phase 'x' before even setting its local state to 'x'.
+                // If inbetween the manager sees the worker's local state as 'INVALID', then
+                // the manager could think all threads are in phase 'x + 1' which leads to
+                // a violation of the CPR guarantee.
+                crate::sync::atomic::fence(Ordering::SeqCst);
 
                 // If the global state has changed or a pause is requested after setting the local state, reset
                 // This is to guarantee that as soon as global state rolls to the next one,
@@ -747,14 +761,22 @@ impl CPRSnapShotMgr {
                     }
                 }
                 PageLocation::Null => {
-                    assert!(tree.cache_only);
-                    // In cache-only mode, an entry in page table could be Null when the corresponding mini-page is evicted.
-                    // The Null page is also snapshotted with a special marker.
-                    // Note that, the underlying assumption here is that Null page is always of an older version which may not be true.
-                    // To reconcille with the CPR semantics, we say that any data page in cache-only mode could be either Null or a valid page.
-                    // TODO: version the Null pages.
-                    mini_mapping.push((pid, NULL_PAGE_LOCATION_OFFSET)); // Special marker
-                    mini_size_mapping.push((pid, 0));
+                    if tree.cache_only {
+                        // In cache-only mode, an entry in page table could be Null when the corresponding mini-page is evicted.
+                        // The Null page is also snapshotted with a special marker.
+                        // Note that, the underlying assumption here is that Null page is always of an older version which may not be true.
+                        // To reconcille with the CPR semantics, we say that any data page in cache-only mode could be either Null or a valid page.
+                        // TODO: version the Null pages.
+                        mini_mapping.push((pid, NULL_PAGE_LOCATION_OFFSET)); // Special marker
+                        mini_size_mapping.push((pid, 0));
+                    } else {
+                        // Disk-mode trees can have Null page-table slots when
+                        // recovery materialized placeholders for sparse PageIDs
+                        // (see `new_from_snapshot`). Those placeholders are not
+                        // part of the logical tree state and should not appear
+                        // in the new snapshot.
+                        continue;
+                    }
                 }
             }
         }
@@ -890,33 +912,20 @@ impl CPRSnapShotMgr {
         }
 
         // Finalize the base leaf node mappings of the snapshot, disk-mode only
-        // Sort the base leaf node mappings by PageID in ascending order
-        // which is required for page table initialization.
-        let mut sorted_base_mapping_uninit: Vec<MaybeUninit<(PageID, usize)>> =
-            Vec::with_capacity(base_mapping_unique.len());
-        unsafe {
-            sorted_base_mapping_uninit.set_len(base_mapping_unique.len());
-        }
-        let mut sorted_base_mapping_init = vec![false; base_mapping_unique.len()];
-
-        for (k, v) in base_mapping_unique.iter() {
-            assert!(k.is_id());
-            let offset = k.as_id();
-            assert!((offset as usize) < sorted_base_mapping_uninit.len());
-            sorted_base_mapping_init[offset as usize] = true;
-            sorted_base_mapping_uninit[offset as usize].write((*k, *v));
-        }
+        // Sort the base leaf node mappings by PageID in ascending order so that
+        // recovery can replay them in PageID order. PageIDs can be sparse: a
+        // writer that captured an older snapshot version (e.g. V) but finished
+        // its leaf split after another writer with version V+1 will produce a
+        // base page whose ID is *higher* than the version-V+1 page, but only
+        // the version-V page is captured here. The resulting holes can appear
+        // anywhere in the ID range.
         let final_sorted_base_mapping: Vec<(PageID, usize)> = if !config.cache_only {
-            assert_eq!(
-                base_mapping_unique.len(),
-                sorted_base_mapping_init.iter().filter(|&&b| b).count()
-            );
-            unsafe {
-                std::mem::transmute::<
-                    std::vec::Vec<std::mem::MaybeUninit<(PageID, usize)>>,
-                    std::vec::Vec<(PageID, usize)>,
-                >(sorted_base_mapping_uninit)
-            }
+            let mut final_sorted_base_mapping = base_mapping_unique.into_iter().collect::<Vec<_>>();
+            final_sorted_base_mapping.sort_unstable_by_key(|(pid, _)| {
+                assert!(pid.is_id());
+                pid.as_id()
+            });
+            final_sorted_base_mapping
         } else {
             Vec::new()
         };
@@ -1305,7 +1314,7 @@ impl CPRSnapShotMgr {
         // Here we differentiate cache-only from disk-backed Bf-trees as their recovery process differs.
         if !bf_meta.cache_only {
             // For disk backed bf-tree, we reconstruct the page table using base pages.
-            let base_mapping: Vec<(PageID, usize)> = if bf_meta.base_size > 0 {
+            let mut base_mapping: Vec<(PageID, usize)> = if bf_meta.base_size > 0 {
                 read_vec_from_offset(
                     bf_meta.base_offset,
                     bf_meta.base_size,
@@ -1315,14 +1324,47 @@ impl CPRSnapShotMgr {
                 Vec::new()
             };
 
-            let base_page_loc_mapping = base_mapping.into_iter().map(|(pid, offset)| {
-                let loc = PageLocation::Base(offset);
-                (pid, loc)
+            // Captured PageIDs can be sparse: writers that observed an older
+            // snapshot version can produce base pages whose IDs are higher
+            // than version-V+1 pages that were filtered out by the sweep, so
+            // gaps can appear anywhere in [0, max_pid]. Materialize a dense
+            // page table that covers [0, max_pid] by inserting
+            // `PageLocation::Null` placeholders for missing IDs. This keeps
+            // `MappingTable::next_id` consistent with the original tree as of
+            // the snapshot point and lets later allocations resume at
+            // `max_pid + 1`.
+            base_mapping.sort_unstable_by_key(|(pid, _)| {
+                assert!(pid.is_id());
+                pid.as_id()
             });
+
+            let dense_base_page_loc_mapping: Vec<(PageID, PageLocation)> =
+                if let Some(max_pid) = base_mapping.last().map(|(pid, _)| pid.as_id()) {
+                    let mut dense_base_page_loc_mapping = Vec::with_capacity(max_pid as usize + 1);
+                    let mut base_mapping_iter = base_mapping.into_iter().peekable();
+
+                    for raw_pid in 0..=max_pid {
+                        let pid = PageID::from_id(raw_pid);
+                        let loc = if matches!(
+                            base_mapping_iter.peek(),
+                            Some((next_pid, _)) if next_pid.as_id() == raw_pid
+                        ) {
+                            let (_, offset) = base_mapping_iter.next().unwrap();
+                            PageLocation::Base(offset)
+                        } else {
+                            PageLocation::Null
+                        };
+                        dense_base_page_loc_mapping.push((pid, loc));
+                    }
+
+                    dense_base_page_loc_mapping
+                } else {
+                    Vec::new()
+                };
 
             // The file system of the newly constructed Bf-tree is the recovery_snapshot_file
             let pt = PageTable::new_from_mapping(
-                base_page_loc_mapping,
+                dense_base_page_loc_mapping.into_iter(),
                 recovery_snapshot_vfs.clone(),
                 config.clone(),
                 snapshot_mgr.clone(),
@@ -1764,6 +1806,125 @@ fn serialize_u8_slice_to_disk(slice: &[u8], vfs: &Arc<dyn VfsImpl>) -> usize {
     start_offset.unwrap()
 }
 
+#[cfg(miri)]
+mod cpr_handshake_miri {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Miri samples weak-memory behaviours rather than enumerating them, so each
+    /// litmus runs repeatedly. Both violations normally surface in the first few
+    /// iterations; see the control table above for the seeds this was checked on.
+    const ITERATIONS: usize = 300;
+
+    /// A raw pointer that can cross a thread boundary with its provenance intact.
+    ///
+    /// Casting through `usize` would also compile, but it exposes the allocation
+    /// and hands the other thread a wildcard-provenance pointer, which weakens
+    /// Miri's aliasing checks and muddies the diagnostic. Passing the pointer
+    /// itself keeps the experiment about ordering and nothing else.
+    /// Derived `Clone`/`Copy` would add a `T: Copy` bound, which the pointee does
+    /// not satisfy; a pointer is `Copy` regardless of what it points to.
+    struct SendPtr<T>(*mut T);
+
+    impl<T> Clone for SendPtr<T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<T> Copy for SendPtr<T> {}
+
+    unsafe impl<T> Send for SendPtr<T> {}
+
+    /// A worker cannot commit to phase `x` after the manager has both advanced to
+    /// `x + 1` and satisfied itself that every thread is already there.
+    #[test]
+    fn phase_can_complete_while_a_reservation_is_still_in_the_old_phase() {
+        for iteration in 0..ITERATIONS {
+            let mgr = Arc::new(CPRSnapShotMgr::new(0));
+            let old_state = mgr.global_state.load(Ordering::Relaxed);
+
+            let worker_mgr = mgr.clone();
+            let worker = thread::spawn(move || worker_mgr.reserve_thread_slot().ok());
+
+            let new_state = mgr.advance_global_state();
+            let phase_completed = mgr.check_if_phase_completed(new_state);
+
+            let Some((tid, version, phase_id)) = worker.join().unwrap() else {
+                continue;
+            };
+
+            mgr.release_thread_slot(tid);
+
+            let committed = CPRSnapShotMgr::new_snapshot_state(phase_id.as_raw(), version);
+            assert!(
+                !(phase_completed && committed == old_state),
+                "iteration {iteration}: worker committed to the old state {old_state:#x}, \
+                 but the manager advanced to {new_state:#x} and reported the phase complete"
+            );
+        }
+    }
+
+    /// A worker cannot reserve a slot after the manager has both flipped on pause
+    /// and satisfied itself that no thread is holding a slot.
+    #[test]
+    fn sweep_freeze_can_admit_a_reservation_after_declaring_the_tree_frozen() {
+        struct InnerNodeStandIn {
+            magic: u64,
+        }
+
+        const MAGIC: u64 = 0x5AFE_0000_5AFE;
+
+        for _ in 0..ITERATIONS {
+            let mgr = Arc::new(CPRSnapShotMgr::new(0));
+            let node = SendPtr(Box::into_raw(Box::new(InnerNodeStandIn { magic: MAGIC })));
+
+            // Signals that the manager has finished its freeze decision and acted
+            // on it. Nothing is ever sent to the manager, so the handshake window
+            // itself gains no synchronisation.
+            let (decided_tx, decided_rx) = mpsc::channel::<()>();
+
+            let worker_mgr = mgr.clone();
+            let worker = thread::spawn(move || {
+                // Capture the whole `SendPtr`, not its field: RFC 2229 would
+                // otherwise capture the bare `*mut T`, which is not `Send`.
+                let node = node;
+
+                let Ok((tid, _, _)) = worker_mgr.reserve_thread_slot() else {
+                    return;
+                };
+
+                // Holding a slot means the tree is not frozen, so by the protocol
+                // this node is live and `sweep` cannot have touched it.
+                let _ = decided_rx.recv();
+                let n = unsafe { &*node.0 };
+                assert_eq!(n.magic, MAGIC);
+
+                worker_mgr.release_thread_slot(tid);
+            });
+
+            // `sweep` phase 1: block all reservations, then drain the thread table.
+            mgr.pause_snapshot.store(true, Ordering::Release);
+            let frozen = mgr.check_if_phase_completed(INVALID_SNAPSHOT_STATE);
+            if frozen {
+                drop(unsafe { Box::from_raw(node.0) });
+            }
+
+            // Only now may the worker act on the slot it was granted.
+            let _ = decided_tx.send(());
+
+            worker.join().unwrap();
+
+            if !frozen {
+                drop(unsafe { Box::from_raw(node.0) });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{nodes::leaf_node::LeafReadResult, sync::thread, BfTree, Config};
@@ -1779,13 +1940,6 @@ mod tests {
     /// A snapshot taken later should cover the previous snapshots.
     #[test]
     fn cpr_snapshot_disk() {
-        // Install a panic hook that triggers the just-in-time debugger (e.g. VS debugger)
-        // so we can inspect the state at the point of failure.
-        panic::set_hook(Box::new(|info| {
-            eprintln!("PANIC: {info}");
-            unsafe { std::arch::asm!("int 3") };
-        }));
-
         let min_record_size: usize = 64;
         let max_record_size: usize = 2408;
         let leaf_page_size: usize = 8192;

@@ -358,6 +358,10 @@ impl LeafStorage {
             false,
         );
 
+        if unsafe { &*mini_page_ptr }.is_snapshot_version_changed() {
+            dst_ref.set_snapshot_version_changed_flag();
+        }
+
         self.circular_buffer.dealloc(mini_page);
         unsafe {
             debug_assert!(
