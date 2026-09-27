@@ -61,9 +61,9 @@ pub(crate) fn read_exact_at(
 ) -> std::io::Result<()> {
     while !buf.is_empty() {
         #[cfg(unix)]
-        let bytes_read = file.read_at(buf, offset)?;
+        let bytes_read = retry_interrupted(|| file.read_at(buf, offset))?;
         #[cfg(windows)]
-        let bytes_read = file.seek_read(buf, offset)?;
+        let bytes_read = retry_interrupted(|| file.seek_read(buf, offset))?;
 
         if bytes_read == 0 {
             return Err(std::io::Error::new(
@@ -84,9 +84,9 @@ pub(crate) fn write_all_at(
 ) -> std::io::Result<()> {
     while !buf.is_empty() {
         #[cfg(unix)]
-        let bytes_written = file.write_at(buf, offset)?;
+        let bytes_written = retry_interrupted(|| file.write_at(buf, offset))?;
         #[cfg(windows)]
-        let bytes_written = file.seek_write(buf, offset)?;
+        let bytes_written = retry_interrupted(|| file.seek_write(buf, offset))?;
 
         if bytes_written == 0 {
             return Err(std::io::Error::new(
@@ -98,6 +98,16 @@ pub(crate) fn write_all_at(
         buf = &buf[bytes_written..];
     }
     Ok(())
+}
+
+#[inline]
+fn retry_interrupted<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
 }
 
 /// We need these pair of function because spdk don't work with arbitrary memory, it needs memory that is pinned.
@@ -174,5 +184,50 @@ impl OffsetAlloc {
             offset = DISK_PAGE_SIZE;
         }
         self.next_available_offset.store(offset, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn positioned_io_retries_interruptions_and_preserves_other_errors() {
+        let mut attempts = 0;
+        let result = retry_interrupted(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from(ErrorKind::Interrupted))
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts, 3);
+
+        let mut attempts = 0;
+        let result: std::io::Result<()> = retry_interrupted(|| {
+            attempts += 1;
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        });
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn positioned_io_reads_and_writes_at_requested_offsets() {
+        let file = tempfile::tempfile().unwrap();
+        write_all_at(&file, b"abcdef", 5).unwrap();
+        write_all_at(&file, b"xy", 7).unwrap();
+        let mut bytes = [0; 6];
+        read_exact_at(&file, &mut bytes, 5).unwrap();
+        assert_eq!(&bytes, b"abxyef");
+        assert_eq!(
+            read_exact_at(&file, &mut [0; 7], 5).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        read_exact_at(&file, &mut [], u64::MAX).unwrap();
+        write_all_at(&file, &[], u64::MAX).unwrap();
     }
 }

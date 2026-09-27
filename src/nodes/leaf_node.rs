@@ -552,21 +552,8 @@ impl LeafNode {
     }
 
     /// Get # of keys strictly smaller than a merge_split_key
-    #[allow(clippy::unused_enumerate_index)]
     pub fn get_kv_num_below_key(&self, merge_split_key: &[u8]) -> u16 {
-        // Linear search
-        let mut cnt: u16 = 0;
-        for meta in self.meta_iter() {
-            let cmp = self.key_cmp(meta, merge_split_key);
-            // Pick all records from the base page whose key is smaller
-            // than merge_split_key
-            if cmp == std::cmp::Ordering::Less {
-                cnt += 1;
-            } else {
-                break;
-            }
-        }
-        cnt
+        self.lower_bound(merge_split_key) - self.first_meta_pos_after_fence()
     }
 
     /// [Cache-only mode]: Find the splitting key that evenly splits all the records in the
@@ -1232,6 +1219,63 @@ impl LeafNode {
             return true;
         }
 
+        self.insert_new_at(key, value, op_type, pos, max_fence_len)
+    }
+
+    /// Rebuilding and splitting visit unique records in key order. Append them
+    /// directly instead of searching the already sorted destination each time.
+    fn append_sorted(&mut self, key: &[u8], value: &[u8], op_type: OpType) -> bool {
+        if key.len() > KEY_LEN_MASK as usize
+            || value.len() > VALUE_LEN_MASK as usize
+            || key.len() < self.prefix_len as usize
+        {
+            return false;
+        }
+        let pos = self.meta.meta_count_with_fence() as usize;
+        debug_assert!(
+            pos == self.first_meta_pos_after_fence() as usize
+                || self.key_cmp(self.get_kv_meta(pos - 1), key) == Ordering::Less
+        );
+        // Match insert's handling of a deletion of an absent base-page record.
+        if op_type == OpType::Delete && self.is_base_page() {
+            return true;
+        }
+        self.insert_new_at(key, value, op_type, pos, 0)
+    }
+
+    fn append_from(
+        &mut self,
+        source: &LeafNode,
+        meta: &LeafKVMeta,
+        op_type: OpType,
+        key_buffer: &mut Vec<u8>,
+    ) -> bool {
+        let remaining_key = source.get_remaining_key(meta);
+        let key = if source.prefix_len == 0 {
+            // Mini pages normally have no prefix, so their keys can be borrowed.
+            remaining_key
+        } else {
+            key_buffer.clear();
+            key_buffer.extend_from_slice(source.get_prefix());
+            key_buffer.extend_from_slice(remaining_key);
+            key_buffer.as_slice()
+        };
+        self.append_sorted(key, source.get_value(meta), op_type)
+    }
+
+    /// The caller has checked lengths and located a vacant metadata position.
+    #[inline]
+    fn insert_new_at(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        op_type: OpType,
+        pos: usize,
+        max_fence_len: usize,
+    ) -> bool {
+        let post_fix_len = (key.len() - self.prefix_len as usize) as u16;
+        let val_len = value.len() as u16;
+        let kv_len = post_fix_len + val_len;
         //Check if the node has capacity for the new record with or without fences
         if self.full_with_fences(
             kv_len + std::mem::size_of::<LeafKVMeta>() as u16,
@@ -1249,19 +1293,16 @@ impl LeafNode {
         unsafe {
             let metas_size = std::mem::size_of::<LeafKVMeta>()
                 * (self.meta.meta_count_with_fence() - pos as u16) as usize;
-            let src_ptr = self
-                .data
-                .as_ptr()
-                .add(pos * std::mem::size_of::<LeafKVMeta>());
-            let dest_ptr = self
-                .data
-                .as_mut_ptr()
-                .add((pos + 1) * std::mem::size_of::<LeafKVMeta>());
-            std::ptr::copy(src_ptr, dest_ptr, metas_size);
-
-            self.write_initial_kv_meta(pos, new_meta);
-
-            let pair_ptr = self.data.as_mut_ptr().add(offset as usize);
+            let data_ptr = self.data.as_mut_ptr();
+            if metas_size != 0 {
+                std::ptr::copy(
+                    data_ptr.add(pos * std::mem::size_of::<LeafKVMeta>()),
+                    data_ptr.add((pos + 1) * std::mem::size_of::<LeafKVMeta>()),
+                    metas_size,
+                );
+            }
+            data_ptr.cast::<LeafKVMeta>().add(pos).write(new_meta);
+            let pair_ptr = data_ptr.add(offset as usize);
             std::ptr::copy_nonoverlapping(
                 key[self.prefix_len as usize..].as_ptr(),
                 pair_ptr,
@@ -1346,15 +1387,14 @@ impl LeafNode {
 
         let starting_kv_idx = if cache_only { 0 } else { FENCE_KEY_CNT };
 
+        let mut key_buffer = Vec::new();
         for i in 0..sibling_cnt {
             let kv_meta = self.get_kv_meta((new_cur_count + i) as usize + starting_kv_idx);
             if kv_meta.op_type() == OpType::Delete {
                 // skip deleted records.
                 continue;
             }
-            let key = self.get_full_key(kv_meta);
-            let value = self.get_value(kv_meta);
-            let insert_rt = sibling.insert(&key, value, OpType::Insert, 0);
+            let insert_rt = sibling.append_from(self, kv_meta, OpType::Insert, &mut key_buffer);
             assert!(insert_rt);
         }
 
@@ -1431,15 +1471,14 @@ impl LeafNode {
 
         let starting_kv_index = if cache_only { 0 } else { FENCE_KEY_CNT };
 
+        let mut key_buffer = Vec::new();
         for i in 0..sibling_cnt {
             let kv_meta = self.get_kv_meta((new_cur_count + i) as usize + starting_kv_index);
             if kv_meta.op_type() == OpType::Delete {
                 // skip deleted records
                 continue;
             }
-            let key = self.get_full_key(kv_meta);
-            let value = self.get_value(kv_meta);
-            let insert_rt = sibling.insert(&key, value, OpType::Insert, 0);
+            let insert_rt = sibling.append_from(self, kv_meta, OpType::Insert, &mut key_buffer);
             assert!(insert_rt);
         }
 
@@ -1482,7 +1521,7 @@ impl LeafNode {
         let prefix = self.get_prefix();
 
         for meta in self.meta_iter() {
-            if skip_tombstone && meta.op_type() == OpType::Delete {
+            if skip_tombstone && meta.op_type().is_absent() {
                 // Skip tombstone values.
                 continue;
             }
@@ -1525,10 +1564,12 @@ impl LeafNode {
             let (key, rest) = payload.split_at(key_len as usize);
             let (value, rest) = rest.split_at(value_len as usize);
             payload = rest;
-            let rt = if op_type == OpType::Delete {
-                self.insert(key, value, OpType::Delete, 0)
+            let rt = if op_type.is_absent() {
+                // Clean tombstones must remain absent too: converting Phantom
+                // to Insert/Cache would resurrect a deleted value.
+                self.append_sorted(key, value, op_type)
             } else {
-                self.insert(key, value, new_optype, 0)
+                self.append_sorted(key, value, new_optype)
             };
             assert!(rt);
         }
@@ -1618,6 +1659,7 @@ impl LeafNode {
         }
         let dst_ref = unsafe { &mut *dst_node };
 
+        let mut key_buffer = Vec::new();
         for meta in self.meta_iter() {
             let op = meta.op_type();
 
@@ -1629,8 +1671,7 @@ impl LeafNode {
                 continue;
             }
 
-            let value = self.get_value(meta);
-            let rt = dst_ref.insert(&self.get_full_key(meta), value, op, 0);
+            let rt = dst_ref.append_from(self, meta, op, &mut key_buffer);
             assert!(rt);
         }
     }

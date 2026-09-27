@@ -143,7 +143,7 @@ impl<'b> ScanIterMut<'_, 'b> {
 
     pub fn next(&mut self, out_buffer: &mut [u8]) -> Option<(usize, usize)> {
         loop {
-            if self.scan_cnt == 0 && self.end_key.is_none() {
+            if self.scan_cnt == 0 {
                 return None;
             }
 
@@ -306,7 +306,7 @@ impl<'b> ScanIter<'_, 'b> {
     /// Returns the length of the record fields copied into `out_buffer` or None if there is no more value.
     pub fn next(&mut self, out_buffer: &mut [u8]) -> Option<(usize, usize)> {
         loop {
-            if self.scan_cnt == 0 && self.end_key.is_none() {
+            if self.scan_cnt == 0 {
                 return None;
             }
 
@@ -483,7 +483,7 @@ fn move_cursor_to_leaf_mut<'a>(
     if let Ok(pos) = leaf.get_scan_position(key, false) {
         match pos {
             ScanPosition::Base(_) => {
-                if !tree.should_promote_scan_page() {
+                if parent.is_none() || !tree.should_promote_scan_page() {
                     return Ok((pos, leaf));
                 }
                 // o.w. fall through and upgrade to full page.
@@ -564,6 +564,62 @@ mod tests {
     use crate::{BfTree, Config};
     use crate::{LeafInsertResult, ScanReturnField};
     use std::mem::size_of;
+
+    #[test]
+    fn mutable_scan_of_root_leaf_with_full_promotion_rate() {
+        let mut config = Config::default();
+        config.scan_promotion_rate(100);
+        let tree = BfTree::with_config(config, None).unwrap();
+        let mut out = [0; 16];
+        {
+            let mut scan = tree
+                .scan_mut_with_count(b"a", 1, ScanReturnField::KeyAndValue)
+                .unwrap();
+            assert_eq!(scan.next(&mut out), None);
+        }
+        assert_eq!(tree.insert(b"a", b"one"), LeafInsertResult::Success);
+        let mut scan = tree
+            .scan_mut_with_end_key(b"a", b"z", ScanReturnField::KeyAndValue)
+            .unwrap();
+        assert_eq!(scan.next(&mut out), Some((1, 3)));
+        assert_eq!(&out[..4], b"aone");
+        for _ in 0..3 {
+            assert_eq!(scan.next(&mut out), None);
+        }
+    }
+
+    #[test]
+    fn mutable_scans_validate_keys_before_acquiring_a_leaf() {
+        use crate::ScanIterError;
+
+        let tree = BfTree::default();
+        assert!(matches!(
+            tree.scan_mut_with_count(b"", 1, ScanReturnField::Key),
+            Err(ScanIterError::InvalidStartKey)
+        ));
+        for (start, end, expected) in [
+            (
+                b"".as_slice(),
+                b"z".as_slice(),
+                ScanIterError::InvalidStartKey,
+            ),
+            (
+                b"a".as_slice(),
+                b"".as_slice(),
+                ScanIterError::InvalidEndKey,
+            ),
+            (
+                b"z".as_slice(),
+                b"a".as_slice(),
+                ScanIterError::InvalidKeyRange,
+            ),
+        ] {
+            match tree.scan_mut_with_end_key(start, end, ScanReturnField::Key) {
+                Err(actual) => assert_eq!(actual, expected),
+                Ok(_) => panic!("invalid mutable scan range was accepted"),
+            }
+        }
+    }
 
     #[test]
     fn test_scan_with_count() {

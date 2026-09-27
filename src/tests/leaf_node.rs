@@ -8,14 +8,14 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::nodes::leaf_node::{LeafNode, LeafReadResult, MiniPageNextLevel, OpType};
 
-struct TestBasePage(*mut LeafNode);
+struct TestBasePage(*mut LeafNode, usize);
 
 impl TestBasePage {
     fn new(size: usize) -> Self {
-        Self(LeafNode::make_base_page(
+        Self(
+            LeafNode::make_base_page(size, crate::snapshot::INVALID_SNAPSHOT_VERSION),
             size,
-            crate::snapshot::INVALID_SNAPSHOT_VERSION,
-        ))
+        )
     }
 
     fn page(&mut self) -> &mut LeafNode {
@@ -26,7 +26,187 @@ impl TestBasePage {
 
 impl Drop for TestBasePage {
     fn drop(&mut self) {
-        LeafNode::free_base_page(self.0);
+        // A test may reinitialize this allocation as a mini page. Ownership and
+        // allocation layout remain the same regardless of its current metadata.
+        let layout =
+            std::alloc::Layout::from_size_align(self.1, std::mem::align_of::<LeafNode>()).unwrap();
+        unsafe { std::alloc::dealloc(self.0.cast::<u8>(), layout) };
+    }
+}
+
+#[test]
+fn leaf_consolidation_keeps_clean_tombstones_absent() {
+    for skip_tombstone in [false, true] {
+        let mut allocation = TestBasePage::new(4096);
+        let leaf = allocation.page();
+        leaf.initialize(&[], &[], 4096, MiniPageNextLevel::new(0), false, false, 0);
+        assert!(leaf.insert(b"deleted-with-value", b"old", OpType::Insert, 0));
+        assert!(leaf.insert(b"deleted-with-value", &[], OpType::Delete, 0));
+        assert!(leaf.insert(b"deleted-empty", &[], OpType::Delete, 0));
+        assert!(leaf.insert(b"retained", b"value", OpType::Insert, 0));
+        leaf.covert_insert_records_to_cache();
+
+        leaf.consolidate_inner(OpType::Cache, None, skip_tombstone, false, None, 1);
+        let mut out = [0; 16];
+        for key in [b"deleted-with-value".as_slice(), b"deleted-empty"] {
+            let expected = if skip_tombstone {
+                LeafReadResult::NotFound
+            } else {
+                LeafReadResult::Deleted
+            };
+            assert_eq!(leaf.read_by_key(key, &mut out), expected);
+        }
+        assert_eq!(
+            leaf.read_by_key(b"retained", &mut out),
+            LeafReadResult::Found(5)
+        );
+        assert_eq!(&out[..5], b"value");
+        assert_eq!(
+            leaf.meta.meta_count_without_fence(),
+            if skip_tombstone { 1 } else { 3 }
+        );
+        if !skip_tombstone {
+            assert!(leaf
+                .meta_iter()
+                .take(2)
+                .all(|meta| meta.op_type() == OpType::Phantom));
+        }
+    }
+}
+
+#[test]
+fn leaf_upgrade_preserves_prefix_keys_and_filters_only_cold_cache() {
+    for with_prefix in [false, true] {
+        for discard_cold_cache in [false, true] {
+            let mut source = TestBasePage::new(4096);
+            let leaf = source.page();
+            let (low, high) = if with_prefix {
+                (b"tenant/a".as_slice(), b"tenant/z".as_slice())
+            } else {
+                (&[][..], &[][..])
+            };
+            leaf.initialize(
+                low,
+                high,
+                4096,
+                MiniPageNextLevel::new(128),
+                with_prefix,
+                false,
+                0,
+            );
+            let records = [
+                (
+                    b"tenant/a".as_slice(),
+                    b"one".as_slice(),
+                    OpType::Cache,
+                    false,
+                ),
+                (b"tenant/b", b"two", OpType::Cache, true),
+                (b"tenant/c", b"", OpType::Phantom, false),
+                (b"tenant/d", b"", OpType::Phantom, true),
+                (b"tenant/e", b"five", OpType::Insert, false),
+                (b"tenant/f", b"", OpType::Delete, false),
+            ];
+            for (key, value, op, referenced) in records {
+                assert!(leaf.insert(key, value, op, 0));
+                if referenced {
+                    leaf.get_kv_meta(leaf.lower_bound(key) as usize)
+                        .mark_as_ref();
+                }
+            }
+            let mut destination = TestBasePage::new(8192);
+            leaf.copy_initialize_to(destination.0, 8192, discard_cold_cache, 91);
+            let destination = destination.page();
+            assert!(destination.get_prefix().is_empty());
+            assert_eq!(destination.next_level.as_offset(), 128);
+            assert_eq!(destination.get_clean_snapshot_version(), 91);
+            let retained: Vec<_> = records
+                .iter()
+                .filter(|(_, _, op, referenced)| {
+                    !discard_cold_cache || op.is_dirty() || *referenced
+                })
+                .collect();
+            assert_eq!(
+                destination.meta.meta_count_without_fence() as usize,
+                retained.len()
+            );
+            for (meta, (key, value, op, _)) in destination.meta_iter().zip(retained) {
+                assert_eq!(destination.get_full_key(meta), *key);
+                assert_eq!(destination.get_value(meta), *value);
+                assert_eq!(meta.op_type(), *op);
+                assert!(!meta.is_referenced());
+            }
+        }
+    }
+}
+
+/// Run in an optimized build, with other tests/benchmarks stopped. Copy this
+/// harness unchanged to the compared revision; setup and checks are not timed.
+#[test]
+#[ignore = "manual leaf rebuild benchmark"]
+fn leaf_rebuild_microbench() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const ITERATIONS: usize = 2_000;
+    const SAMPLES: usize = 9;
+    for (key_len, count) in [(8, 96usize), (128, 20)] {
+        let keys: Vec<_> = (0..count)
+            .map(|index| {
+                let mut key = vec![b'x'; key_len];
+                key[key_len - 4..].copy_from_slice(&(index as u32).to_be_bytes());
+                key
+            })
+            .collect();
+        let value = [7; 16];
+        for operation in ["consolidate", "upgrade"] {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..=SAMPLES {
+                let mut source = TestBasePage::new(4096);
+                let source = source.page();
+                source.initialize(&[], &[], 4096, MiniPageNextLevel::new(0), false, false, 0);
+                for key in &keys {
+                    assert!(source.insert(key, &value, OpType::Insert, 0));
+                }
+                let mut destination = TestBasePage::new(8192);
+                let start = Instant::now();
+                if operation == "consolidate" {
+                    for _ in 0..ITERATIONS {
+                        black_box(&mut *source).consolidate(1);
+                    }
+                } else {
+                    for _ in 0..ITERATIONS {
+                        black_box(&*source).copy_initialize_to(
+                            black_box(destination.0),
+                            8192,
+                            false,
+                            1,
+                        );
+                    }
+                }
+                let elapsed = start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+                let result = if operation == "consolidate" {
+                    source
+                } else {
+                    destination.page()
+                };
+                assert_eq!(result.meta.meta_count_without_fence() as usize, count);
+                for (meta, key) in result.meta_iter().zip(&keys) {
+                    assert_eq!(result.get_full_key(meta), *key);
+                    assert_eq!(result.get_value(meta), value);
+                }
+                if sample != 0 {
+                    samples.push(elapsed);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "leaf_{operation}_k{key_len},records={count},median_ns={:.2},min_ns={:.2},max_ns={:.2}",
+                samples[SAMPLES / 2],
+                samples[0],
+                samples[SAMPLES - 1],
+            );
+        }
     }
 }
 
@@ -166,6 +346,7 @@ proptest! {
             let expected = 2 + stored.partition_point(|key| key < &query) as u16;
             prop_assert_eq!(leaf.lower_bound(&query), expected);
             prop_assert_eq!(leaf.linear_lower_bound(&query), expected);
+            prop_assert_eq!(leaf.get_kv_num_below_key(&query), expected - 2);
         }
 
         leaf.consolidate(37);

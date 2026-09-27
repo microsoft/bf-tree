@@ -14,7 +14,7 @@ use std::{
 
 use crate::counter;
 
-use super::{OffsetAlloc, VfsImpl};
+use super::{retry_interrupted, OffsetAlloc, VfsImpl};
 
 pub(crate) struct StdDirectVfs {
     file: File,
@@ -68,7 +68,7 @@ impl VfsImpl for StdDirectVfs {
 
     fn read(&self, offset: usize, buf: &mut [u8]) {
         counter!(IOReadRequest);
-        let bytes_read = self.file.read_at(buf, offset as u64).unwrap();
+        let bytes_read = retry_interrupted(|| self.file.read_at(buf, offset as u64)).unwrap();
         assert_eq!(bytes_read, buf.len(), "short direct I/O read");
     }
 
@@ -78,7 +78,7 @@ impl VfsImpl for StdDirectVfs {
 
     fn write(&self, offset: usize, buf: &[u8]) {
         counter!(IOWriteRequest);
-        let bytes_written = self.file.write_at(buf, offset as u64).unwrap();
+        let bytes_written = retry_interrupted(|| self.file.write_at(buf, offset as u64)).unwrap();
         assert_eq!(bytes_written, buf.len(), "short direct I/O write");
     }
 }

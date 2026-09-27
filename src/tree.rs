@@ -1379,7 +1379,7 @@ impl BfTree {
         }
 
         // The start key cannot exceed the configured max key length
-        if key.len() > self.config.max_fence_len / 2 || key.len() > MAX_KEY_LEN {
+        if key.is_empty() || key.len() > self.config.max_fence_len / 2 || key.len() > MAX_KEY_LEN {
             return Err(ScanIterError::InvalidStartKey);
         }
 
@@ -1409,13 +1409,23 @@ impl BfTree {
         }
 
         // The start key cannot exceed the configured max key length
-        if start_key.len() > self.config.max_fence_len / 2 || start_key.len() > MAX_KEY_LEN {
+        if start_key.is_empty()
+            || start_key.len() > self.config.max_fence_len / 2
+            || start_key.len() > MAX_KEY_LEN
+        {
             return Err(ScanIterError::InvalidStartKey);
         }
 
         // The end key cannot exceed the configured max key length
-        if end_key.len() > self.config.max_fence_len / 2 || end_key.len() > MAX_KEY_LEN {
+        if end_key.is_empty()
+            || end_key.len() > self.config.max_fence_len / 2
+            || end_key.len() > MAX_KEY_LEN
+        {
             return Err(ScanIterError::InvalidEndKey);
+        }
+
+        if start_key > end_key {
+            return Err(ScanIterError::InvalidKeyRange);
         }
 
         Ok(ScanIterMut::new_with_end_key(

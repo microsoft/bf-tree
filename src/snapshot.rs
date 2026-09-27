@@ -1012,7 +1012,7 @@ impl CPRSnapShotMgr {
         };
 
         let vfs = self.vfs.read().unwrap();
-        vfs.write(META_DATA_PAGE_OFFSET, metadata.as_slice());
+        vfs.write(META_DATA_PAGE_OFFSET, &metadata.to_bytes());
         vfs.flush();
 
         self.reset();
@@ -1162,26 +1162,19 @@ impl CPRSnapShotMgr {
         buffer_size: Option<usize>, // buffer size of the newly created Bf-tree
         wal_config: Option<Arc<WalConfig>>,
     ) -> Result<BfTree, ConfigError> {
-        // Check the recovery file is valid
-        if !recovery_snapshot_file_path.as_ref().exists() {
-            // if not already exist, we just create a new empty file at the location.
-            return Err(ConfigError::SnapshotFileInvalid(format!(
-                "Not found {}",
-                recovery_snapshot_file_path.as_ref().display()
-            )));
-        }
-
-        // Create WAL, if specified
-        let wal = wal_config.as_ref().map(|s| WriteAheadLog::new(s.clone()));
-
         // Retrieve the header of the snapshot file and construct a valid config for the to-be-recovered Bf-tree
-        let reader = std::fs::File::open(recovery_snapshot_file_path.as_ref()).unwrap();
+        let invalid_io = |error: std::io::Error| {
+            ConfigError::SnapshotFileInvalid(format!(
+                "Cannot read snapshot {}: {error}",
+                recovery_snapshot_file_path.as_ref().display()
+            ))
+        };
+        let reader =
+            std::fs::File::open(recovery_snapshot_file_path.as_ref()).map_err(invalid_io)?;
         let mut metadata = SectorAlignedVector::new_zeroed(DISK_PAGE_SIZE); // Metadata is at most one disk page in size
-        read_exact_at(&reader, &mut metadata, 0).unwrap();
-
-        let bf_meta = unsafe { (metadata.as_ptr() as *const BfTreeMeta).read() };
-        bf_meta.check_magic();
-        assert_eq!(reader.metadata().unwrap().len(), bf_meta.file_size);
+        read_exact_at(&reader, &mut metadata, 0).map_err(invalid_io)?;
+        let bf_meta = BfTreeMeta::from_bytes(&metadata)?;
+        bf_meta.validate_file_layout(reader.metadata().map_err(invalid_io)?.len())?;
 
         let mut bf_tree_config = Config::new_from_snapshot(&bf_meta);
 
@@ -1197,17 +1190,13 @@ impl CPRSnapShotMgr {
 
         bf_tree_config.snapshot_backend = StorageBackend::Std; // TODO, allow user chosen snapshot backend
 
-        let snapshot_mgr = if bf_tree_config.use_snapshot {
-            Some(Arc::new(CPRSnapShotMgr::new(
-                bf_tree_config.snapshot_version,
-            )))
-        } else {
-            None
-        };
-
         if let Some(size) = buffer_size {
             bf_tree_config.cb_size_byte = size
         }
+
+        bf_tree_config.write_ahead_log = wal_config.clone();
+        // Validate before size-class arithmetic and snapshot-manager creation.
+        bf_tree_config.validate()?;
 
         let size_classes = BfTree::create_mem_page_size_classes(
             bf_tree_config.cb_min_record_size,
@@ -1217,8 +1206,13 @@ impl CPRSnapShotMgr {
             bf_tree_config.cache_only,
         );
 
-        bf_tree_config.write_ahead_log = wal_config.clone();
-        bf_tree_config.validate()?;
+        let snapshot_mgr = if bf_tree_config.use_snapshot {
+            Some(Arc::new(CPRSnapShotMgr::new(
+                bf_tree_config.snapshot_version,
+            )))
+        } else {
+            None
+        };
 
         let config = Arc::new(bf_tree_config);
 
@@ -1229,6 +1223,7 @@ impl CPRSnapShotMgr {
         );
 
         // Step 1: reconstruct inner nodes.
+        let mut recovered_inner_nodes = RecoveryInnerNodes::default();
         let mut root_page_id = bf_meta.root_id;
         let mut inner_node_page_buffer = SectorAlignedVector::new_zeroed(INNER_NODE_SIZE);
         if root_page_id.is_inner_node_pointer() {
@@ -1257,7 +1252,7 @@ impl CPRSnapShotMgr {
             }
             let offset = inner_map.get(&root_page_id.as_inner_node()).unwrap();
             recovery_snapshot_vfs.read(*offset, &mut inner_node_page_buffer);
-            let root_page = InnerNodeBuilder::new().build_from_slice(&inner_node_page_buffer);
+            let root_page = recovered_inner_nodes.restore(&inner_node_page_buffer);
 
             // No need for disk offset of a inner node.
             unsafe {
@@ -1286,8 +1281,7 @@ impl CPRSnapShotMgr {
                     };
                     let offset = inner_map.get(&c.as_inner_node()).unwrap();
                     recovery_snapshot_vfs.read(*offset, &mut inner_node_page_buffer);
-                    let inner_page =
-                        InnerNodeBuilder::new().build_from_slice(&inner_node_page_buffer);
+                    let inner_page = recovered_inner_nodes.restore(&inner_node_page_buffer);
                     unsafe {
                         (*inner_page).set_disk_offset(INVALID_DISK_OFFSET as u64);
                     }
@@ -1404,6 +1398,8 @@ impl CPRSnapShotMgr {
             // Create the storage system first before allocating mini-pages.
             let storage =
                 LeafStorage::new_inner(config.clone(), pt, circular_buffer, recovery_snapshot_vfs);
+            let mut recovered_mini_pages =
+                RecoveryMiniPages::new(&storage.circular_buffer, mini_mapping.len());
 
             for (pid, offset) in &mini_mapping {
                 let mini_size = *mini_size_mapping_unique.get(pid).unwrap();
@@ -1415,6 +1411,7 @@ impl CPRSnapShotMgr {
                         return Err(ConfigError::CircularBufferSize("buffer size set too small. Consider increasing it or not specifying at all".to_string()));
                     }
                 };
+                recovered_mini_pages.pages.push(mini_page_guard.as_ptr());
 
                 // Copy mini-page from snapshot file to the newly allocated mini-page
                 let mut page_buffer = SectorAlignedVector::new_zeroed(mini_size);
@@ -1447,7 +1444,9 @@ impl CPRSnapShotMgr {
                 base_page.create_cache_page_loc(mini_loc);
             }
 
-            Ok(BfTree {
+            let wal = wal_config.as_ref().map(|s| WriteAheadLog::new(s.clone()));
+            recovered_mini_pages.disarm();
+            let tree = BfTree {
                 storage,
                 root_page_id: AtomicU64::new(raw_root_id),
                 wal,
@@ -1458,7 +1457,9 @@ impl CPRSnapShotMgr {
                 config,
                 #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
                 metrics_recorder: Some(Arc::new(ThreadLocal::new())),
-            })
+            };
+            recovered_inner_nodes.disarm();
+            Ok(tree)
         } else {
             // For cache-only mode, we create a new page table with NULL pages
             let mini_mapping_unallocated: Vec<(PageID, PageLocation)> = (0..bf_meta.leaf_page_num)
@@ -1514,6 +1515,8 @@ impl CPRSnapShotMgr {
 
             // Create a memory-based storage system before allocating mini-pages.
             let storage = LeafStorage::new_inner(config.clone(), pt, circular_buffer, storage_vfs);
+            let mut recovered_mini_pages =
+                RecoveryMiniPages::new(&storage.circular_buffer, mini_mapping.len());
 
             for (pid, offset) in &mini_mapping {
                 let mini_size = *mini_size_mapping_unique.get(pid).unwrap();
@@ -1527,9 +1530,10 @@ impl CPRSnapShotMgr {
                 let mini_page_guard = match storage.alloc_mini_page(mini_size) {
                     Ok(mini_page_ptr) => mini_page_ptr,
                     Err(_) => {
-                        panic!("Please increase cb_size_byte in config");
+                        return Err(ConfigError::CircularBufferSize("buffer size set too small. Consider increasing it or not specifying at all".to_string()));
                     }
                 };
+                recovered_mini_pages.pages.push(mini_page_guard.as_ptr());
 
                 // Copy mini-page from snapshot file to the newly allocated space.
                 let mut page_buffer = SectorAlignedVector::new_zeroed(mini_size);
@@ -1560,7 +1564,9 @@ impl CPRSnapShotMgr {
                     }
                 }
             }
-            Ok(BfTree {
+            let wal = wal_config.as_ref().map(|s| WriteAheadLog::new(s.clone()));
+            recovered_mini_pages.disarm();
+            let tree = BfTree {
                 storage,
                 root_page_id: AtomicU64::new(raw_root_id),
                 wal,
@@ -1571,7 +1577,70 @@ impl CPRSnapShotMgr {
                 config,
                 #[cfg(any(feature = "metrics-rt-debug-all", feature = "metrics-rt-debug-timer"))]
                 metrics_recorder: Some(Arc::new(ThreadLocal::new())),
-            })
+            };
+            recovered_inner_nodes.disarm();
+            Ok(tree)
+        }
+    }
+}
+
+/// Own reconstructed nodes until BfTree takes over. A partially restored tree
+/// cannot be traversed to free them because some children are still disk IDs.
+#[derive(Default)]
+struct RecoveryInnerNodes {
+    nodes: Vec<*mut InnerNode>,
+}
+
+impl RecoveryInnerNodes {
+    fn restore(&mut self, bytes: &[u8]) -> *mut InnerNode {
+        self.nodes.reserve(1);
+        let node = InnerNodeBuilder::new().build_from_slice(bytes);
+        self.nodes.push(node);
+        node
+    }
+
+    fn disarm(mut self) {
+        self.nodes.clear();
+    }
+}
+
+impl Drop for RecoveryInnerNodes {
+    fn drop(&mut self) {
+        for node in self.nodes.drain(..) {
+            InnerNode::free_node(node);
+        }
+    }
+}
+
+/// Drop before its buffer. Allocation guards inside the loop publish Ready
+/// before unwinding reaches this owner, and recovery has no concurrent users.
+struct RecoveryMiniPages<'a> {
+    buffer: &'a CircularBuffer,
+    pages: Vec<*mut u8>,
+}
+
+impl<'a> RecoveryMiniPages<'a> {
+    fn new(buffer: &'a CircularBuffer, capacity: usize) -> Self {
+        Self {
+            buffer,
+            pages: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.pages.clear();
+    }
+}
+
+impl Drop for RecoveryMiniPages<'_> {
+    fn drop(&mut self) {
+        for page in self.pages.drain(..) {
+            // SAFETY: Each pointer is a distinct, live allocation from this
+            // buffer. No recovered page has been published to another thread.
+            let handle = unsafe { self.buffer.acquire_exclusive_dealloc_handle(page) }
+                .expect("recovery exclusively owns its mini pages");
+            // Use allocator metadata, not potentially invalid page metadata.
+            self.buffer.dealloc(handle);
         }
     }
 }
@@ -1755,15 +1824,130 @@ pub(crate) struct BfTreeMeta {
 const _: () = assert!(std::mem::size_of::<BfTreeMeta>() <= DISK_PAGE_SIZE);
 
 impl BfTreeMeta {
-    fn as_slice(&self) -> &[u8] {
-        let ptr = self as *const Self as *const u8;
-        let size = std::mem::size_of::<Self>();
-        unsafe { std::slice::from_raw_parts(ptr, size) }
+    // Keep the existing native-layout format while initializing every padding
+    // byte. Reading a Rust struct's padding through &[u8] is not valid.
+    fn to_bytes(&self) -> SectorAlignedVector {
+        let mut bytes = SectorAlignedVector::new_zeroed(std::mem::size_of::<Self>());
+        macro_rules! write_field {
+            ($field:ident, $value:expr) => {{
+                let offset = std::mem::offset_of!(Self, $field);
+                let value = $value;
+                bytes[offset..offset + value.len()].copy_from_slice(&value);
+            }};
+        }
+        write_field!(magic_begin, self.magic_begin);
+        write_field!(root_id, self.root_id.raw().to_ne_bytes());
+        write_field!(inner_offset, self.inner_offset.to_ne_bytes());
+        write_field!(inner_size, self.inner_size.to_ne_bytes());
+        write_field!(mini_offset, self.mini_offset.to_ne_bytes());
+        write_field!(mini_size, self.mini_size.to_ne_bytes());
+        write_field!(mini_size_offset, self.mini_size_offset.to_ne_bytes());
+        write_field!(mini_size_size, self.mini_size_size.to_ne_bytes());
+        write_field!(base_offset, self.base_offset.to_ne_bytes());
+        write_field!(base_size, self.base_size.to_ne_bytes());
+        write_field!(file_size, self.file_size.to_ne_bytes());
+        write_field!(leaf_page_num, self.leaf_page_num.to_ne_bytes());
+        write_field!(cb_size_byte, self.cb_size_byte.to_ne_bytes());
+        write_field!(snapshot_version, self.snapshot_version.to_ne_bytes());
+        write_field!(cache_only, [u8::from(self.cache_only)]);
+        write_field!(read_promotion_rate, self.read_promotion_rate.to_ne_bytes());
+        write_field!(scan_promotion_rate, self.scan_promotion_rate.to_ne_bytes());
+        write_field!(cb_min_record_size, self.cb_min_record_size.to_ne_bytes());
+        write_field!(cb_max_record_size, self.cb_max_record_size.to_ne_bytes());
+        write_field!(leaf_page_size, self.leaf_page_size.to_ne_bytes());
+        write_field!(cb_max_key_len, self.cb_max_key_len.to_ne_bytes());
+        write_field!(max_fence_len, self.max_fence_len.to_ne_bytes());
+        write_field!(
+            cb_copy_on_access_ratio,
+            self.cb_copy_on_access_ratio.to_ne_bytes()
+        );
+        write_field!(read_record_cache, [u8::from(self.read_record_cache)]);
+        write_field!(max_mini_page_size, self.max_mini_page_size.to_ne_bytes());
+        write_field!(
+            mini_page_binary_search,
+            [u8::from(self.mini_page_binary_search)]
+        );
+        write_field!(write_load_full_page, [u8::from(self.write_load_full_page)]);
+        write_field!(magic_end, self.magic_end);
+        bytes
     }
 
-    fn check_magic(&self) {
-        assert_eq!(self.magic_begin, *BF_TREE_MAGIC_BEGIN);
-        assert_eq!(self.magic_end, *BF_TREE_MAGIC_END);
+    fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return Err(ConfigError::SnapshotFileInvalid(
+                "Truncated snapshot header".to_string(),
+            ));
+        }
+        // bool is the only field type with invalid bit patterns. Check its
+        // bytes before constructing a typed value from persisted data.
+        for offset in [
+            std::mem::offset_of!(Self, cache_only),
+            std::mem::offset_of!(Self, read_record_cache),
+            std::mem::offset_of!(Self, mini_page_binary_search),
+            std::mem::offset_of!(Self, write_load_full_page),
+        ] {
+            if bytes[offset] > 1 {
+                return Err(ConfigError::SnapshotFileInvalid(
+                    "Invalid boolean in snapshot header".to_string(),
+                ));
+            }
+        }
+        // SAFETY: The slice covers Self; bool bytes were validated above and
+        // every other field accepts all bit patterns. Unaligned input is valid.
+        let metadata = unsafe { bytes.as_ptr().cast::<Self>().read_unaligned() };
+        if metadata.magic_begin != *BF_TREE_MAGIC_BEGIN || metadata.magic_end != *BF_TREE_MAGIC_END
+        {
+            return Err(ConfigError::SnapshotFileInvalid(
+                "Invalid snapshot magic".to_string(),
+            ));
+        }
+        Ok(metadata)
+    }
+
+    fn validate_file_layout(&self, file_size: u64) -> Result<(), ConfigError> {
+        let invalid = |message: &str| ConfigError::SnapshotFileInvalid(message.to_string());
+        if self.file_size != file_size {
+            return Err(invalid("Snapshot file length does not match its header"));
+        }
+        if self.snapshot_version >= SNAPSHOT_STATE_VERSION_MASK {
+            return Err(invalid(
+                "Snapshot version cannot be advanced during recovery",
+            ));
+        }
+        let mapping_record_size = std::mem::size_of::<(PageID, usize)>();
+        for (offset, size) in [
+            (self.inner_offset, self.inner_size),
+            (self.mini_offset, self.mini_size),
+            (self.mini_size_offset, self.mini_size_size),
+            (self.base_offset, self.base_size),
+        ] {
+            if size == 0 && offset == 0 {
+                continue;
+            }
+            if size == 0
+                || !size.is_multiple_of(mapping_record_size)
+                || offset < DISK_PAGE_SIZE
+                || offset
+                    .checked_add(size)
+                    .is_none_or(|end| end as u64 > file_size)
+            {
+                return Err(invalid(
+                    "Snapshot mapping lies outside the file or has an invalid size",
+                ));
+            }
+        }
+        if self.mini_size != self.mini_size_size {
+            return Err(invalid(
+                "Snapshot mini-page mappings have inconsistent lengths",
+            ));
+        }
+        if self.root_id.is_inner_node_pointer() && (self.root_id.raw() == 0 || self.inner_size == 0)
+        {
+            return Err(invalid(
+                "Snapshot root is missing from the inner-node mappings",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1948,14 +2132,150 @@ mod cpr_handshake_miri {
 
 #[cfg(test)]
 mod tests {
+    use super::BfTreeMeta;
+    use crate::error::ConfigError;
     use crate::{nodes::leaf_node::LeafReadResult, sync::thread, BfTree, Config, WalConfig};
     use std::panic;
     #[cfg(feature = "shuttle")]
     use std::path::PathBuf;
+    #[cfg(feature = "shuttle")]
     use std::str::FromStr;
     use std::sync::atomic::Ordering;
     use std::sync::{atomic::AtomicBool, Arc};
     use std::time::Duration;
+
+    #[test]
+    fn recovery_with_insufficient_cache_releases_partial_allocations() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = temp_dir.path().join("tree.snapshot");
+        let wal_path = temp_dir.path().join("not-started.wal");
+        let mut config = Config::new(":cache:", 2 * 1024 * 1024);
+        config.use_snapshot(true);
+        let tree = BfTree::with_config(config, None).unwrap();
+        for index in 0..1024u64 {
+            tree.insert(&index.to_be_bytes(), &[7; 128]);
+        }
+        assert!(tree.root_page_id.load(Ordering::Relaxed) & BfTree::ROOT_IS_LEAF_MASK == 0);
+        tree.cpr_snapshot(&snapshot_path);
+        drop(tree);
+
+        // This size passes config validation but cannot hold the restored
+        // leaves. The error occurs after inner nodes and some mini pages have
+        // been allocated. CircularBuffer's destructor checks page cleanup;
+        // Miri/sanitizers additionally detect leaked inner allocations.
+        for _ in 0..3 {
+            let result = BfTree::new_from_cpr_snapshot(
+                &snapshot_path,
+                false,
+                None,
+                Some(16 * 1024),
+                Some(Arc::new(WalConfig::new(&wal_path))),
+            );
+            assert!(matches!(result, Err(ConfigError::CircularBufferSize(_))));
+            assert!(!wal_path.exists());
+        }
+
+        let recovered =
+            BfTree::new_from_cpr_snapshot(&snapshot_path, false, None, None, None).unwrap();
+        let mut value = [0; 128];
+        assert_eq!(
+            recovered.read(&1023u64.to_be_bytes(), &mut value),
+            LeafReadResult::Found(128),
+        );
+        assert_eq!(value, [7; 128]);
+    }
+
+    #[test]
+    fn recovery_rejects_invalid_headers_before_starting_a_wal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = temp_dir.path().join("tree.snapshot");
+        let wal_path = temp_dir.path().join("untouched.wal");
+        let mut config = Config::new(":cache:", 64 * 1024);
+        config.use_snapshot(true);
+        let tree = BfTree::with_config(config, None).unwrap();
+        tree.insert(b"key", b"value");
+        tree.cpr_snapshot(&snapshot_path);
+        drop(tree);
+        let original = std::fs::read(&snapshot_path).unwrap();
+
+        let assert_rejected = |bytes: &[u8]| {
+            std::fs::write(&snapshot_path, bytes).unwrap();
+            let wal = Arc::new(WalConfig::new(&wal_path));
+            let result = BfTree::new_from_cpr_snapshot(&snapshot_path, true, None, None, Some(wal));
+            assert!(matches!(result, Err(ConfigError::SnapshotFileInvalid(_))));
+            assert!(
+                !wal_path.exists(),
+                "invalid input must not start a WAL writer"
+            );
+        };
+
+        for len in [0, 1, std::mem::size_of::<BfTreeMeta>() - 1, 4095] {
+            assert_rejected(&original[..len]);
+        }
+        for offset in [
+            std::mem::offset_of!(BfTreeMeta, magic_begin),
+            std::mem::offset_of!(BfTreeMeta, magic_end),
+            std::mem::offset_of!(BfTreeMeta, cache_only),
+            std::mem::offset_of!(BfTreeMeta, read_record_cache),
+            std::mem::offset_of!(BfTreeMeta, mini_page_binary_search),
+            std::mem::offset_of!(BfTreeMeta, write_load_full_page),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset] = 0xff;
+            assert_rejected(&bytes);
+        }
+        for offset in [
+            std::mem::offset_of!(BfTreeMeta, mini_offset),
+            std::mem::offset_of!(BfTreeMeta, mini_size),
+            std::mem::offset_of!(BfTreeMeta, mini_size_size),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + std::mem::size_of::<usize>()]
+                .copy_from_slice(&usize::MAX.to_ne_bytes());
+            assert_rejected(&bytes);
+        }
+        for offset in [
+            std::mem::offset_of!(BfTreeMeta, snapshot_version),
+            std::mem::offset_of!(BfTreeMeta, file_size),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + 8].copy_from_slice(&u64::MAX.to_ne_bytes());
+            assert_rejected(&bytes);
+        }
+
+        for (offset, value) in [
+            (std::mem::offset_of!(BfTreeMeta, cb_min_record_size), 0usize),
+            (
+                std::mem::offset_of!(BfTreeMeta, cb_max_record_size),
+                usize::MAX,
+            ),
+            (std::mem::offset_of!(BfTreeMeta, leaf_page_size), 0usize),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + std::mem::size_of::<usize>()]
+                .copy_from_slice(&value.to_ne_bytes());
+            std::fs::write(&snapshot_path, &bytes).unwrap();
+            assert!(BfTree::new_from_cpr_snapshot(
+                &snapshot_path,
+                true,
+                None,
+                None,
+                Some(Arc::new(WalConfig::new(&wal_path))),
+            )
+            .is_err());
+            assert!(!wal_path.exists());
+        }
+
+        // Decoding also accepts unaligned bytes and writes deterministic zero
+        // padding, preserving the previous header layout without exposing it.
+        let mut unaligned = vec![0u8];
+        unaligned.extend_from_slice(&original);
+        let decoded = BfTreeMeta::from_bytes(&unaligned[1..]).unwrap();
+        assert_eq!(
+            decoded.to_bytes().as_slice(),
+            &original[..std::mem::size_of::<BfTreeMeta>()]
+        );
+    }
 
     #[test]
     fn recovery_replays_write_ops_and_returns_the_tree() {
@@ -2012,11 +2332,9 @@ mod tests {
         let leaf_page_size: usize = 8192;
         let snapshot_num: usize = 10;
         let num_threads: usize = 4;
-        let file_path: String = "target/test_simple.bftree".to_string();
-        let snapshot_file_path: String = "target/test_simple_snapshot.bftree".to_string();
-
-        let tmp_file_path = std::path::PathBuf::from_str(&file_path).unwrap();
-        let tmp_snapshot_file_path = std::path::PathBuf::from_str(&snapshot_file_path).unwrap();
+        let test_dir = tempfile::tempdir().unwrap();
+        let tmp_file_path = test_dir.path().join("tree.bftree");
+        let tmp_snapshot_file_path = test_dir.path().join("snapshot.bftree");
 
         let mut config = Config::new(&tmp_file_path, 128 * 1024); // 128KB buffer pool. insert/split/eviction all triggered
         config.storage_backend(crate::StorageBackend::Std);
@@ -2096,9 +2414,8 @@ mod tests {
         let leaf_page_size: usize = 8192;
         let num_threads: usize = 4;
 
-        let snapshot_file_path: String =
-            "target/test_simple_cache_only_snapshot.bftree".to_string();
-        let tmp_snapshot_file_path = std::path::PathBuf::from_str(&snapshot_file_path).unwrap();
+        let test_dir = tempfile::tempdir().unwrap();
+        let tmp_snapshot_file_path = test_dir.path().join("snapshot.bftree");
 
         let mut config = Config::default(); // Creat a CB that can hold 16 full pages
         config.storage_backend(crate::StorageBackend::Memory);
