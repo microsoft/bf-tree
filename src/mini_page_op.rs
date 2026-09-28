@@ -8,7 +8,6 @@ use crate::{
     error::TreeError,
     fs::{buffer_alloc, buffer_dealloc, VfsImpl},
     histogram, info,
-    nodes::InnerNode,
     nodes::{
         leaf_node::{
             GetScanRecordByPosResult, LeafNode, LeafReadResult as LeafResult, MiniPageNextLevel,
@@ -16,6 +15,7 @@ use crate::{
         },
         DISK_PAGE_SIZE,
     },
+    nodes::{InnerNode, LeafNodeHeader},
     range_scan::{ScanError, ScanPosition, ScanReturnField},
     snapshot::{CPRSnapShotMgr, PhaseId},
     storage::{LeafStorage, PageLocation},
@@ -50,7 +50,7 @@ impl TmpBuffer {
         }
     }
 
-    fn from_leaf_node(leaf: *mut LeafNode, size: usize) -> Self {
+    fn from_leaf_node(leaf: *mut LeafNodeHeader, size: usize) -> Self {
         let mut buffer = Self::new(size);
         assert!(unsafe { &*leaf }.meta.node_size as usize == size);
 
@@ -70,13 +70,15 @@ impl TmpBuffer {
         unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
     }
 
+    #[inline]
     fn as_leaf_node(&self) -> &LeafNode {
-        unsafe { &*(self.ptr as *const LeafNode) }
+        unsafe { &*LeafNode::from_raw_parts(self.ptr.cast::<LeafNodeHeader>(), self.size) }
     }
 
+    #[inline]
     fn as_leaf_node_mut(&mut self) -> &mut LeafNode {
         self.is_dirty = true;
-        unsafe { &mut *(self.ptr as *mut LeafNode) }
+        unsafe { &mut *LeafNode::from_raw_parts(self.ptr.cast::<LeafNodeHeader>(), self.size) }
     }
 }
 
@@ -95,8 +97,9 @@ pub(crate) trait LeafOperations {
 
     fn load_base_page(&mut self, offset: usize) -> &LeafNode;
 
-    fn load_cache_page(&self, ptr: *mut LeafNode) -> &LeafNode {
-        unsafe { &*ptr }
+    #[inline]
+    fn load_cache_page(&self, ptr: *mut LeafNodeHeader) -> &LeafNode {
+        unsafe { &*LeafNode::from_initialized_ptr(ptr) }
     }
 
     fn scan_record_by_pos_with_bound(
@@ -164,6 +167,7 @@ pub(crate) trait LeafOperations {
         }
     }
 
+    #[inline]
     fn read(
         &mut self,
         key: &[u8],
@@ -362,7 +366,7 @@ impl Drop for LeafEntryXLocked<'_> {
                 let offset = match self.raw_guard.deref() {
                     PageLocation::Base(offset) => *offset,
                     PageLocation::Mini(ptr) | PageLocation::Full(ptr) => {
-                        let mini_page = self.load_cache_page_mut(*ptr);
+                        let mini_page = unsafe { self.load_cache_page_mut(*ptr) };
                         mini_page.next_level.as_offset()
                     }
                     PageLocation::Null => panic!("Dropping a tmp buffer of a Null page"),
@@ -428,7 +432,7 @@ impl<'a> LeafEntryXLocked<'a> {
         file_handle: &'a dyn VfsImpl,
         page_id: PageID,
         tmp_buffer_size: usize,
-        leaf_buffer: *mut LeafNode,
+        leaf_buffer: *mut LeafNodeHeader,
         snapshot_mgr: Option<Arc<CPRSnapShotMgr>>,
     ) -> Self {
         Self {
@@ -455,8 +459,8 @@ impl<'a> LeafEntryXLocked<'a> {
                 self.file_handle.dealloc_offset(offset);
             }
             PageLocation::Mini(ptr) | PageLocation::Full(ptr) => {
-                let leaf_node = self.load_cache_page_mut(ptr);
-                let h = storage.begin_dealloc_mini_page(leaf_node).unwrap();
+                let leaf_node = unsafe { self.load_cache_page_mut(ptr) };
+                let h = storage.begin_dealloc_mini_page(ptr).unwrap();
                 let base_page = leaf_node.next_level;
                 storage.finish_dealloc_mini_page(h);
 
@@ -524,16 +528,11 @@ impl<'a> LeafEntryXLocked<'a> {
                             if base_page_ref.get_clean_snapshot_version()
                                 < local_thread_snapshot_version =>
                         {
-                            let base_page_ptr = unsafe {
-                                std::slice::from_raw_parts(
-                                    base_page_ref as *const LeafNode as *const u8,
-                                    base_page_ref.meta.node_size as usize,
-                                )
-                            };
+                            let base_page_ptr = base_page_ref.snapshot_bytes();
                             snapshot_guard.snapshot_base_page(
                                 pid,
                                 base_page_ptr,
-                                base_page_ref.meta.node_size as usize,
+                                base_page_ptr.len(),
                             );
                             base_page_ref
                                 .set_snapshot_version(local_thread_snapshot_version, false);
@@ -581,11 +580,11 @@ impl<'a> LeafEntryXLocked<'a> {
                     snapshot_guard.snapshot_version(),
                 );
 
-                let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
+                let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNodeHeader;
                 let mini_loc = PageLocation::Mini(new_mini_ptr);
                 self.create_cache_page_loc(mini_loc);
 
-                let mini_page_ref = self.load_cache_page_mut(new_mini_ptr);
+                let mini_page_ref = unsafe { self.load_cache_page_mut(new_mini_ptr) };
                 let insert_success = mini_page_ref.insert(key, value, op_type, 0);
                 assert!(insert_success);
                 counter!(InsertCreatedMiniPage);
@@ -602,7 +601,7 @@ impl<'a> LeafEntryXLocked<'a> {
                 }
 
                 histogram!(HitMiniPage, storage.config.leaf_page_size as u64);
-                let mini_page = unsafe { &mut *ptr };
+                let mini_page = unsafe { self.load_cache_page_mut(ptr) };
 
                 // Apply CPR snapshot, if enabled.
                 if snapshot_guard.is_protected() {
@@ -625,20 +624,15 @@ impl<'a> LeafEntryXLocked<'a> {
                             if mini_page.get_clean_snapshot_version()
                                 < local_thread_snapshot_version =>
                         {
-                            let mini_page_ptr = unsafe {
-                                std::slice::from_raw_parts(
-                                    mini_page as *const LeafNode as *const u8,
-                                    mini_page.meta.node_size as usize,
-                                )
-                            };
-                            // Temporarily change the next level to none for snapshotting
-                            // and reverse back afterwards.
+                            // Finish header mutation before borrowing the entire
+                            // page as immutable bytes for the snapshot write.
                             let next_level = mini_page.next_level;
                             mini_page.next_level = MiniPageNextLevel::new_null();
+                            let mini_page_ptr = mini_page.snapshot_bytes();
                             snapshot_guard.snapshot_base_page(
                                 pid,
                                 mini_page_ptr,
-                                mini_page.meta.node_size as usize,
+                                mini_page_ptr.len(),
                             );
                             mini_page.set_snapshot_version(local_thread_snapshot_version, true);
                             mini_page.next_level = next_level;
@@ -653,7 +647,7 @@ impl<'a> LeafEntryXLocked<'a> {
                     return Ok(());
                 }
 
-                self.merge_full_page_and_dealloc(mini_page, storage)?;
+                self.merge_full_page_and_dealloc(ptr, storage)?;
 
                 counter!(InsertMergeFullPage);
 
@@ -663,7 +657,7 @@ impl<'a> LeafEntryXLocked<'a> {
                 // Apply CPR snapshot, if enabled.
                 if snapshot_guard.is_protected() {
                     let local_thread_snapshot_version = snapshot_guard.snapshot_version();
-                    let mini_page = self.load_cache_page_mut(ptr);
+                    let mini_page = unsafe { self.load_cache_page_mut(ptr) };
 
                     match snapshot_guard.get_local_phase_id() {
                         PhaseId::Rest
@@ -685,16 +679,11 @@ impl<'a> LeafEntryXLocked<'a> {
                             if mini_page.get_clean_snapshot_version()
                                 < local_thread_snapshot_version =>
                         {
-                            let mini_page_ptr = unsafe {
-                                std::slice::from_raw_parts(
-                                    mini_page as *const LeafNode as *const u8,
-                                    mini_page.meta.node_size as usize,
-                                )
-                            };
+                            let mini_page_ptr = mini_page.snapshot_bytes();
                             snapshot_guard.snapshot_mini_page(
                                 pid,
                                 mini_page_ptr,
-                                mini_page.meta.node_size as usize,
+                                mini_page_ptr.len(),
                             );
                             mini_page.set_snapshot_version(
                                 local_thread_snapshot_version,
@@ -705,23 +694,18 @@ impl<'a> LeafEntryXLocked<'a> {
                             if !(*cache_only) {
                                 // No need to update the version on a base page as its mini-page has version updated already
                                 // Need to guarantee mini-page is already merged to the base page along with its snapshot version.
-                                let base_page =
-                                    self.load_base_page(mini_page.next_level.as_offset());
+                                let base_offset = mini_page.next_level.as_offset();
+                                let base_page = self.load_base_page(base_offset);
                                 assert!(
                                     base_page.get_clean_snapshot_version()
                                         < local_thread_snapshot_version
                                 );
 
-                                let base_page_ptr = unsafe {
-                                    std::slice::from_raw_parts(
-                                        base_page as *const LeafNode as *const u8,
-                                        base_page.meta.node_size as usize,
-                                    )
-                                };
+                                let base_page_ptr = self.snapshot_base_page_bytes(base_offset);
                                 snapshot_guard.snapshot_base_page(
                                     pid,
                                     base_page_ptr,
-                                    base_page.meta.node_size as usize,
+                                    base_page_ptr.len(),
                                 );
                             }
 
@@ -738,7 +722,7 @@ impl<'a> LeafEntryXLocked<'a> {
                 // Unlike other leaf nodes, root leaf node's split is done through
                 // detecting split_flag upon tree traversal
                 if *cache_only && parent.is_none() {
-                    let root_page = self.load_cache_page_mut(ptr);
+                    let root_page = unsafe { self.load_cache_page_mut(ptr) };
                     let mut success = root_page.insert(key, value, op_type, 0);
 
                     // Consolidate first, and then try insert again
@@ -763,7 +747,7 @@ impl<'a> LeafEntryXLocked<'a> {
                     }
                 }
 
-                let mini_page = self.load_cache_page_mut(ptr);
+                let mini_page = unsafe { self.load_cache_page_mut(ptr) };
                 if !(*cache_only) {
                     debug_assert!(!mini_page.next_level.is_null());
                 } else {
@@ -789,7 +773,7 @@ impl<'a> LeafEntryXLocked<'a> {
                             "upgrading mini page size"
                         );
 
-                        let h = storage.begin_dealloc_mini_page(mini_page)?;
+                        let h = storage.begin_dealloc_mini_page(ptr)?;
 
                         // Guarantee: the new mini-page has the thread's snapshot version.
                         let mini_page_guard = storage.alloc_mini_page(s)?;
@@ -801,27 +785,27 @@ impl<'a> LeafEntryXLocked<'a> {
                             snapshot_guard.snapshot_version(),
                         );
                         mini_page.copy_initialize_to(
-                            mini_page_guard.as_ptr() as *mut LeafNode,
+                            mini_page_guard.as_ptr() as *mut LeafNodeHeader,
                             s,
                             true,
                             snapshot_guard.snapshot_version(),
                         );
 
-                        let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
+                        let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNodeHeader;
 
                         // If snapshot version was updated for the original page, then it needs to carry over to the new page as well.
                         // Otherwise, the updated snapshot version may not be merged into the base page.
                         if mini_page.is_snapshot_version_changed() {
                             unsafe {
-                                (*new_mini_ptr).set_snapshot_version_changed_flag();
+                                (*LeafNode::from_initialized_ptr(new_mini_ptr))
+                                    .set_snapshot_version_changed_flag();
                             }
                         }
 
                         let new_mini_loc = PageLocation::Mini(new_mini_ptr);
                         self.create_cache_page_loc(new_mini_loc);
 
-                        let rt = self
-                            .load_cache_page_mut(new_mini_ptr)
+                        let rt = unsafe { self.load_cache_page_mut(new_mini_ptr) }
                             .insert(key, value, op_type, 0);
                         drop(mini_page_guard);
 
@@ -842,7 +826,7 @@ impl<'a> LeafEntryXLocked<'a> {
                         // To avoid creating empty mini-pages during consolidation after split, we do consolidation first to see if we could
                         // avoid page splitting.
                         if *cache_only {
-                            let cur_mini_page = self.load_cache_page_mut(ptr);
+                            let cur_mini_page = unsafe { self.load_cache_page_mut(ptr) };
 
                             // Only split when the current mini-page has reached the max leaf page size
                             assert!(
@@ -936,7 +920,7 @@ impl<'a> LeafEntryXLocked<'a> {
                                     *cache_only,
                                     snapshot_guard.snapshot_version(),
                                 );
-                                let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
+                                let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNodeHeader;
                                 let mini_loc = PageLocation::Mini(new_mini_ptr);
 
                                 // Insert the new page into mapping table
@@ -947,7 +931,9 @@ impl<'a> LeafEntryXLocked<'a> {
                                 let cur_page_loc = self.get_page_location().clone();
                                 match cur_page_loc {
                                     PageLocation::Mini(_) => {
-                                        let sibling_page = unsafe { &mut *new_mini_ptr };
+                                        let sibling_page = unsafe {
+                                            &mut *LeafNode::from_initialized_ptr(new_mini_ptr)
+                                        };
                                         cur_mini_page.split_with_key(
                                             sibling_page,
                                             &insert_split_key,
@@ -1005,7 +991,7 @@ impl<'a> LeafEntryXLocked<'a> {
                             // it caches the entire gap.
                             let base_offset = mini_page.next_level;
                             self.merge_mini_page_and_dealloc(
-                                mini_page,
+                                ptr,
                                 storage,
                                 parent.expect("parent must exists here"),
                             )?;
@@ -1040,8 +1026,31 @@ impl<'a> LeafEntryXLocked<'a> {
         }
     }
 
-    pub(crate) fn load_cache_page_mut<'b>(&self, ptr: *mut LeafNode) -> &'b mut LeafNode {
-        unsafe { &mut *ptr }
+    /// Borrow a cache allocation while its page-table entry is write locked.
+    ///
+    /// # Safety
+    /// The caller must hold this allocation's page-table write lock. `ptr` must
+    /// retain the original allocation provenance and point to an initialized
+    /// header whose validated size fits that allocation. The returned borrow
+    /// must not outlive the write lock or allocation, and must not overlap any
+    /// other access to the page except reborrows derived from this reference.
+    #[inline]
+    pub(crate) unsafe fn load_cache_page_mut<'b>(
+        &self,
+        ptr: *mut LeafNodeHeader,
+    ) -> &'b mut LeafNode {
+        unsafe { &mut *LeafNode::from_initialized_ptr(ptr) }
+    }
+
+    /// Snapshot this exclusively held base-page buffer without marking it dirty.
+    /// Clearing unused bytes does not change records or require a disk writeback.
+    pub(crate) fn snapshot_base_page_bytes(&mut self, offset: usize) -> &[u8] {
+        self.load_base_page(offset);
+        let buffer = self.tmp_buffer.as_mut().unwrap();
+        let leaf = unsafe {
+            &mut *LeafNode::from_raw_parts(buffer.ptr.cast::<LeafNodeHeader>(), buffer.size)
+        };
+        leaf.snapshot_bytes()
     }
 
     pub(crate) fn get_split_flag(&mut self) -> bool {
@@ -1052,7 +1061,7 @@ impl<'a> LeafEntryXLocked<'a> {
                 base_ref.get_split_flag()
             }
             PageLocation::Full(ptr) | PageLocation::Mini(ptr) => {
-                let base_ref = self.load_cache_page_mut(*ptr);
+                let base_ref = unsafe { self.load_cache_page_mut(*ptr) };
                 base_ref.get_split_flag()
             }
             PageLocation::Null => false, // This happens in the rare case in cache-only mode where the leaf node to insert a page in is evicted.
@@ -1068,7 +1077,7 @@ impl<'a> LeafEntryXLocked<'a> {
             None => {
                 let offset = match page_loc {
                     PageLocation::Mini(ptr) | PageLocation::Full(ptr) => {
-                        let page = self.load_cache_page_mut(ptr);
+                        let page = unsafe { self.load_cache_page_mut(ptr) };
                         page.next_level.as_offset()
                     }
                     PageLocation::Base(offset) => offset,
@@ -1091,7 +1100,7 @@ impl<'a> LeafEntryXLocked<'a> {
 
     pub(crate) fn merge_mini_page_and_dealloc(
         &mut self,
-        mini_page: &mut LeafNode,
+        mini_page: *mut LeafNodeHeader,
         storage: &LeafStorage,
         parent: ReadGuard<'_>,
     ) -> Result<(), TreeError> {
@@ -1104,7 +1113,7 @@ impl<'a> LeafEntryXLocked<'a> {
 
     pub(crate) fn merge_full_page_and_dealloc(
         &mut self,
-        mini_page: &mut LeafNode,
+        mini_page: *mut LeafNodeHeader,
         storage: &LeafStorage,
     ) -> Result<(), TreeError> {
         let h = storage.begin_dealloc_mini_page(mini_page)?;
@@ -1121,23 +1130,23 @@ impl<'a> LeafEntryXLocked<'a> {
         let page_loc = self.raw_guard.deref();
         let new_loc = match page_loc {
             PageLocation::Mini(ptr) => {
-                let mini_page = self.load_cache_page_mut(*ptr);
-                let h: TombstoneHandle = storage.begin_dealloc_mini_page(mini_page)?;
+                let mini_page = unsafe { self.load_cache_page_mut(*ptr) };
+                let h: TombstoneHandle = storage.begin_dealloc_mini_page(*ptr)?;
                 let new_page =
                     storage.move_mini_page_to_tail(h, mini_page.meta.node_size as usize)?;
 
                 counter!(MoveMiniPageToTail);
-                PageLocation::Mini(new_page.as_ptr() as *mut LeafNode)
+                PageLocation::Mini(new_page.as_ptr() as *mut LeafNodeHeader)
             }
             PageLocation::Full(ptr) => {
-                let mini_page = self.load_cache_page_mut(*ptr);
+                let mini_page = unsafe { self.load_cache_page_mut(*ptr) };
                 assert!(mini_page.meta.node_size as usize == storage.config.leaf_page_size);
-                let h = storage.begin_dealloc_mini_page(mini_page)?;
+                let h = storage.begin_dealloc_mini_page(*ptr)?;
                 let new_page =
                     storage.move_full_page_to_tail(h, mini_page.meta.node_size as usize)?;
 
                 counter!(MoveFullPageToTail);
-                PageLocation::Full(new_page.as_ptr() as *mut LeafNode)
+                PageLocation::Full(new_page.as_ptr() as *mut LeafNodeHeader)
             }
             PageLocation::Base(_) => unreachable!(),
             PageLocation::Null => panic!("move_cache_page_to_tail on Null page"),
@@ -1148,8 +1157,10 @@ impl<'a> LeafEntryXLocked<'a> {
 
     /// Flush a full page into its corresponding base page
     pub(crate) fn merge_full_page(&mut self, mini_page_handle: &TombstoneHandle) {
-        let mini_page = self.load_cache_page_mut(mini_page_handle.as_ptr() as *mut LeafNode);
-        assert!(mini_page.meta.node_size as usize == self.tmp_buffer_size);
+        let mini_page =
+            unsafe { self.load_cache_page_mut(mini_page_handle.as_ptr() as *mut LeafNodeHeader) };
+        let page_size = mini_page.meta.node_size as usize;
+        assert!(page_size == self.tmp_buffer_size);
 
         // Beside the content, flush full page if its version changes as well to avoid duplicate snapshots of the same page.
         if !mini_page.need_actually_merge_to_disk() && !mini_page.is_snapshot_version_changed() {
@@ -1169,11 +1180,7 @@ impl<'a> LeafEntryXLocked<'a> {
                 assert!(b.is_dirty);
 
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        mini_page_handle.as_ptr(),
-                        b.ptr,
-                        mini_page.meta.node_size as usize,
-                    );
+                    std::ptr::copy_nonoverlapping(mini_page_handle.as_ptr(), b.ptr, page_size);
                 }
                 let base = b.as_leaf_node_mut();
                 base.next_level = MiniPageNextLevel::new_null();
@@ -1183,11 +1190,7 @@ impl<'a> LeafEntryXLocked<'a> {
             None => {
                 let mut buffer = TmpBuffer::new(self.tmp_buffer_size);
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        mini_page_handle.as_ptr(),
-                        buffer.ptr,
-                        mini_page.meta.node_size as usize,
-                    );
+                    std::ptr::copy_nonoverlapping(mini_page_handle.as_ptr(), buffer.ptr, page_size);
                 }
 
                 let base = buffer.as_leaf_node_mut();
@@ -1209,7 +1212,8 @@ impl<'a> LeafEntryXLocked<'a> {
         storage: &LeafStorage,
     ) -> Result<MergeResult, TreeError> {
         parent.check_version()?;
-        let mini_page = self.load_cache_page_mut(mini_page_handle.as_ptr() as *mut LeafNode);
+        let mini_page_ptr = mini_page_handle.as_ptr().cast::<LeafNodeHeader>();
+        let mini_page = self.load_cache_page(mini_page_ptr);
 
         if !mini_page.need_actually_merge_to_disk() && !mini_page.is_snapshot_version_changed() {
             return Ok(MergeResult::NoSplit);
@@ -1219,6 +1223,11 @@ impl<'a> LeafEntryXLocked<'a> {
         let pid = self.pid;
 
         let base_ref = self.load_base_page_mut();
+        // Loading the base buffer may briefly borrow the mini-page to obtain
+        // its next-level offset. Only establish its mutable borrow afterwards.
+        // The page-table write lock and tombstone handle keep this allocation
+        // exclusively accessible and separate from the owned base-page buffer.
+        let mini_page = unsafe { &mut *LeafNode::from_initialized_ptr(mini_page_ptr) };
 
         // If base page has only one record, consolidate it first
         if base_ref.meta.meta_count_without_fence() == 1 {
@@ -1301,31 +1310,13 @@ impl<'a> LeafEntryXLocked<'a> {
                     // Second take a snapshot of the mini page and the corresponding base page if they are of an older version.
                     // Then update their versions
                     if mini_page.get_clean_snapshot_version() < local_thread_snapshot_version {
-                        let mini_page_ptr = unsafe {
-                            std::slice::from_raw_parts(
-                                mini_page as *const LeafNode as *const u8,
-                                mini_page.meta.node_size as usize,
-                            )
-                        };
-                        snapshot_guard.snapshot_mini_page(
-                            pid,
-                            mini_page_ptr,
-                            mini_page.meta.node_size as usize,
-                        );
+                        let mini_page_ptr = mini_page.snapshot_bytes();
+                        snapshot_guard.snapshot_mini_page(pid, mini_page_ptr, mini_page_ptr.len());
 
                         mini_page.set_snapshot_version(local_thread_snapshot_version, true);
 
-                        let base_page_ptr = unsafe {
-                            std::slice::from_raw_parts(
-                                base_ref as *const LeafNode as *const u8,
-                                base_ref.meta.node_size as usize,
-                            )
-                        };
-                        snapshot_guard.snapshot_base_page(
-                            pid,
-                            base_page_ptr,
-                            base_ref.meta.node_size as usize,
-                        );
+                        let base_page_ptr = base_ref.snapshot_bytes();
+                        snapshot_guard.snapshot_base_page(pid, base_page_ptr, base_page_ptr.len());
                         base_ref.set_snapshot_version(local_thread_snapshot_version, false);
                     }
                 }
@@ -1412,7 +1403,7 @@ impl<'a> LeafEntryXLocked<'a> {
         let page_loc = self.raw_guard.deref();
         match page_loc {
             PageLocation::Mini(ptr) => {
-                let mini_page = self.load_cache_page_mut(*ptr);
+                let mini_page = unsafe { self.load_cache_page_mut(*ptr) };
                 let mut mini_stats = mini_page.get_stats();
                 let next_level = mini_page.next_level;
 
@@ -1422,7 +1413,7 @@ impl<'a> LeafEntryXLocked<'a> {
                 mini_stats
             }
             PageLocation::Full(ptr) => {
-                let base_ref = self.load_cache_page_mut(*ptr);
+                let base_ref = unsafe { self.load_cache_page_mut(*ptr) };
                 base_ref.get_stats()
             }
             PageLocation::Base(offset) => {
@@ -1449,7 +1440,7 @@ impl<'a> LeafEntryXLocked<'a> {
                 panic!("the page is already base page!");
             }
             PageLocation::Mini(ptr) | PageLocation::Full(ptr) => {
-                let mini_page = self.load_cache_page_mut(ptr);
+                let mini_page = unsafe { self.load_cache_page_mut(ptr) };
                 let offset = mini_page.next_level.as_offset();
                 let base_loc = PageLocation::Base(offset);
 
@@ -1489,7 +1480,7 @@ impl<'a> LeafEntryXLocked<'a> {
                 base_ref.lsn = lsn;
             }
             PageLocation::Full(ptr) | PageLocation::Mini(ptr) => {
-                let page_ref = self.load_cache_page_mut(*ptr);
+                let page_ref = unsafe { self.load_cache_page_mut(*ptr) };
                 page_ref.lsn = lsn;
             }
             PageLocation::Null => panic!("update_lsn on Null page"),
@@ -1520,10 +1511,11 @@ pub(crate) fn upgrade_to_full_page(
             storage.config.leaf_page_size,
         );
     }
-    let full_page_ptr = full_page.as_ptr() as *mut LeafNode;
-    let full_page_ref = unsafe { &mut *full_page_ptr };
+    let full_page_ptr = full_page.as_ptr() as *mut LeafNodeHeader;
+    let full_page_ref =
+        unsafe { &mut *LeafNode::from_raw_parts(full_page_ptr, storage.config.leaf_page_size) };
     full_page_ref.covert_insert_records_to_cache();
     full_page_ref.next_level = base_page_offset;
 
-    Ok(PageLocation::Full(full_page.as_ptr() as *mut LeafNode))
+    Ok(PageLocation::Full(full_page.as_ptr() as *mut LeafNodeHeader))
 }

@@ -157,24 +157,28 @@ The final test suite adds 25 unit tests and one integration test over the
 82-unit-test baseline. The new model-based node tests each run 256 generated
 cases; the existing 1000-case node property tests remain in place.
 
-### Known unresolved safety findings
+### Leaf allocation bounds: follow-up on 2026-09-27
 
-This optimization pass is **not a clean memory-safety certification** of the
-whole tree. With default Stacked Borrows checks on nightly 2026-09-07, this
-command still fails:
+The original zero-tail representation was reproduced at `f8206af` with default
+Stacked Borrows checks on nightly 2026-09-07:
 
 ```sh
 cargo +nightly miri test --lib leaf_empty_prefix_and_empty_consolidation_are_valid
 ```
 
-`LeafNode::write_initial_kv_meta` derives a pointer from `data: [u8; 0]` and writes
-past that zero-length borrow. The failure happens during initial fence setup,
-before the optimized operations. This pre-existing variable-page representation
-needs a view carrying the allocation's actual bounds (for example, a DST or
-separate allocation owner/view). Using a fixed maximum array would overstate
-small mini-page allocations; address reconstruction and disabling alias checks
-are not acceptable fixes. The new deterministic test remains a normal/ASan
-regression, with this Miri reproducer documented separately.
+`LeafNode::write_initial_kv_meta` wrote past the borrow derived from
+`data: [u8; 0]`, during initial fence setup. The follow-up replaces it with an
+allocation-bounded DST backed by `[UnsafeCell<MaybeUninit<u8>>]`. This preserves
+the 32-byte header and thin page-table pointers while allowing atomic reference
+bits to change through shared leaf references. Fresh allocations use their
+owner's length; published pages retain a validated page size. The historical
+reproducer and deterministic leaf tests now pass with default alias checks.
+See [implementation, validation and performance evidence](leaf-safety-2026-09-27.md).
+
+### Remaining safety scope
+
+These targeted checks are **not a clean memory-safety certification** of the
+whole tree.
 
 The existing optimistic inner read protocol also allows ordinary metadata and
 payload reads to overlap non-atomic writes: `ReadGuard::try_read` samples a
@@ -182,5 +186,5 @@ version without excluding writers, `as_ref` exposes ordinary references, and
 `check_version` validates only afterwards. Such validation cannot remove a data
 race that already occurred. A complete fix needs a consistent atomic snapshot
 representation or shared reader exclusion, followed by concurrency and
-performance revalidation. Neither broad representation/protocol rewrite is
-claimed by these local optimizations.
+performance revalidation. That concurrency protocol rewrite is not claimed by
+the leaf allocation-bounds fix.

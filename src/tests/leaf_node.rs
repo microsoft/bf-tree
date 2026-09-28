@@ -6,9 +6,11 @@ use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
 use proptest_derive::Arbitrary;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::nodes::leaf_node::{LeafNode, LeafReadResult, MiniPageNextLevel, OpType};
+use crate::nodes::leaf_node::{
+    LeafNode, LeafNodeHeader, LeafReadResult, MiniPageNextLevel, OpType,
+};
 
-struct TestBasePage(*mut LeafNode, usize);
+struct TestBasePage(*mut LeafNodeHeader, usize);
 
 impl TestBasePage {
     fn new(size: usize) -> Self {
@@ -19,8 +21,9 @@ impl TestBasePage {
     }
 
     fn page(&mut self) -> &mut LeafNode {
-        // This guard owns the allocation, and the returned reference is tied to it.
-        unsafe { &mut *self.0 }
+        // Preserve the original allocation provenance and carry its entire
+        // extent into the reference, rather than extending a header reference.
+        unsafe { &mut *LeafNode::from_raw_parts(self.0, self.1) }
     }
 }
 
@@ -29,7 +32,8 @@ impl Drop for TestBasePage {
         // A test may reinitialize this allocation as a mini page. Ownership and
         // allocation layout remain the same regardless of its current metadata.
         let layout =
-            std::alloc::Layout::from_size_align(self.1, std::mem::align_of::<LeafNode>()).unwrap();
+            std::alloc::Layout::from_size_align(self.1, std::mem::align_of::<LeafNodeHeader>())
+                .unwrap();
         unsafe { std::alloc::dealloc(self.0.cast::<u8>(), layout) };
     }
 }
@@ -283,6 +287,109 @@ fn collision_key(prefix: &[u8], id: u8) -> Vec<u8> {
     key
 }
 
+#[test]
+fn leaf_short_preview_search_matches_btree_order() {
+    // Cover empty suffixes, strict zero-byte prefixes, signed-byte boundaries,
+    // and suffixes longer than the two-byte metadata preview.
+    let mut suffixes = vec![Vec::new()];
+    let mut previous = vec![Vec::new()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for suffix in &previous {
+            for byte in [0, 1, 0x80, 0xFF] {
+                let mut key = suffix.clone();
+                key.push(byte);
+                next.push(key);
+            }
+        }
+        suffixes.extend(next.iter().cloned());
+        previous = next;
+    }
+
+    for prefix in [b"".as_slice(), b"\0tenant/\0".as_slice()] {
+        for stored_parity in 0..2 {
+            let mut allocation = TestBasePage::new(4096);
+            let leaf = allocation.page();
+            let has_fence = !prefix.is_empty();
+            let mut high_fence = prefix.to_vec();
+            high_fence.extend_from_slice(&[0xFF; 4]);
+            leaf.initialize(
+                if has_fence { prefix } else { &[] },
+                if has_fence { &high_fence } else { &[] },
+                4096,
+                MiniPageNextLevel::new_null(),
+                has_fence,
+                false,
+                crate::snapshot::INVALID_SNAPSHOT_VERSION,
+            );
+            assert_eq!(leaf.get_prefix(), prefix);
+            let first_record = if has_fence { 2 } else { 0 };
+            let mut model = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+            // Alternate which short keys are absent, and insert in reverse
+            // generation order so insertion exercises the same lower bound.
+            for (index, suffix) in suffixes.iter().enumerate().rev() {
+                if index % 2 != stored_parity {
+                    continue;
+                }
+                let mut key = prefix.to_vec();
+                key.extend_from_slice(suffix);
+                let value = vec![index as u8, 0, 0xA5];
+                assert!(leaf.insert(&key, &value, OpType::Insert, 0));
+                model.insert(key, value);
+            }
+            // Initialized bytes outside a zero/one-byte preview are irrelevant
+            // to slice ordering, even when they are deliberately nonzero.
+            for index in first_record..leaf.meta.meta_count_with_fence() as usize {
+                leaf.get_kv_meta_mut(index)
+                    .fill_unused_preview_bytes(prefix.len(), 0xA5);
+            }
+            let stored: Vec<_> = leaf
+                .meta_iter()
+                .map(|meta| leaf.get_full_key(meta))
+                .collect();
+            assert_eq!(stored, model.keys().cloned().collect::<Vec<_>>());
+
+            let mut queries: Vec<_> = suffixes
+                .iter()
+                .map(|suffix| {
+                    let mut key = prefix.to_vec();
+                    key.extend_from_slice(suffix);
+                    key
+                })
+                .collect();
+            for suffix in [
+                [0, 0, 0, 0],
+                [0, 0, 0, 1],
+                [1, 0, 0, 0],
+                [0xFF, 0xFF, 0xFF, 0],
+            ] {
+                let mut key = prefix.to_vec();
+                key.extend_from_slice(&suffix);
+                queries.push(key);
+            }
+            queries.extend((0..prefix.len()).map(|len| prefix[..len].to_vec()));
+            queries.extend([vec![0xFF], high_fence]);
+
+            for query in queries {
+                let expected_position = first_record + model.range(..query.clone()).count();
+                assert_eq!(leaf.lower_bound(&query) as usize, expected_position);
+                assert_eq!(leaf.linear_lower_bound(&query) as usize, expected_position);
+                for binary_search in [true, false] {
+                    let mut out = [0x7E; 3];
+                    let result = leaf.read_by_key_inner(&query, &mut out, binary_search);
+                    if let Some(expected) = model.get(&query) {
+                        assert_eq!(result, LeafReadResult::Found(expected.len() as u32));
+                        assert_eq!(out.as_slice(), expected);
+                    } else {
+                        assert_eq!(result, LeafReadResult::NotFound);
+                        assert_eq!(out, [0x7E; 3]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(Config::with_cases(256))]
 
@@ -454,8 +561,290 @@ fn leaf_base_page_unused_storage_is_initialized() {
     // Whole pages are serialized by storage. This read also lets Miri check
     // that the header, fence metadata, and unused capacity are initialized.
     let bytes = unsafe { std::slice::from_raw_parts(allocation.0.cast::<u8>(), 4096) };
-    let unused_start = std::mem::size_of::<LeafNode>() + 2 * crate::nodes::KV_META_SIZE;
+    let unused_start = std::mem::size_of::<LeafNodeHeader>() + 2 * crate::nodes::KV_META_SIZE;
     assert!(bytes[unused_start..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn leaf_variable_allocations_preserve_bounds_and_shared_reference_bits() {
+    for page_size in [64, 128, 448, 832, 4096] {
+        for has_fence in [false, true] {
+            let mut allocation = TestBasePage::new(page_size);
+            {
+                let leaf = allocation.page();
+                assert_eq!(std::mem::size_of_val(leaf), page_size);
+                leaf.initialize(
+                    &[],
+                    &[],
+                    page_size,
+                    MiniPageNextLevel::new_null(),
+                    has_fence,
+                    false,
+                    0,
+                );
+                let record_index = if has_fence { 2 } else { 0 };
+                let value_len = page_size
+                    - std::mem::size_of::<LeafNodeHeader>()
+                    - (record_index + 1) * crate::nodes::KV_META_SIZE
+                    - 1;
+                let value = vec![0xA5; value_len];
+                assert!(leaf.insert(b"k", &value, OpType::Insert, 0));
+                assert_eq!(leaf.meta.remaining_size, 0);
+
+                // The record reaches the last allocated payload byte. Shared
+                // page/value borrows must still allow the metadata's atomic
+                // reference bit to be updated by a matching lookup.
+                let shared_leaf = &*leaf;
+                let meta = shared_leaf.get_kv_meta(record_index);
+                let borrowed_value = shared_leaf.get_value(meta);
+                let mut out = vec![0; value_len];
+                assert!(!meta.is_referenced());
+                assert_eq!(
+                    shared_leaf.read_by_key(b"j", &mut out),
+                    LeafReadResult::NotFound
+                );
+                assert!(!meta.is_referenced());
+                assert_eq!(
+                    shared_leaf.read_by_key(b"k", &mut out),
+                    LeafReadResult::Found(value_len as u32)
+                );
+                assert!(meta.is_referenced());
+                assert_eq!(borrowed_value, value);
+                assert_eq!(out, value);
+
+                // Rebuild both a full page and an empty one through the same
+                // allocation-backed DST borrow.
+                leaf.consolidate(2);
+                assert_eq!(leaf.meta.remaining_size, 0);
+                assert!(!leaf.get_kv_meta(record_index).is_referenced());
+                assert!(leaf.insert(b"k", &[], OpType::Delete, 0));
+                leaf.consolidate(4);
+                assert_eq!(leaf.meta.meta_count_without_fence(), 0);
+                assert!(leaf.insert(b"k", &value, OpType::Insert, 0));
+            }
+
+            // End the first mutable borrow before reconstructing a second
+            // full-extent reference from the owner-held allocation pointer.
+            let leaf = allocation.page();
+            assert_eq!(std::mem::size_of_val(leaf), page_size);
+            let mut out = vec![0; page_size];
+            assert!(matches!(
+                leaf.read_by_key(b"k", &mut out),
+                LeafReadResult::Found(_)
+            ));
+            leaf.consolidate(6);
+        }
+    }
+}
+
+#[test]
+fn leaf_variable_allocations_upgrade_into_uninitialized_storage() {
+    for page_size in [64, 128, 448, 832, 4096] {
+        let mut source = TestBasePage::new(page_size);
+        let leaf = source.page();
+        leaf.initialize(
+            &[],
+            &[],
+            page_size,
+            MiniPageNextLevel::new(128),
+            false,
+            false,
+            0,
+        );
+        assert!(leaf.insert(b"a", b"first", OpType::Insert, 0));
+        assert!(leaf.insert(b"z", b"last", OpType::Cache, 0));
+
+        let destination_size = page_size * 2;
+        let layout = std::alloc::Layout::from_size_align(
+            destination_size,
+            std::mem::align_of::<LeafNodeHeader>(),
+        )
+        .unwrap();
+        // Mini-page storage comes from an allocator and need not be zeroed.
+        // Only initialized metadata and record ranges may subsequently be read.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let mut destination = TestBasePage(ptr.cast(), destination_size);
+        leaf.copy_initialize_to(destination.0, destination_size, false, 7);
+        let upgraded = destination.page();
+        assert_eq!(std::mem::size_of_val(upgraded), destination_size);
+        assert_eq!(upgraded.get_clean_snapshot_version(), 7);
+        assert_eq!(upgraded.next_level.as_offset(), 128);
+        let gap_start = std::mem::size_of::<LeafNodeHeader>()
+            + upgraded.meta.meta_count_with_fence() as usize * crate::nodes::KV_META_SIZE;
+        let gap_end = gap_start + upgraded.meta.remaining_size as usize;
+        // Read every serialized byte under Miri, including genuinely
+        // uninitialized allocator capacity that snapshot_bytes must clear.
+        let snapshot = upgraded.snapshot_bytes().to_vec();
+        assert_eq!(snapshot.len(), destination_size);
+        assert!(snapshot[gap_start..gap_end].iter().all(|byte| *byte == 0));
+        let mut out = [0; 5];
+        assert_eq!(
+            upgraded.read_by_key(b"a", &mut out),
+            LeafReadResult::Found(5)
+        );
+        assert_eq!(&out, b"first");
+        assert_eq!(
+            upgraded.read_by_key(b"z", &mut out),
+            LeafReadResult::Found(4)
+        );
+        assert_eq!(&out[..4], b"last");
+        upgraded.consolidate(8);
+        assert_eq!(upgraded.meta.meta_count_without_fence(), 2);
+        assert_eq!(
+            upgraded.read_by_key(b"z", &mut out),
+            LeafReadResult::Found(4)
+        );
+        assert_eq!(&out[..4], b"last");
+    }
+}
+
+fn check_leaf_allocations_through_tree(cache_only: bool, record_count: u64) {
+    use crate::{BfTree, Config as TreeConfig, LeafInsertResult, ScanReturnField};
+
+    let mut config = TreeConfig::default();
+    config
+        .cache_only(cache_only)
+        .cb_size_byte(128 * 1024)
+        .cb_max_record_size(256)
+        .cb_max_key_len(8)
+        .read_promotion_rate(100)
+        .scan_promotion_rate(100)
+        .read_record_cache(false)
+        .write_load_full_page(true);
+    let tree = BfTree::with_config(config, None).unwrap();
+    let mut model = BTreeMap::new();
+    for id in 0..record_count {
+        let key = (id * 2).to_be_bytes().to_vec();
+        let value = vec![id as u8; 128];
+        assert_eq!(tree.insert(&key, &value), LeafInsertResult::Success);
+        model.insert(key, value);
+    }
+    if record_count == 96 {
+        // More than a page of records exercises allocator-backed splitting
+        // and inner-node traversal in addition to the root-leaf lifecycle.
+        assert_eq!(
+            tree.root_page_id
+                .load(crate::sync::atomic::Ordering::Relaxed)
+                & BfTree::ROOT_IS_LEAF_MASK,
+            0
+        );
+    }
+    let mut out = [0; 264];
+    for (key, value) in &model {
+        assert_eq!(tree.read(key, &mut out), LeafReadResult::Found(128));
+        assert_eq!(&out[..128], value);
+    }
+    for id in 0..record_count {
+        let absent_key = (id * 2 + 1).to_be_bytes();
+        assert_eq!(tree.read(&absent_key, &mut out), LeafReadResult::NotFound);
+        let key = (id * 2).to_be_bytes();
+        if id % 7 == 0 {
+            tree.delete(&key);
+            model.remove(key.as_slice());
+            assert!(matches!(
+                tree.read(&key, &mut out),
+                LeafReadResult::NotFound | LeafReadResult::Deleted
+            ));
+        } else if id % 3 == 0 {
+            let value = vec![255 - id as u8; 192];
+            assert_eq!(tree.insert(&key, &value), LeafInsertResult::Success);
+            assert_eq!(tree.read(&key, &mut out), LeafReadResult::Found(192));
+            assert_eq!(&out[..192], value);
+            model.insert(key.to_vec(), value);
+        }
+    }
+    {
+        let start = 0u64.to_be_bytes();
+        let mut scan = tree
+            .scan_with_count(
+                &start,
+                record_count as usize + 1,
+                ScanReturnField::KeyAndValue,
+            )
+            .unwrap();
+        for (key, value) in &model {
+            assert_eq!(scan.next(&mut out), Some((key.len(), value.len())));
+            assert_eq!(&out[..key.len()], key);
+            assert_eq!(&out[key.len()..key.len() + value.len()], value);
+        }
+        assert_eq!(scan.next(&mut out), None);
+    }
+    // Drop also traverses the real circular buffer's allocation metadata.
+    drop(tree);
+}
+
+#[test]
+fn leaf_allocation_cache_only_tree_lifecycle() {
+    check_leaf_allocations_through_tree(true, 96);
+}
+
+#[test]
+fn leaf_allocation_memory_backed_tree_lifecycle() {
+    check_leaf_allocations_through_tree(false, 96);
+}
+
+#[test]
+fn leaf_allocation_single_leaf_cache_only_lifecycle() {
+    check_leaf_allocations_through_tree(true, 16);
+}
+
+#[test]
+fn leaf_allocation_single_leaf_memory_backed_lifecycle() {
+    check_leaf_allocations_through_tree(false, 16);
+}
+
+#[test]
+fn leaf_circular_buffer_growth_preserves_allocation_metadata() {
+    use crate::circular_buffer::CircularBuffer;
+
+    let sizes = crate::BfTree::create_mem_page_size_classes(2, 256, 4096, 16, true);
+    let buffer = CircularBuffer::new(16 * 1024, 0.1, 2, 256, 4096, 16, None, true);
+    let mut page_size = sizes[0];
+    let mut allocation = buffer.alloc(page_size).unwrap();
+    LeafNode::initialize_mini_page(
+        &allocation,
+        page_size,
+        MiniPageNextLevel::new_null(),
+        true,
+        0,
+    );
+    {
+        let leaf = unsafe { &mut *LeafNode::from_raw_parts(allocation.as_ptr().cast(), page_size) };
+        assert!(leaf.insert(b"key", b"value", OpType::Insert, 0));
+    }
+    for (version, &next_size) in sizes[1..].iter().enumerate() {
+        let next = buffer.alloc(next_size).unwrap();
+        {
+            let leaf = unsafe { &*LeafNode::from_raw_parts(allocation.as_ptr().cast(), page_size) };
+            leaf.copy_initialize_to(next.as_ptr().cast(), next_size, false, version as u64);
+        }
+        // Keep the guard's original allocation pointer. A leaf reference only
+        // covers page bytes and cannot be used to reach preceding AllocMeta.
+        let old_ptr = allocation.as_ptr();
+        drop(allocation);
+        let handle = unsafe { buffer.acquire_exclusive_dealloc_handle(old_ptr).unwrap() };
+        buffer.dealloc(handle);
+        allocation = next;
+        page_size = next_size;
+
+        let leaf = unsafe { &mut *LeafNode::from_raw_parts(allocation.as_ptr().cast(), page_size) };
+        assert_eq!(std::mem::size_of_val(leaf), page_size);
+        assert_eq!(leaf.get_clean_snapshot_version(), version as u64);
+        let mut out = [0; 5];
+        assert_eq!(leaf.read_by_key(b"key", &mut out), LeafReadResult::Found(5));
+        assert_eq!(&out, b"value");
+        leaf.consolidate(version as u64);
+        assert_eq!(leaf.snapshot_bytes().to_vec().len(), page_size);
+    }
+    let ptr = allocation.as_ptr();
+    drop(allocation);
+    let handle = unsafe { buffer.acquire_exclusive_dealloc_handle(ptr).unwrap() };
+    buffer.dealloc(handle);
+    // CircularBuffer::drop verifies every real allocation is tombstoned or
+    // freelisted, and Miri validates the payload/metadata borrow separation.
 }
 
 #[test]

@@ -11,7 +11,7 @@ use std::{
 use crate::{
     error::ConfigError,
     nodes::{
-        leaf_node::LeafKVMeta, LeafNode, CACHE_LINE_SIZE, DISK_PAGE_SIZE, MAX_KEY_LEN,
+        leaf_node::LeafKVMeta, LeafNodeHeader, CACHE_LINE_SIZE, DISK_PAGE_SIZE, MAX_KEY_LEN,
         MAX_LEAF_PAGE_SIZE,
     },
     snapshot::BfTreeMeta,
@@ -496,7 +496,7 @@ impl Config {
         // Bound additions before evaluating the split/merge inequalities. Public
         // setters accept usize, so invalid configurations must not overflow even
         // when validation only needs to report an error.
-        let leaf_meta_size = std::mem::size_of::<LeafNode>();
+        let leaf_meta_size = std::mem::size_of::<LeafNodeHeader>();
         let kv_meta_size = std::mem::size_of::<LeafKVMeta>();
         let max_record_size_with_meta = self
             .cb_max_record_size

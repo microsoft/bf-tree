@@ -20,7 +20,7 @@ use crate::{
     mini_page_op::LeafOperations,
     nodes::{
         leaf_node::{MiniPageNextLevel, OpType},
-        LeafNode, INVALID_DISK_OFFSET,
+        LeafNode, LeafNodeHeader, INVALID_DISK_OFFSET,
     },
     nodes::{InnerNode, InnerNodeBuilder, PageID, DISK_PAGE_SIZE, INNER_NODE_SIZE},
     storage::{make_vfs, LeafStorage, PageLocation, PageTable},
@@ -483,8 +483,8 @@ impl CPRSnapShotMgr {
     }
 
     /// Snapshot a page to the current snapshot file and return its offset in the file.
-    /// The invoker needs to guarantee that the page to be copied is xlocked
-    /// throughout the lifetime of this function.
+    /// The image must remain stable throughout this call: either keep the source
+    /// page xlocked or pass an independent copy made while it was xlocked.
     /// Also the invoker needs to guarantee proper alignment of ptr which could be required
     /// by the underlying vfs. (E.g., io_uring_vfs requires 512B alignment)
     pub fn snapshot_page(&self, ptr: &[u8], size: usize) -> usize {
@@ -550,6 +550,12 @@ impl CPRSnapShotMgr {
         mini_size_mapping: &mut Vec<(PageID, usize)>,
         base_mapping: &mut Vec<(PageID, usize)>,
     ) -> usize {
+        // Reuse aligned images across the sweep. Hold each leaf's write lock
+        // only while copying its image (and its base page, if any), not during
+        // synchronous snapshot I/O. Alignment is needed by direct-I/O backends.
+        let mut mini_image = SectorAlignedVector::new_zeroed(tree.config.leaf_page_size);
+        let mut base_image = SectorAlignedVector::new_zeroed(tree.config.leaf_page_size);
+
         // There is no page table for inner nodes including the root, and each inner node's information is only
         // saved in the tree structure itself. As a result, we need to traverse the tree to find all inner nodes.
         // However, without blocking inner node splitting, the tree structure could change concurrently while we
@@ -570,47 +576,51 @@ impl CPRSnapShotMgr {
                     let rid = root_id.0;
                     if root_id.1 {
                         // Leaf
-                        let mut leaf = tree.mapping_table().get(&rid);
-                        let page_loc = leaf.get_page_location();
+                        // Reads can atomically mark record reference bits. Exclude
+                        // them while copying the complete page as ordinary bytes.
+                        let mut leaf = tree.mapping_table().get_mut(&rid);
+                        let page_loc = leaf.get_page_location().clone();
+                        let mut mini_size = None;
+                        let mut base_size = None;
 
                         match page_loc {
                             PageLocation::Base(offset) => {
-                                let base_ref = leaf.load_base_page(*offset);
+                                let base_ref = leaf.load_base_page(offset);
                                 if base_ref.get_clean_snapshot_version() < version {
-                                    let base_ptr = unsafe {
-                                        std::slice::from_raw_parts(
-                                            base_ref as *const LeafNode as *const u8,
-                                            base_ref.meta.node_size as usize,
-                                        )
-                                    };
-                                    let offset = self
-                                        .snapshot_page(base_ptr, base_ref.meta.node_size as usize);
-                                    base_mapping.push((rid, offset));
-                                    self.snapshot_root_page(rid);
+                                    let base_ptr = leaf.snapshot_base_page_bytes(offset);
+                                    let size = base_ptr.len();
+                                    base_image[..size].copy_from_slice(base_ptr);
+                                    base_size = Some(size);
                                 }
                             }
                             PageLocation::Mini(ptr) => {
                                 // Root page is a mini page only in cache-only mode.
                                 assert!(tree.cache_only);
 
-                                let mini_ref = leaf.load_cache_page(*ptr);
+                                let mini_ref = unsafe { leaf.load_cache_page_mut(ptr) };
                                 if mini_ref.get_clean_snapshot_version() < version {
-                                    let mini_ptr = unsafe {
-                                        std::slice::from_raw_parts(
-                                            mini_ref as *const LeafNode as *const u8,
-                                            mini_ref.meta.node_size as usize,
-                                        )
-                                    };
-                                    let offset = self
-                                        .snapshot_page(mini_ptr, mini_ref.meta.node_size as usize);
-                                    mini_mapping.push((rid, offset));
-                                    mini_size_mapping.push((rid, mini_ref.meta.node_size as usize));
-                                    self.snapshot_root_page(rid);
+                                    let mini_ptr = mini_ref.snapshot_bytes();
+                                    let size = mini_ptr.len();
+                                    mini_image[..size].copy_from_slice(mini_ptr);
+                                    mini_size = Some(size);
                                 }
                             }
                             _ => {
                                 panic!("Unexpected page location for root page: {:?}", page_loc);
                             }
+                        }
+                        drop(leaf);
+
+                        if let Some(size) = mini_size {
+                            let offset = self.snapshot_page(&mini_image[..size], size);
+                            mini_mapping.push((rid, offset));
+                            mini_size_mapping.push((rid, size));
+                            self.snapshot_root_page(rid);
+                        }
+                        if let Some(size) = base_size {
+                            let offset = self.snapshot_page(&base_image[..size], size);
+                            base_mapping.push((rid, offset));
+                            self.snapshot_root_page(rid);
                         }
 
                         break;
@@ -683,73 +693,57 @@ impl CPRSnapShotMgr {
         for (_, pid) in page_table_iter {
             assert!(pid.is_id());
 
-            // A reader lock is enough
-            let mut leaf = tree.mapping_table().get(&pid);
+            // The page image includes atomic reference bits, so copying it as
+            // bytes needs to exclude readers as well as writers.
+            let mut leaf = tree.mapping_table().get_mut(&pid);
             let page_loc = leaf.get_page_location().clone();
             enumerate_leaf_count += 1;
+            let mut mini_size = None;
+            let mut base_size = None;
 
             match page_loc {
                 PageLocation::Base(offset) => {
                     let base_ref = leaf.load_base_page(offset);
                     if base_ref.get_clean_snapshot_version() < version {
-                        let base_ptr = unsafe {
-                            std::slice::from_raw_parts(
-                                base_ref as *const LeafNode as *const u8,
-                                base_ref.meta.node_size as usize,
-                            )
-                        };
-                        let new_offset =
-                            self.snapshot_page(base_ptr, base_ref.meta.node_size as usize);
-                        base_mapping.push((pid, new_offset));
+                        let base_ptr = leaf.snapshot_base_page_bytes(offset);
+                        let size = base_ptr.len();
+                        base_image[..size].copy_from_slice(base_ptr);
+                        base_size = Some(size);
                     }
                 }
                 PageLocation::Full(ptr) => {
                     // We snapshot Full page as a disk page to reduce some complexity as they are equivalent.
-                    let full_ref = leaf.load_cache_page(ptr);
-                    if full_ref.get_clean_snapshot_version() < version {
+                    if leaf.load_cache_page(ptr).get_clean_snapshot_version() < version {
                         // Temporarily change the next level to null for snapshotting.
                         // and reverse afterwards.
-                        let next_level = full_ref.next_level;
-                        let full_page = unsafe { &mut *ptr };
+                        let full_page = unsafe { leaf.load_cache_page_mut(ptr) };
+                        let next_level = full_page.next_level;
                         full_page.next_level = MiniPageNextLevel::new_null();
-                        let full_ptr = unsafe {
-                            std::slice::from_raw_parts(
-                                full_ref as *const LeafNode as *const u8,
-                                full_ref.meta.node_size as usize,
-                            )
-                        };
-                        let offset = self.snapshot_page(full_ptr, full_ref.meta.node_size as usize);
+                        let full_ptr = full_page.snapshot_bytes();
+                        let size = full_ptr.len();
+                        base_image[..size].copy_from_slice(full_ptr);
                         full_page.next_level = next_level;
-                        base_mapping.push((pid, offset));
+                        base_size = Some(size);
                     }
                 }
                 PageLocation::Mini(ptr) => {
-                    let mini_ref = leaf.load_cache_page(ptr);
+                    let mini_ref = unsafe { leaf.load_cache_page_mut(ptr) };
                     if mini_ref.get_clean_snapshot_version() < version {
-                        let mini_ptr = unsafe {
-                            std::slice::from_raw_parts(
-                                mini_ref as *const LeafNode as *const u8,
-                                mini_ref.meta.node_size as usize,
-                            )
-                        };
-                        let offset = self.snapshot_page(mini_ptr, mini_ref.meta.node_size as usize);
-                        mini_mapping.push((pid, offset));
-                        mini_size_mapping.push((pid, mini_ref.meta.node_size as usize));
+                        let next_level = mini_ref.next_level;
+                        let mini_ptr = mini_ref.snapshot_bytes();
+                        let size = mini_ptr.len();
+                        mini_image[..size].copy_from_slice(mini_ptr);
+                        mini_size = Some(size);
 
                         if !tree.cache_only {
                             // In disk-mode, the base page of mini-page is part of the snapshot as well.
-                            let base_ref = leaf.load_base_page(mini_ref.next_level.as_offset());
+                            let base_ref = leaf.load_base_page(next_level.as_offset());
                             assert!(base_ref.get_clean_snapshot_version() < version); // disk page's version should never be greater than its mini-page's.
 
-                            let base_ptr = unsafe {
-                                std::slice::from_raw_parts(
-                                    base_ref as *const LeafNode as *const u8,
-                                    base_ref.meta.node_size as usize,
-                                )
-                            };
-                            let offset =
-                                self.snapshot_page(base_ptr, base_ref.meta.node_size as usize);
-                            base_mapping.push((pid, offset));
+                            let base_ptr = leaf.snapshot_base_page_bytes(next_level.as_offset());
+                            let size = base_ptr.len();
+                            base_image[..size].copy_from_slice(base_ptr);
+                            base_size = Some(size);
                         }
                     }
                 }
@@ -771,6 +765,20 @@ impl CPRSnapShotMgr {
                         continue;
                     }
                 }
+            }
+            drop(leaf);
+
+            // Keep Mini+Base sampling atomic with respect to page changes.
+            // Writers may now take their own snapshots; finalize already gives
+            // those thread-local mappings priority over the sweep's copies.
+            if let Some(size) = mini_size {
+                let offset = self.snapshot_page(&mini_image[..size], size);
+                mini_mapping.push((pid, offset));
+                mini_size_mapping.push((pid, size));
+            }
+            if let Some(size) = base_size {
+                let offset = self.snapshot_page(&base_image[..size], size);
+                base_mapping.push((pid, offset));
             }
         }
 
@@ -1403,6 +1411,11 @@ impl CPRSnapShotMgr {
 
             for (pid, offset) in &mini_mapping {
                 let mini_size = *mini_size_mapping_unique.get(pid).unwrap();
+                validate_mini_page_allocation_size(
+                    mini_size,
+                    size_classes[0],
+                    config.leaf_page_size,
+                )?;
 
                 // Allocate space in memory for new mini-page
                 let mini_page_guard = match storage.alloc_mini_page(mini_size) {
@@ -1425,8 +1438,17 @@ impl CPRSnapShotMgr {
                 }
 
                 // Connect the new mini-page to the corresponding base page in page table
-                let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
-                let mini_page = unsafe { &mut *new_mini_ptr };
+                let new_mini_ptr = mini_page_guard.as_ptr().cast::<LeafNodeHeader>();
+                // A snapshot's header cannot enlarge the bounded reference
+                // beyond the allocation obtained from its size mapping.
+                let stored_size =
+                    unsafe { std::ptr::addr_of!((*new_mini_ptr).meta.node_size).read() as usize };
+                if stored_size != mini_size {
+                    return Err(ConfigError::SnapshotFileInvalid(
+                        "Mini-page header size does not match its allocation".to_string(),
+                    ));
+                }
+                let mini_page = unsafe { &mut *LeafNode::from_raw_parts(new_mini_ptr, mini_size) };
 
                 let mut base_page = storage.page_table.get_mut(pid);
                 let page_loc = base_page.get_page_location().clone();
@@ -1525,6 +1547,11 @@ impl CPRSnapShotMgr {
                 if *offset == NULL_PAGE_LOCATION_OFFSET {
                     continue;
                 }
+                validate_mini_page_allocation_size(
+                    mini_size,
+                    size_classes[0],
+                    config.leaf_page_size,
+                )?;
 
                 // Allocate memory for a new mini-page in storage
                 let mini_page_guard = match storage.alloc_mini_page(mini_size) {
@@ -1547,8 +1574,15 @@ impl CPRSnapShotMgr {
                 }
 
                 // Set its next level to oblivion
-                let mini_page_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
-                let mini_page = unsafe { &mut *mini_page_ptr };
+                let mini_page_ptr = mini_page_guard.as_ptr().cast::<LeafNodeHeader>();
+                let stored_size =
+                    unsafe { std::ptr::addr_of!((*mini_page_ptr).meta.node_size).read() as usize };
+                if stored_size != mini_size {
+                    return Err(ConfigError::SnapshotFileInvalid(
+                        "Mini-page header size does not match its allocation".to_string(),
+                    ));
+                }
+                let mini_page = unsafe { &mut *LeafNode::from_raw_parts(mini_page_ptr, mini_size) };
                 mini_page.next_level = MiniPageNextLevel::new_null();
 
                 // Update the corresponding page location
@@ -1582,6 +1616,25 @@ impl CPRSnapShotMgr {
             Ok(tree)
         }
     }
+}
+
+fn validate_mini_page_allocation_size(
+    size: usize,
+    min_size: usize,
+    max_size: usize,
+) -> Result<(), ConfigError> {
+    // The allocator rejects requests below its smallest size class. Validate
+    // that bound here so a corrupt snapshot produces an error, not an assertion.
+    if size < min_size
+        || size > max_size
+        || !size.is_multiple_of(std::mem::align_of::<LeafNodeHeader>())
+    {
+        return Err(ConfigError::SnapshotFileInvalid(
+            "Mini-page allocation size is outside the configured page bounds or misaligned"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Own reconstructed nodes until BfTree takes over. A partially restored tree
@@ -2145,6 +2198,92 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn sweep_writes_independent_images_after_releasing_leaf_locks() {
+        use crate::fs::VfsImpl;
+        use std::sync::{atomic::AtomicUsize, Weak};
+
+        struct CheckingVfs {
+            tree: Weak<BfTree>,
+            writes: AtomicUsize,
+            next_offset: AtomicUsize,
+        }
+
+        impl VfsImpl for CheckingVfs {
+            fn read(&self, _offset: usize, _buf: &mut [u8]) {
+                unreachable!("the sweep only writes snapshot images");
+            }
+
+            fn write(&self, _offset: usize, buf: &[u8]) {
+                let tree = self.tree.upgrade().unwrap();
+                for (lock, _) in tree.mapping_table().iter() {
+                    assert!(
+                        lock.try_write().is_ok(),
+                        "snapshot I/O must not retain a leaf lock"
+                    );
+                }
+                assert!((buf.as_ptr() as usize).is_multiple_of(super::SECTOR_SIZE));
+
+                // A hit may set the source page's atomic reference bit. It must
+                // neither block on the sweep nor modify the independent image.
+                let image = buf.to_vec();
+                let mut value = [0; 5];
+                assert_eq!(tree.read(b"key", &mut value), LeafReadResult::Found(5));
+                assert_eq!(&value, b"value");
+                assert_eq!(buf, image);
+                self.writes.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn alloc_offset(&self, size: usize) -> usize {
+                self.next_offset
+                    .fetch_add(super::align_to_sector_size(size), Ordering::Relaxed)
+            }
+
+            fn dealloc_offset(&self, _offset: usize) {
+                unreachable!("the sweep does not free snapshot images");
+            }
+
+            fn flush(&self) {}
+
+            fn open(_path: impl AsRef<std::path::Path>) -> Self {
+                unreachable!("this test installs its VFS directly");
+            }
+        }
+
+        for backend in [":cache:", ":memory:"] {
+            let mut config = Config::new(backend, 64 * 1024);
+            config
+                .use_snapshot(true)
+                .read_promotion_rate(0)
+                .scan_promotion_rate(0);
+            let tree = Arc::new(BfTree::with_config(config, None).unwrap());
+            tree.insert(b"key", b"value");
+            let manager = tree.snapshot_mgr.as_ref().unwrap();
+            let vfs = Arc::new(CheckingVfs {
+                tree: Arc::downgrade(&tree),
+                writes: AtomicUsize::new(0),
+                next_offset: AtomicUsize::new(super::SECTOR_SIZE),
+            });
+            *manager.vfs.write().unwrap() = vfs.clone();
+            // Enter Sweep with all existing pages in the preceding version.
+            manager.advance_global_state();
+            manager.advance_global_state();
+            manager.advance_global_state();
+            let count = manager.sweep(
+                &tree,
+                manager.get_global_version(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            assert_eq!(count, 1);
+            // Both the paused root pass and the ordinary leaf sweep write it.
+            assert_eq!(vfs.writes.load(Ordering::Relaxed), 2);
+            assert!(!manager.pause_snapshot.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
     fn recovery_with_insufficient_cache_releases_partial_allocations() {
         let temp_dir = tempfile::tempdir().unwrap();
         let snapshot_path = temp_dir.path().join("tree.snapshot");
@@ -2275,6 +2414,98 @@ mod tests {
             decoded.to_bytes().as_slice(),
             &original[..std::mem::size_of::<BfTreeMeta>()]
         );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_fragmented_small_leaf_pages() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        for (backend, name) in [(":cache:", "cache"), (":memory:", "memory")] {
+            let snapshot_path = temp_dir.path().join(format!("{name}.snapshot"));
+            let mut config = Config::new(backend, 64 * 1024);
+            config.use_snapshot(true);
+            let tree = BfTree::with_config(config, None).unwrap();
+            let mut value = [0u8; 96];
+            for index in 0..12u64 {
+                tree.insert(&index.to_be_bytes(), &[index as u8; 32]);
+                assert_eq!(
+                    tree.read(&index.to_be_bytes(), &mut value),
+                    LeafReadResult::Found(32),
+                );
+            }
+            // Growth leaves obsolete payload behind, and deletion changes the
+            // live metadata count. Both must yield an initialized page image.
+            for index in 0..12u64 {
+                if index.is_multiple_of(3) {
+                    tree.delete(&index.to_be_bytes());
+                } else {
+                    tree.insert(&index.to_be_bytes(), &[index as u8; 96]);
+                }
+            }
+            tree.cpr_snapshot(&snapshot_path);
+            drop(tree);
+            let recovered =
+                BfTree::new_from_cpr_snapshot(&snapshot_path, false, None, None, None).unwrap();
+            for index in 0..12u64 {
+                let result = recovered.read(&index.to_be_bytes(), &mut value);
+                if index.is_multiple_of(3) {
+                    assert!(matches!(
+                        result,
+                        LeafReadResult::NotFound | LeafReadResult::Deleted
+                    ));
+                } else {
+                    assert_eq!(result, LeafReadResult::Found(96));
+                    assert_eq!(value, [index as u8; 96]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_mini_page_sizes_before_borrowing_payload() {
+        use crate::nodes::{LeafNodeHeader, PageID};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshot_path = temp_dir.path().join("tree.snapshot");
+        let mut config = Config::new(":cache:", 64 * 1024);
+        // This produces a 128-byte minimum allocation class, so even an
+        // otherwise aligned 64-byte mapping must be rejected before allocation.
+        config.use_snapshot(true).cb_min_record_size(64);
+        let tree = BfTree::with_config(config, None).unwrap();
+        tree.insert(b"key", b"value");
+        tree.cpr_snapshot(&snapshot_path);
+        drop(tree);
+        let original = std::fs::read(&snapshot_path).unwrap();
+        let metadata = BfTreeMeta::from_bytes(&original).unwrap();
+        let mapping_value_offset = std::mem::offset_of!((PageID, usize), 1);
+        let page_offset = usize::from_ne_bytes(
+            original[metadata.mini_offset + mapping_value_offset
+                ..metadata.mini_offset + mapping_value_offset + std::mem::size_of::<usize>()]
+                .try_into()
+                .unwrap(),
+        );
+        let header_size_offset = page_offset + std::mem::offset_of!(LeafNodeHeader, meta.node_size);
+        let allocation_size_offset = metadata.mini_size_offset + mapping_value_offset;
+
+        for stored_size in [0, 31, metadata.leaf_page_size as u16 + 8] {
+            let mut bytes = original.clone();
+            bytes[header_size_offset..header_size_offset + 2]
+                .copy_from_slice(&stored_size.to_ne_bytes());
+            std::fs::write(&snapshot_path, bytes).unwrap();
+            assert!(matches!(
+                BfTree::new_from_cpr_snapshot(&snapshot_path, false, None, None, None),
+                Err(ConfigError::SnapshotFileInvalid(_)),
+            ));
+        }
+        for allocation_size in [0, 31, 32, 33, 40, 64, metadata.leaf_page_size + 8] {
+            let mut bytes = original.clone();
+            bytes[allocation_size_offset..allocation_size_offset + std::mem::size_of::<usize>()]
+                .copy_from_slice(&allocation_size.to_ne_bytes());
+            std::fs::write(&snapshot_path, bytes).unwrap();
+            assert!(matches!(
+                BfTree::new_from_cpr_snapshot(&snapshot_path, false, None, None, None),
+                Err(ConfigError::SnapshotFileInvalid(_)),
+            ));
+        }
     }
 
     #[test]

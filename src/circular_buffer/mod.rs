@@ -238,10 +238,6 @@ impl AllocMeta {
         Self { size, states }
     }
 
-    fn data_ptr(&self) -> *mut u8 {
-        unsafe { (self as *const Self as *mut u8).add(std::mem::size_of::<Self>()) }
-    }
-
     fn state(&self) -> MetaState {
         self.states.state()
     }
@@ -272,6 +268,12 @@ impl CircularBufferPtr<'_> {
     /// Get the actual pointer to the allocated memory.
     pub fn as_ptr(&self) -> *mut u8 {
         self.ptr
+    }
+
+    /// Capacity of this allocation, including any allocator alignment slack.
+    /// The allocation guard keeps its metadata alive until the guard is dropped.
+    pub fn allocated_size(&self) -> usize {
+        CircularBuffer::get_meta_from_data_ptr(self.ptr).size as usize
     }
 }
 
@@ -930,7 +932,9 @@ impl CircularBuffer {
         };
 
         let meta = self.get_meta(start_addr);
-        let data_ptr = meta.data_ptr();
+        // Preserve the backing allocation's provenance. A pointer derived from
+        // `&AllocMeta` only carries that header's borrow, not the following page.
+        let data_ptr = self.logical_to_physical(start_addr + CB_ALLOC_META_SIZE);
 
         let backoff = Backoff::new();
 

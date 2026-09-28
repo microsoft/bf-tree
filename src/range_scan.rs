@@ -417,9 +417,9 @@ fn promote_or_merge_mini_page<'a>(
         }
         PageLocation::Mini(ptr) => {
             counter!(ScanMergeMiniPage);
-            let mini_page = leaf.load_cache_page_mut(*ptr);
+            let base_offset = leaf.load_cache_page(*ptr).next_level;
             // acquire the handle so that the eviction process with not contend with us.
-            let h = tree.storage.begin_dealloc_mini_page(mini_page)?;
+            let h = tree.storage.begin_dealloc_mini_page(*ptr)?;
             let merge_result = leaf.try_merge_mini_page(&h, parent, &tree.storage)?;
 
             match merge_result {
@@ -430,7 +430,6 @@ fn promote_or_merge_mini_page<'a>(
                     //      this is done with probability to avoid polluting the cache.
                     if tree.should_promote_scan_page() {
                         // upgrade to full page
-                        let base_offset = mini_page.next_level;
                         leaf.change_to_base_loc();
                         tree.storage.finish_dealloc_mini_page(h);
 
