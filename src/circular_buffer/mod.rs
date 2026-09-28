@@ -238,10 +238,6 @@ impl AllocMeta {
         Self { size, states }
     }
 
-    fn data_ptr(&self) -> *mut u8 {
-        unsafe { (self as *const Self as *mut u8).add(std::mem::size_of::<Self>()) }
-    }
-
     fn state(&self) -> MetaState {
         self.states.state()
     }
@@ -272,6 +268,12 @@ impl CircularBufferPtr<'_> {
     /// Get the actual pointer to the allocated memory.
     pub fn as_ptr(&self) -> *mut u8 {
         self.ptr
+    }
+
+    /// Capacity of this allocation, including any allocator alignment slack.
+    /// The allocation guard keeps its metadata alive until the guard is dropped.
+    pub fn allocated_size(&self) -> usize {
+        CircularBuffer::get_meta_from_data_ptr(self.ptr).size as usize
     }
 }
 
@@ -363,6 +365,9 @@ impl States {
 #[derive(Debug)]
 pub struct CircularBuffer {
     states: UnsafeCell<States>,
+    // Readers use this approximate tail without taking the state mutex. Keep
+    // it outside States so those reads never alias the writer's &mut States.
+    fuzzy_tail_addr: AtomicUsize,
     capacity: usize,
     data_ptr: *mut u8,
     lock: Mutex<()>,
@@ -425,11 +430,15 @@ impl CircularBuffer {
             }
             None => unsafe { std::alloc::alloc(layout) },
         };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
 
         let copy_on_access_threshold = (capacity as f64 * (1.0 - copy_on_access_percent)) as usize;
 
         Self {
             states: UnsafeCell::new(States::new()),
+            fuzzy_tail_addr: AtomicUsize::new(0),
             capacity,
             free_list: FreeList::new(
                 min_record_size,
@@ -586,6 +595,8 @@ impl CircularBuffer {
                 physical_addr.cast::<AllocMeta>().write(meta);
             }
             states.tail_addr += physical_remaining;
+            self.fuzzy_tail_addr
+                .store(states.tail_addr, Ordering::Relaxed);
             std::mem::drop(lock_guard);
             return self.alloc(size);
         }
@@ -598,6 +609,8 @@ impl CircularBuffer {
         }
         let return_addr = states.tail_addr + std::mem::size_of::<AllocMeta>();
         states.tail_addr += required;
+        self.fuzzy_tail_addr
+            .store(states.tail_addr, Ordering::Relaxed);
 
         let ptr = CircularBufferPtr::new(self.logical_to_physical(return_addr));
         Ok(ptr)
@@ -636,7 +649,9 @@ impl CircularBuffer {
     }
 
     fn get_fuzzy_tail_addr(&self) -> usize {
-        unsafe { &*self.states.get() }.tail_addr()
+        // This is only a distance heuristic; it does not publish allocation
+        // contents. Allocation metadata provides its own synchronization.
+        self.fuzzy_tail_addr.load(Ordering::Relaxed)
     }
 
     /// This is used to sanity check that
@@ -917,7 +932,9 @@ impl CircularBuffer {
         };
 
         let meta = self.get_meta(start_addr);
-        let data_ptr = meta.data_ptr();
+        // Preserve the backing allocation's provenance. A pointer derived from
+        // `&AllocMeta` only carries that header's borrow, not the following page.
+        let data_ptr = self.logical_to_physical(start_addr + CB_ALLOC_META_SIZE);
 
         let backoff = Backoff::new();
 
@@ -1005,6 +1022,61 @@ mod tests {
     use super::*;
     use crate::{BfTree, Config};
     use rstest::rstest;
+
+    #[test]
+    fn fuzzy_tail_tracks_allocations_across_wraparound() {
+        let test = || {
+            let buffer = CircularBuffer::new(8192, 0.1, 64, 1952, 4096, 32, None, false);
+            let allocation_size = 2048 + CB_ALLOC_META_SIZE;
+            for expected_tail in (1..=3).map(|count| count * allocation_size) {
+                drop(buffer.alloc(2048).unwrap());
+                assert_eq!(buffer.get_fuzzy_tail_addr(), expected_tail);
+            }
+            buffer.evict_n(usize::MAX, Ok).unwrap();
+            drop(buffer.alloc(2048).unwrap());
+            assert_eq!(buffer.get_fuzzy_tail_addr(), 8192 + allocation_size);
+            buffer.evict_n(usize::MAX, Ok).unwrap();
+
+            let (_lock, states) = buffer.lock_states();
+            // Keep the exclusive state reference live across the heuristic
+            // read. The getter must only access its separate atomic field.
+            assert_eq!(buffer.get_fuzzy_tail_addr(), states.tail_addr());
+            assert_eq!(states.tail_addr(), 8192 + allocation_size);
+        };
+        #[cfg(feature = "shuttle")]
+        shuttle::check_random(test, 1);
+        #[cfg(not(feature = "shuttle"))]
+        test();
+    }
+
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn fuzzy_tail_can_be_read_during_allocation() {
+        let buffer = CircularBuffer::new(8192, 0.1, 64, 1952, 4096, 32, None, false);
+        let tail = &buffer.fuzzy_tail_addr;
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                let mut previous = 0;
+                for _ in 0..128 {
+                    let observed = tail.load(Ordering::Relaxed);
+                    assert!(observed >= previous);
+                    assert_eq!(observed % CB_ALLOC_META_SIZE, 0);
+                    previous = observed;
+                    std::thread::yield_now();
+                }
+            });
+            barrier.wait();
+            for _ in 0..32 {
+                drop(buffer.alloc(2048).unwrap());
+                buffer.evict_n(usize::MAX, Ok).unwrap();
+                std::thread::yield_now();
+            }
+        });
+        let (_lock, states) = buffer.lock_states();
+        assert_eq!(buffer.get_fuzzy_tail_addr(), states.tail_addr());
+    }
 
     #[rstest]
     #[case(64, 1952, 4096)] // 1 leaf page = 1 disk page

@@ -11,7 +11,7 @@ use std::{
 use crate::{
     error::ConfigError,
     nodes::{
-        leaf_node::LeafKVMeta, LeafNode, CACHE_LINE_SIZE, DISK_PAGE_SIZE, MAX_KEY_LEN,
+        leaf_node::LeafKVMeta, LeafNodeHeader, CACHE_LINE_SIZE, DISK_PAGE_SIZE, MAX_KEY_LEN,
         MAX_LEAF_PAGE_SIZE,
     },
     snapshot::BfTreeMeta,
@@ -158,9 +158,10 @@ impl Config {
     pub fn new(file_path: impl AsRef<Path>, circular_buffer_size: usize) -> Self {
         let mut config = Self::default();
         let mut cache_only = false;
-        let storage_backend = if file_path.as_ref().to_str().unwrap().starts_with(":memory:") {
+        let file_path_str = file_path.as_ref().to_str();
+        let storage_backend = if file_path_str.is_some_and(|path| path.starts_with(":memory:")) {
             StorageBackend::Memory
-        } else if file_path.as_ref().to_str().unwrap().starts_with(":cache:") {
+        } else if file_path_str.is_some_and(|path| path.starts_with(":cache:")) {
             cache_only = true;
             StorageBackend::Memory
         } else {
@@ -204,7 +205,7 @@ impl Config {
             cb_max_record_size: config_file.cb_max_record_size,
             leaf_page_size: config_file.leaf_page_size,
             cb_max_key_len: config_file.cb_max_key_len,
-            max_fence_len: config_file.cb_max_key_len * 2,
+            max_fence_len: config_file.cb_max_key_len.saturating_mul(2),
             cb_copy_on_access_ratio: DEFAULT_COPY_ON_ACCESS_RATIO,
             file_path: PathBuf::from(config_file.index_file_path),
             read_record_cache: true,
@@ -332,7 +333,12 @@ impl Config {
     /// to leverage different storage patterns
     /// (WAL is always sequence write and requires durability).
     pub fn enable_write_ahead_log_default(&mut self) -> &mut Self {
-        let wal_config = WalConfig::new(self.file_path.parent().unwrap().join("wal.log"));
+        let wal_path = self
+            .file_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join("wal.log");
+        let wal_config = WalConfig::new(wal_path);
         self.write_ahead_log = Some(Arc::new(wal_config));
         self
     }
@@ -368,7 +374,8 @@ impl Config {
 
     pub fn cb_max_key_len(&mut self, max_key_len: usize) -> &mut Self {
         self.cb_max_key_len = max_key_len;
-        self.max_fence_len = max_key_len * 2;
+        // Preserve invalid inputs for validate() instead of overflowing here.
+        self.max_fence_len = max_key_len.saturating_mul(2);
         self
     }
 
@@ -420,21 +427,21 @@ impl Config {
             return Err(ConfigError::MaximumRecordSize("cb_min_record_size (key + value in bytes) cannot be greater than cb_max_record_size".to_string()));
         }
 
-        if self.max_fence_len == 0 {
+        if self.max_fence_len < 2 {
             return Err(ConfigError::MaxKeyLen(
                 "cb_max_key_len cannot be zero".to_string(),
             ));
         }
 
-        if self.max_fence_len / 2 > self.cb_max_record_size {
+        if self.max_fence_len / 2 >= self.cb_max_record_size {
             return Err(ConfigError::MaxKeyLen(
-                "cb_max_key_len cannot be greater than cb_max_record_size".to_string(),
+                "max_fence_len / 2 must be less than cb_max_record_size".to_string(),
             ));
         }
 
-        if self.leaf_page_size > MAX_LEAF_PAGE_SIZE {
+        if self.leaf_page_size == 0 || self.leaf_page_size > MAX_LEAF_PAGE_SIZE {
             return Err(ConfigError::LeafPageSize(format!(
-                "leaf_page_size cannot be larger than {}",
+                "leaf_page_size must be positive and cannot be larger than {}",
                 MAX_LEAF_PAGE_SIZE
             )));
         }
@@ -446,9 +453,23 @@ impl Config {
             )));
         }
 
-        if !self.cb_size_byte.is_power_of_two() {
+        if !self.cb_size_byte.is_power_of_two()
+            || std::alloc::Layout::from_size_align(self.cb_size_byte, DISK_PAGE_SIZE).is_err()
+        {
             return Err(ConfigError::CircularBufferSize(
-                "cb_size_byte should be a power of two".to_string(),
+                "cb_size_byte must be a power of two supported by the allocator".to_string(),
+            ));
+        }
+
+        if !(0.0..=1.0).contains(&self.cb_copy_on_access_ratio) {
+            return Err(ConfigError::CopyOnAccessRatio(
+                "cb_copy_on_access_ratio must be finite and between 0 and 1".to_string(),
+            ));
+        }
+
+        if self.use_snapshot && self.snapshot_version >= (1u64 << 61) - 1 {
+            return Err(ConfigError::SnapshotVersion(
+                "snapshot_version must leave room for the next 61-bit snapshot version".to_string(),
             ));
         }
 
@@ -472,41 +493,44 @@ impl Config {
         }
 
         // Mini-page merge/split operation safety guarantee checks
-        let max_record_size_with_meta = self.cb_max_record_size + std::mem::size_of::<LeafKVMeta>();
-        let mut max_mini_page_size: usize;
+        // Bound additions before evaluating the split/merge inequalities. Public
+        // setters accept usize, so invalid configurations must not overflow even
+        // when validation only needs to report an error.
+        let leaf_meta_size = std::mem::size_of::<LeafNodeHeader>();
+        let kv_meta_size = std::mem::size_of::<LeafKVMeta>();
+        let max_record_size_with_meta = self
+            .cb_max_record_size
+            .checked_add(kv_meta_size)
+            .filter(|size| *size <= self.leaf_page_size)
+            .ok_or_else(|| {
+                ConfigError::MaximumRecordSize(
+                    "cb_max_record_size and its metadata must fit in a leaf page".to_string(),
+                )
+            })?;
 
         if self.cache_only {
-            if self.leaf_page_size < 2 * max_record_size_with_meta + std::mem::size_of::<LeafNode>()
-            {
+            if self.leaf_page_size < 2 * max_record_size_with_meta + leaf_meta_size {
                 return Err(ConfigError::MaximumRecordSize(format!(
                     "In cache-only mode, given the leaf_page_size the corresponding cb_max_record_size should be <= {}",
-                    (self.leaf_page_size - std::mem::size_of::<LeafNode>()) / 2
-                        - std::mem::size_of::<LeafKVMeta>()
+                    (self.leaf_page_size.saturating_sub(leaf_meta_size) / 2)
+                        .saturating_sub(kv_meta_size)
                 )));
             }
         } else {
-            if max_record_size_with_meta
-                > self.leaf_page_size - self.max_fence_len - 2 * std::mem::size_of::<LeafKVMeta>()
-            {
-                return Err(ConfigError::MaximumRecordSize(format!(
-                    "In non cache-only mode, given the leaf_page_size the corresponding cb_max_record_size should be <= {}",
-                    self.leaf_page_size
-                        - self.max_fence_len
-                        - 2 * std::mem::size_of::<LeafKVMeta>()
-                )));
-            }
-            max_mini_page_size = self.leaf_page_size
-                - max_record_size_with_meta
-                - self.max_fence_len
-                - 2 * std::mem::size_of::<LeafKVMeta>();
-            max_mini_page_size = (max_mini_page_size / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
+            let max_mini_page_size = self
+                .leaf_page_size
+                .checked_sub(max_record_size_with_meta + self.max_fence_len + 2 * kv_meta_size)
+                .ok_or_else(|| {
+                    ConfigError::MaximumRecordSize(
+                        "leaf_page_size must accommodate a record and both fences".to_string(),
+                    )
+                })?;
+            let max_mini_page_size = (max_mini_page_size / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
 
-            if max_mini_page_size < max_record_size_with_meta + std::mem::size_of::<LeafNode>() {
+            if max_mini_page_size < max_record_size_with_meta + leaf_meta_size {
                 return Err(ConfigError::MaximumRecordSize(format!(
                     "In non cache-only mode, given the leaf_page_size the corresponding cb_max_record_size should be <= {}",
-                    max_mini_page_size
-                        - std::mem::size_of::<LeafNode>()
-                        - std::mem::size_of::<LeafKVMeta>()
+                    max_mini_page_size.saturating_sub(leaf_meta_size + kv_meta_size)
                 )));
             }
         }
@@ -556,7 +580,7 @@ impl WalConfig {
         Self {
             file_path: file_path.as_ref().to_path_buf(),
             flush_interval: Duration::from_millis(1),
-            segment_size: 1024 * 1024 * 1024,
+            segment_size: 1024 * 1024,
             storage_backend: StorageBackend::Std,
         }
     }
@@ -632,5 +656,76 @@ mod tests {
         let another_max_record_size = 8192;
         config.cb_max_record_size(another_max_record_size);
         assert_eq!(config.get_cb_max_record_size(), another_max_record_size);
+    }
+
+    #[test]
+    fn default_wal_segment_size_is_one_megabyte() {
+        let config = WalConfig::new("wal.log");
+        assert_eq!(config.segment_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn validation_handles_size_boundaries_without_panicking() {
+        for cache_only in [false, true] {
+            for min in [2, 4, 48, 1544, usize::MAX] {
+                for max in [16, 48, 1544, 1952, 32768, usize::MAX] {
+                    for leaf in [0, 64, 128, 4096, 32768, usize::MAX] {
+                        for fence in [0, 1, 2, 32, 4040, usize::MAX] {
+                            let mut config = Config::default();
+                            config
+                                .cache_only(cache_only)
+                                .cb_min_record_size(min)
+                                .cb_max_record_size(max)
+                                .leaf_page_size(leaf)
+                                .max_fence_len(fence);
+                            if config.validate().is_ok() {
+                                // An accepted configuration must also satisfy
+                                // the constructor's allocation-class invariants.
+                                let classes = crate::BfTree::create_mem_page_size_classes(
+                                    min, max, leaf, fence, cache_only,
+                                );
+                                assert_eq!(classes.last(), Some(&leaf));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut config = Config::default();
+        config.cb_max_key_len(usize::MAX);
+        assert!(matches!(config.validate(), Err(ConfigError::MaxKeyLen(_))));
+
+        let mut config = Config::default();
+        config.cb_size_byte(1usize << (usize::BITS - 1));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::CircularBufferSize(_))
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_ratios_and_snapshot_versions() {
+        for ratio in [-1.0, f64::NAN, f64::NEG_INFINITY, f64::INFINITY, 1.01] {
+            let mut config = Config::default();
+            config.cb_copy_on_access_ratio(ratio);
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::CopyOnAccessRatio(_))
+            ));
+        }
+        for ratio in [0.0, 0.1, 1.0] {
+            let mut config = Config::default();
+            config.cb_copy_on_access_ratio(ratio);
+            assert!(config.validate().is_ok());
+        }
+        for version in [(1u64 << 61) - 1, 1u64 << 61, u64::MAX] {
+            let mut config = Config::default();
+            config.use_snapshot(true).snapshot_version(version);
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::SnapshotVersion(_))
+            ));
+        }
     }
 }

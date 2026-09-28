@@ -41,6 +41,7 @@ jobs:
       - run: sudo apt update && sudo apt install -y llvm-dev
       - run: echo "PATH=/usr/lib/llvm-14/bin:$PATH" >> $GITHUB_ENV
       - run: cargo test
+      - run: cargo test --release
       - run: >
           env ASAN_OPTIONS="detect_odr_violation=0" RUSTFLAGS="-Z sanitizer=address"
           cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --tests
@@ -69,6 +70,12 @@ jobs:
       - uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26 # v3.7.0
       - run: rustup toolchain install nightly --component miri --component rust-src
       - run: cargo +nightly miri setup
+      - name: Mapping table ownership and publication
+        run: cargo +nightly miri test --lib utils::mapping_table::tests
+      - name: Initialized inner node images
+        run: |
+          cargo +nightly miri test --lib test_inner_serialization_initializes_unused_bytes_and_resets_lock
+          cargo +nightly miri test --lib test_inner_consolidate_and_split_binary_keys
       # CPR handshake weak-memory litmus tests. Weak-memory emulation is on by
       # default (the meaningful configuration); seeds 0..3 match the controls
       # documented in the `cpr_handshake_miri` module in src/snapshot.rs.

@@ -24,7 +24,7 @@ cargo fmt --check
 cargo clippy
 ```
 
-Rust toolchain is pinned to **1.95.0** via `rust-toolchain.toml`.
+Rust toolchain is pinned to **1.98.1** via `rust-toolchain.toml`.
 
 ## Architecture
 

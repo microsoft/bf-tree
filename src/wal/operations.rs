@@ -27,6 +27,32 @@ impl<'a> WriteOp<'a> {
             op_type: OpType::Delete,
         }
     }
+
+    pub(crate) fn try_read_from_buffer(buffer: &'a [u8]) -> Option<WriteOp<'a>> {
+        const HEADER_SIZE: usize = 5;
+        if buffer.len() < HEADER_SIZE {
+            return None;
+        }
+
+        let key_size = u16::from_le_bytes(buffer[0..2].try_into().ok()?) as usize;
+        let value_size = u16::from_le_bytes(buffer[2..4].try_into().ok()?) as usize;
+        let expected_size = HEADER_SIZE.checked_add(key_size)?.checked_add(value_size)?;
+        if buffer.len() != expected_size {
+            return None;
+        }
+
+        let op_type = match buffer[4] {
+            0 => OpType::Insert,
+            1 => OpType::Delete,
+            _ => return None,
+        };
+        let value_offset = HEADER_SIZE + key_size;
+        Some(WriteOp {
+            key: &buffer[HEADER_SIZE..value_offset],
+            value: &buffer[value_offset..],
+            op_type,
+        })
+    }
 }
 
 impl<'a> LogEntryImpl<'a> for WriteOp<'a> {
@@ -58,84 +84,8 @@ impl<'a> LogEntryImpl<'a> for WriteOp<'a> {
         buffer[key_offset..].copy_from_slice(self.value);
     }
 
+    #[cfg(test)]
     fn read_from_buffer(buffer: &'a [u8]) -> WriteOp<'a> {
-        let key_size = u16::from_le_bytes(buffer[0..2].try_into().unwrap()) as usize;
-        let value_size = u16::from_le_bytes(buffer[2..4].try_into().unwrap()) as usize;
-        let op_type = unsafe { std::mem::transmute::<u8, OpType>(buffer[4]) };
-        let key = &buffer[5..5 + key_size];
-        let value = &buffer[5 + key_size..];
-        assert_eq!(value.len(), value_size);
-        WriteOp {
-            key,
-            value,
-            op_type,
-        }
-    }
-}
-
-pub(crate) enum LogEntry<'a> {
-    Write(WriteOp<'a>),
-    Split(SplitOp),
-}
-
-#[repr(u8)]
-enum LogEntryTagVal {
-    Write = 0,
-    Split = 1,
-}
-
-impl LogEntryTagVal {
-    fn size() -> usize {
-        std::mem::size_of::<u8>()
-    }
-}
-
-impl<'a> From<&LogEntry<'a>> for LogEntryTagVal {
-    fn from(entry: &LogEntry<'a>) -> Self {
-        match entry {
-            LogEntry::Write(_) => LogEntryTagVal::Write,
-            LogEntry::Split(_) => LogEntryTagVal::Split,
-        }
-    }
-}
-
-impl From<u8> for LogEntryTagVal {
-    fn from(val: u8) -> Self {
-        match val {
-            0 => LogEntryTagVal::Write,
-            1 => LogEntryTagVal::Split,
-            _ => unreachable!(),
-        }
-    }
-}
-
-pub(crate) struct SplitOp {}
-
-impl<'a> LogEntryImpl<'a> for LogEntry<'a> {
-    fn log_size(&self) -> usize {
-        let tag_size = LogEntryTagVal::size();
-        let data_size = match self {
-            LogEntry::Write(op) => op.log_size(),
-            LogEntry::Split(_) => todo!(),
-        };
-        tag_size + data_size
-    }
-
-    fn write_to_buffer(&self, buffer: &mut [u8]) {
-        buffer[0] = LogEntryTagVal::from(self) as u8;
-        match self {
-            LogEntry::Write(op) => op.write_to_buffer(&mut buffer[1..]),
-            LogEntry::Split(_) => {
-                todo!()
-            }
-        }
-    }
-
-    fn read_from_buffer(buffer: &'a [u8]) -> Self {
-        let tag = LogEntryTagVal::from(buffer[0]);
-        match tag {
-            LogEntryTagVal::Write => LogEntry::Write(WriteOp::read_from_buffer(&buffer[1..])),
-            LogEntryTagVal::Split => LogEntry::Split(SplitOp {}),
-        }
+        Self::try_read_from_buffer(buffer).expect("invalid WAL write operation")
     }
 }

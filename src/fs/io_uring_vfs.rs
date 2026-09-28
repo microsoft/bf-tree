@@ -13,53 +13,53 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{counter, utils};
+use crate::counter;
 use io_uring::{opcode, IoUring};
+use thread_local::ThreadLocal;
 
 use super::{OffsetAlloc, VfsImpl};
 
 /// The purpose of this struct is to create a group of rings that share the same kernel poll thread.
 /// Checkout this test case to learn how to setup this: https://github.com/axboe/liburing/blob/7ad5e52d4d2f91203615cd738e56aba10ad8b8f6/test/sq-poll-share.c
 struct IoUringInstance {
-    ring: Vec<RefCell<IoUring>>,
+    rings: ThreadLocal<RefCell<IoUring>>,
+    shared_work_queue: Option<IoUring>,
 }
 
 impl IoUringInstance {
     fn new(poll: bool) -> Self {
-        let parallelism: usize = std::thread::available_parallelism().unwrap().into();
-        let thread_cnt = 32.max(parallelism * 4);
-        let mut ring = Vec::with_capacity(thread_cnt);
-
-        for i in 0..thread_cnt {
+        let shared_work_queue = if poll {
             let mut r = IoUring::builder();
+            r.setup_sqpoll(50000).setup_iopoll();
+            Some(
+                r.build(8)
+                    .expect("Failed to create shared io_uring work queue"),
+            )
+        } else {
+            None
+        };
 
-            if poll {
-                r.setup_sqpoll(50000);
-                r.setup_iopoll();
-
-                if i >= 1 {
-                    let pre_r: &RefCell<IoUring> = &ring[i - 1];
-                    r.setup_attach_wq(pre_r.borrow().as_raw_fd());
-                }
-            }
-
-            let r = r.build(8).expect("Failed to create io_uring");
-            ring.push(RefCell::new(r));
+        Self {
+            rings: ThreadLocal::new(),
+            shared_work_queue,
         }
-
-        Self { ring }
     }
 
     fn get_current_ring(&self) -> &RefCell<IoUring> {
-        // TODO: this is unstable feature, we rely on a implementation detail
-        let v = utils::thread_id_to_u64(std::thread::current().id());
-        let idx = v % self.ring.len() as u64;
-        let ring = self.get_ring(idx);
-        ring
-    }
-
-    fn get_ring(&self, thread_id: u64) -> &RefCell<IoUring> {
-        &self.ring[thread_id as usize]
+        self.rings.get_or(|| {
+            let mut builder = IoUring::builder();
+            if let Some(shared_work_queue) = &self.shared_work_queue {
+                builder
+                    .setup_sqpoll(50000)
+                    .setup_iopoll()
+                    .setup_attach_wq(shared_work_queue.as_raw_fd());
+            }
+            RefCell::new(
+                builder
+                    .build(8)
+                    .expect("Failed to create thread-local io_uring"),
+            )
+        })
     }
 }
 
@@ -70,9 +70,6 @@ pub(crate) struct IoUringVfs {
     _path: PathBuf,
     polling: bool,
 }
-
-unsafe impl Send for IoUringVfs {}
-unsafe impl Sync for IoUringVfs {}
 
 impl IoUringVfs {
     pub(crate) fn new_blocking(path: impl AsRef<Path>) -> Self {

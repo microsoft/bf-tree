@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use core::panic;
-use std::{alloc::Layout, cmp::Ordering, sync::atomic};
+use std::{alloc::Layout, cell::UnsafeCell, cmp::Ordering, mem::MaybeUninit, sync::atomic};
 
 use crate::{
     circular_buffer::CircularBufferPtr, counter, error::TreeError, range_scan::ScanReturnField,
@@ -89,7 +89,9 @@ impl LeafKVMeta {
         let mut meta = Self {
             offset,
             op_type_key_len_in_byte: key.len() as u16 | ((op_type as u16) << OP_TYPE_SHIFT),
-            ref_value_len_in_byte: std::sync::atomic::AtomicU16::new(value_len),
+            // A new record starts unreferenced, including when consolidation
+            // recreates metadata. Initialize the bit directly before publication.
+            ref_value_len_in_byte: std::sync::atomic::AtomicU16::new(value_len & VALUE_LEN_MASK),
             preview_bytes: [0; PREVIEW_SIZE],
         };
 
@@ -97,9 +99,6 @@ impl LeafKVMeta {
             meta.preview_bytes[i] = key[i + prefix_len as usize];
         }
 
-        // The initial value is not referenced, this is important because during the Garbage reclaim of the delta chain,
-        // we will call Insert to reset the states, which calls this function.
-        meta.clear_ref();
         meta
     }
 
@@ -158,9 +157,27 @@ impl LeafKVMeta {
             .fetch_or(REF_BIT_MASK, atomic::Ordering::Relaxed);
     }
 
+    #[inline]
+    fn mark_referenced_and_value_len(&self) -> u16 {
+        let packed = self.ref_value_len_in_byte.load(atomic::Ordering::Relaxed);
+        if packed & REF_BIT_MASK == 0 {
+            self.mark_as_ref();
+        }
+        // Shared readers can change only the reference bit. The value length
+        // remains stable while the caller holds the leaf against writers.
+        packed & VALUE_LEN_MASK
+    }
+
+    #[cfg(test)]
     pub fn clear_ref(&self) {
         self.ref_value_len_in_byte
             .fetch_and(!REF_BIT_MASK, atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_unused_preview_bytes(&mut self, prefix_len: usize, byte: u8) {
+        let suffix_len = self.get_key_len() as usize - prefix_len;
+        self.preview_bytes[suffix_len.min(PREVIEW_SIZE)..].fill(byte);
     }
 
     pub fn is_referenced(&self) -> bool {
@@ -210,20 +227,80 @@ impl MiniPageNextLevel {
 }
 
 #[repr(C)]
-pub(crate) struct LeafNode {
+pub(crate) struct LeafNodeStorage<T: ?Sized> {
     pub(crate) meta: NodeMeta,
     prefix_len: u16,
     pub(crate) next_level: MiniPageNextLevel,
     pub(crate) lsn: u64,
     snapshot_version: u64,
-    data: [u8; 0],
+    data: T,
 }
 
-const _: () = assert!(std::mem::size_of::<LeafNode>() == 32);
+// The thin header is stored in page-table pointers, never borrowed to access the
+// payload. A leaf reference covers the actual allocation, including its tail.
+pub(crate) type LeafNodeHeader = LeafNodeStorage<()>;
+pub(crate) type LeafNode = LeafNodeStorage<[UnsafeCell<MaybeUninit<u8>>]>;
+
+const _: () = assert!(std::mem::size_of::<LeafNodeHeader>() == 32);
 
 impl LeafNode {
+    /// Construct a bounded leaf pointer from its original allocation pointer.
+    ///
+    /// # Safety
+    /// `ptr` must be aligned and have provenance for `page_bytes` accessible
+    /// bytes, with `page_bytes` a multiple of the header alignment (so DST
+    /// padding does not extend the borrow). Initialize the header before use;
+    /// initialized metadata must describe only initialized records in the tail.
+    #[inline]
+    pub(crate) unsafe fn from_raw_parts(ptr: *mut LeafNodeHeader, page_bytes: usize) -> *mut Self {
+        debug_assert!(page_bytes >= std::mem::size_of::<LeafNodeHeader>());
+        debug_assert!(page_bytes.is_multiple_of(std::mem::align_of::<LeafNodeHeader>()));
+        std::ptr::slice_from_raw_parts_mut(
+            ptr.cast::<UnsafeCell<MaybeUninit<u8>>>(),
+            page_bytes - std::mem::size_of::<LeafNodeHeader>(),
+        ) as *mut Self
+    }
+
+    /// Reconstruct a published page's bounds without borrowing its thin header.
+    ///
+    /// # Safety
+    /// In addition to `from_raw_parts`, the initialized, validated header size
+    /// must fit the allocation and remain unchanged while accessed. Allocator
+    /// alignment slack is deliberately excluded from the leaf's payload.
+    #[inline]
+    pub(crate) unsafe fn from_initialized_ptr(ptr: *mut LeafNodeHeader) -> *mut Self {
+        let size = std::ptr::addr_of!((*ptr).meta.node_size).read() as usize;
+        Self::from_raw_parts(ptr, size)
+    }
+
+    // UnsafeCell permits the metadata's atomic reference bits to change through
+    // shared leaf references. Only initialized key/value bytes become slices.
+    #[inline]
+    fn data_ptr(&self) -> *mut u8 {
+        self.data.as_ptr().cast::<u8>().cast_mut()
+    }
+
+    /// Prepare an initialized byte image while the page is exclusively held.
+    ///
+    /// Metadata grows from the start and record bytes grow from the end. The
+    /// intervening free gap is the only region that may remain uninitialized in
+    /// a newly allocated mini-page. Initialize it only when taking a snapshot,
+    /// so ordinary reads and writes do not pay for clearing unused capacity.
+    pub(crate) fn snapshot_bytes(&mut self) -> &[u8] {
+        let metadata_end =
+            self.meta.meta_count_with_fence() as usize * std::mem::size_of::<LeafKVMeta>();
+        let gap_len = self.meta.remaining_size as usize;
+        debug_assert!(metadata_end + gap_len <= self.data.len());
+        let page_size = std::mem::size_of::<LeafNodeHeader>() + self.data.len();
+        debug_assert_eq!(page_size, self.meta.node_size as usize);
+        unsafe {
+            std::ptr::write_bytes(self.data_ptr().add(metadata_end), 0, gap_len);
+            std::slice::from_raw_parts(self as *const Self as *const u8, page_size)
+        }
+    }
+
     fn max_data_size(node_size: usize) -> usize {
-        node_size - std::mem::size_of::<LeafNode>()
+        node_size - std::mem::size_of::<LeafNodeHeader>()
     }
 
     pub(crate) fn initialize_mini_page(
@@ -233,6 +310,7 @@ impl LeafNode {
         cache_only: bool,
         snapshot_version: u64,
     ) {
+        assert!(node_size <= ptr.allocated_size());
         unsafe {
             Self::init_node_with_fence(
                 ptr.as_ptr(),
@@ -247,9 +325,14 @@ impl LeafNode {
         }
     }
 
-    pub(crate) fn make_base_page(node_size: usize, snapshot_version: u64) -> *mut Self {
-        let layout = Layout::from_size_align(node_size, std::mem::align_of::<LeafNode>()).unwrap();
-        let ptr = unsafe { std::alloc::alloc(layout) };
+    pub(crate) fn make_base_page(node_size: usize, snapshot_version: u64) -> *mut LeafNodeHeader {
+        let layout =
+            Layout::from_size_align(node_size, std::mem::align_of::<LeafNodeHeader>()).unwrap();
+        // Base pages are persisted as whole byte ranges, including unused space.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
         unsafe {
             Self::init_node_with_fence(
                 ptr,
@@ -262,7 +345,7 @@ impl LeafNode {
                 snapshot_version,
             );
         }
-        ptr as *mut Self
+        ptr.cast::<LeafNodeHeader>()
     }
 
     /// After promoting a base page to full page cache, we need to mark every records as cache.
@@ -324,9 +407,25 @@ impl LeafNode {
         cache_only: bool,
         snapshot_version: u64,
     ) {
-        let ptr = ptr as *mut Self;
+        let ptr = ptr.cast::<LeafNodeHeader>();
 
-        { &mut *ptr }.initialize(
+        // Install every header field before creating a reference to fresh memory.
+        // In particular, initialize() intentionally preserves an existing page's LSN.
+        ptr.write(LeafNodeHeader {
+            meta: NodeMeta::new(
+                Self::max_data_size(node_size) as u16,
+                false,
+                has_fence,
+                node_size as u16,
+                cache_only,
+            ),
+            prefix_len: 0,
+            next_level,
+            lsn: 0,
+            snapshot_version,
+            data: (),
+        });
+        { &mut *Self::from_raw_parts(ptr, node_size) }.initialize(
             low_fence,
             high_fence,
             node_size,
@@ -339,7 +438,7 @@ impl LeafNode {
 
     pub(crate) fn get_kv_meta(&self, index: usize) -> &LeafKVMeta {
         debug_assert!(index < self.meta.meta_count_with_fence() as usize);
-        let meta_ptr = self.data.as_ptr() as *const LeafKVMeta;
+        let meta_ptr = self.data_ptr() as *const LeafKVMeta;
         unsafe { &*meta_ptr.add(index) }
     }
 
@@ -349,14 +448,27 @@ impl LeafNode {
         [prefix, remaining].concat()
     }
 
+    #[inline]
+    fn copy_full_key_to(&self, meta: &LeafKVMeta, out_buffer: &mut [u8]) -> usize {
+        let key_len = meta.get_key_len() as usize;
+        let prefix_len = self.prefix_len as usize;
+        debug_assert!(out_buffer.len() >= key_len);
+
+        if prefix_len != 0 {
+            out_buffer[..prefix_len].copy_from_slice(self.get_prefix());
+        }
+        out_buffer[prefix_len..key_len].copy_from_slice(self.get_remaining_key(meta));
+        key_len
+    }
+
     /// Get the full key for low fence which is not prefix compressed
     pub(crate) fn get_low_fence_full_key(&self) -> Vec<u8> {
         debug_assert!(LOW_FENCE_IDX < self.meta.meta_count_with_fence() as usize);
-        let meta_ptr = self.data.as_ptr() as *const LeafKVMeta;
+        let meta_ptr = self.data_ptr() as *const LeafKVMeta;
         let meta = unsafe { &*meta_ptr.add(LOW_FENCE_IDX) };
 
         let key_offset = meta.get_offset();
-        let key_ptr = unsafe { self.data.as_ptr().add(key_offset as usize) };
+        let key_ptr = unsafe { self.data_ptr().add(key_offset as usize) };
         unsafe {
             let key = std::slice::from_raw_parts(key_ptr, (meta.get_key_len()) as usize);
             [key].concat()
@@ -365,29 +477,34 @@ impl LeafNode {
 
     pub(crate) fn get_kv_meta_mut(&mut self, index: usize) -> &mut LeafKVMeta {
         debug_assert!(index < self.meta.meta_count_with_fence() as usize);
-        let meta_ptr = self.data.as_mut_ptr() as *mut LeafKVMeta;
+        let meta_ptr = self.data_ptr() as *mut LeafKVMeta;
         unsafe { meta_ptr.add(index).as_mut().unwrap() }
     }
 
     pub(crate) fn write_initial_kv_meta(&mut self, index: usize, meta: LeafKVMeta) {
-        let meta_ptr = self.data.as_mut_ptr() as *mut LeafKVMeta;
+        let meta_ptr = self.data_ptr() as *mut LeafKVMeta;
         unsafe { meta_ptr.add(index).write(meta) };
     }
 
     pub(crate) fn get_remaining_key(&self, meta: &LeafKVMeta) -> &[u8] {
         let key_offset = meta.get_offset();
-        let key_ptr = unsafe { self.data.as_ptr().add(key_offset as usize) };
+        let key_ptr = unsafe { self.data_ptr().add(key_offset as usize) };
         unsafe {
             std::slice::from_raw_parts(key_ptr, (meta.get_key_len() - self.prefix_len) as usize)
         }
     }
 
     pub(crate) fn get_prefix(&self) -> &[u8] {
+        // Fence-less pages have no prefix metadata, and infinite fences use
+        // sentinel offsets outside the allocation. Neither may be dereferenced.
+        if self.prefix_len == 0 {
+            return &[];
+        }
         let m = self.get_kv_meta(LOW_FENCE_IDX);
         let key_offset = m.get_offset();
         unsafe {
             std::slice::from_raw_parts(
-                self.data.as_ptr().add(key_offset as usize),
+                self.data_ptr().add(key_offset as usize),
                 self.prefix_len as usize,
             )
         }
@@ -432,7 +549,7 @@ impl LeafNode {
             self.write_initial_kv_meta(loc as usize, new_meta);
 
             unsafe {
-                let start_ptr = self.data.as_mut_ptr().add(offset as usize);
+                let start_ptr = self.data_ptr().add(offset as usize);
 
                 let key_slice = std::slice::from_raw_parts(
                     key.as_ptr().add(prefix_len as usize),
@@ -467,9 +584,16 @@ impl LeafNode {
     }
 
     pub(crate) fn get_value(&self, meta: &LeafKVMeta) -> &[u8] {
+        self.get_value_with_len(meta, meta.value_len())
+    }
+
+    // Reuse a length read from this metadata while the leaf is held against
+    // writers; changing its reference bit does not invalidate that length.
+    #[inline]
+    fn get_value_with_len(&self, meta: &LeafKVMeta, value_len: u16) -> &[u8] {
         let val_offset = meta.get_offset() + meta.get_key_len() - self.prefix_len;
-        let val_ptr = unsafe { self.data.as_ptr().add(val_offset as usize) };
-        unsafe { std::slice::from_raw_parts(val_ptr, meta.value_len() as usize) }
+        let val_ptr = unsafe { self.data_ptr().add(val_offset as usize) };
+        unsafe { std::slice::from_raw_parts(val_ptr, value_len as usize) }
     }
 
     /// A good split key has two properties:
@@ -514,22 +638,8 @@ impl LeafNode {
     }
 
     /// Get # of keys strictly smaller than a merge_split_key
-    #[allow(clippy::unused_enumerate_index)]
-    pub fn get_kv_num_below_key(&self, merge_split_key: &Vec<u8>) -> u16 {
-        // Linear search
-        let mut cnt: u16 = 0;
-        for (_, meta) in self.meta_iter().enumerate() {
-            let key = self.get_full_key(meta);
-            let cmp = key.cmp(merge_split_key);
-            // Pick all records from the base page whose key is smaller
-            // than merge_split_key
-            if cmp == std::cmp::Ordering::Less {
-                cnt += 1;
-            } else {
-                break;
-            }
-        }
-        cnt
+    pub fn get_kv_num_below_key(&self, merge_split_key: &[u8]) -> u16 {
+        self.lower_bound(merge_split_key) - self.first_meta_pos_after_fence()
     }
 
     /// [Cache-only mode]: Find the splitting key that evenly splits all the records in the
@@ -539,24 +649,25 @@ impl LeafNode {
     pub fn get_cache_only_insert_split_key(&self, key: &[u8], new_record_size: &u16) -> Vec<u8> {
         let mut merge_split_key_1: Option<Vec<u8>> = None;
         let mut merge_split_key_2: Option<Vec<u8>> = None;
-        let mut diff_1: i16 = i16::MAX;
-        let mut diff_2: i16 = i16::MAX;
+        let mut diff_1: usize = usize::MAX;
+        let mut diff_2: usize = usize::MAX;
 
         // The total size of all records including the new record to insert
-        let mut total_merged_size: u16 = 0;
+        let mut total_merged_size: usize = 0;
 
         for meta in self.meta_iter() {
             let key_len = meta.get_key_len();
             let value_len = meta.value_len();
 
-            total_merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            total_merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
         }
 
-        total_merged_size += new_record_size + std::mem::size_of::<LeafKVMeta>() as u16;
+        total_merged_size += *new_record_size as usize + std::mem::size_of::<LeafKVMeta>();
         let split_target_size = total_merged_size / 2;
 
         // Search for the splitting key
-        let mut merged_size: u16 = 0;
+        let mut merged_size: usize = 0;
         let mut self_meta_iter = self.meta_iter();
         let mut self_meta_option = self_meta_iter.next();
 
@@ -569,7 +680,8 @@ impl LeafNode {
             while cmp == std::cmp::Ordering::Less {
                 let key_len = cur_base_meta.get_key_len();
                 let value_len = cur_base_meta.value_len();
-                merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+                merged_size +=
+                    key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
                 if merged_size >= split_target_size {
                     // Two split key candidates are already found
                     // Stop
@@ -577,18 +689,18 @@ impl LeafNode {
                         break;
                     }
 
-                    let left_side: u16 = merged_size
-                        - key_len
-                        - value_len
-                        - std::mem::size_of::<LeafKVMeta>() as u16;
+                    let left_side = merged_size
+                        - key_len as usize
+                        - value_len as usize
+                        - std::mem::size_of::<LeafKVMeta>();
                     let right_side = total_merged_size - left_side;
 
                     if merge_split_key_1.is_none() {
                         merge_split_key_1 = Some(cur_base_key);
-                        diff_1 = (left_side as i16 - right_side as i16).abs();
+                        diff_1 = left_side.abs_diff(right_side);
                     } else {
                         merge_split_key_2 = Some(cur_base_key);
-                        diff_2 = (left_side as i16 - right_side as i16).abs();
+                        diff_2 = left_side.abs_diff(right_side);
                     }
                 }
 
@@ -605,22 +717,22 @@ impl LeafNode {
 
         // Count the new key
         if merge_split_key_2.is_none() {
-            merged_size += new_record_size + std::mem::size_of::<LeafKVMeta>() as u16;
+            merged_size += *new_record_size as usize + std::mem::size_of::<LeafKVMeta>();
 
             if merged_size >= split_target_size {
                 // Two split key candidates are already found
                 // Stop
 
-                let left_side: u16 =
-                    merged_size - new_record_size - std::mem::size_of::<LeafKVMeta>() as u16;
+                let left_side =
+                    merged_size - *new_record_size as usize - std::mem::size_of::<LeafKVMeta>();
                 let right_side = total_merged_size - left_side;
 
                 if merge_split_key_1.is_none() {
                     merge_split_key_1 = Some(key.to_vec());
-                    diff_1 = (left_side as i16 - right_side as i16).abs();
+                    diff_1 = left_side.abs_diff(right_side);
                 } else {
                     merge_split_key_2 = Some(key.to_vec());
-                    diff_2 = (left_side as i16 - right_side as i16).abs();
+                    diff_2 = left_side.abs_diff(right_side);
                 }
             }
         }
@@ -630,7 +742,8 @@ impl LeafNode {
             let base_meta = self_meta_option.unwrap();
             let key_len = base_meta.get_key_len();
             let value_len = base_meta.value_len();
-            merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
             if merged_size >= split_target_size {
                 // Return the splitting key
@@ -639,16 +752,18 @@ impl LeafNode {
                     break;
                 }
 
-                let left_side: u16 =
-                    merged_size - key_len - value_len - std::mem::size_of::<LeafKVMeta>() as u16;
+                let left_side = merged_size
+                    - key_len as usize
+                    - value_len as usize
+                    - std::mem::size_of::<LeafKVMeta>();
                 let right_side = total_merged_size - left_side;
 
                 if merge_split_key_1.is_none() {
                     merge_split_key_1 = Some(cur_base_key);
-                    diff_1 = (left_side as i16 - right_side as i16).abs();
+                    diff_1 = left_side.abs_diff(right_side);
                 } else {
                     merge_split_key_2 = Some(cur_base_key);
-                    diff_2 = (left_side as i16 - right_side as i16).abs();
+                    diff_2 = left_side.abs_diff(right_side);
                 }
             }
             self_meta_option = self_meta_iter.next();
@@ -680,10 +795,10 @@ impl LeafNode {
     pub(crate) fn get_merge_split_key(&mut self, mini_page: &LeafNode) -> Vec<u8> {
         let mut merge_split_key_1: Option<Vec<u8>> = None;
         let mut merge_split_key_2: Option<Vec<u8>> = None;
-        let mut diff_1: i16 = i16::MAX;
-        let mut diff_2: i16 = i16::MAX;
+        let mut diff_1: usize = usize::MAX;
+        let mut diff_2: usize = usize::MAX;
 
-        let mut total_merged_size: u16 = 0;
+        let mut total_merged_size: usize = 0;
         let mut base_meta_iter = self.meta_iter();
         let mut cur_pos = base_meta_iter.cur;
         let mut cur_base_meta_option = base_meta_iter.next();
@@ -709,7 +824,7 @@ impl LeafNode {
                     let key_len = cur_base_meta.get_key_len();
                     let value_len = cur_base_meta.value_len();
                     total_merged_size +=
-                        key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+                        key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
                     cur_pos = base_meta_iter.cur;
                     cur_base_meta_option = base_meta_iter.next();
@@ -734,7 +849,8 @@ impl LeafNode {
 
             let key_len = mini_meta.get_key_len();
             let value_len = mini_meta.value_len();
-            total_merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            total_merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
         }
 
         // Mini-page records are exhuasted, go through the rest of
@@ -743,7 +859,8 @@ impl LeafNode {
             let base_meta = cur_base_meta_option.unwrap();
             let key_len = base_meta.get_key_len();
             let value_len = base_meta.value_len();
-            total_merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            total_merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
             cur_base_meta_option = base_meta_iter.next();
         }
@@ -753,7 +870,7 @@ impl LeafNode {
 
         // Merge sort the distinct records from the mini page and the base page
         // until the size of the sorted records reaches the target split size
-        let mut merged_size: u16 = 0;
+        let mut merged_size: usize = 0;
         base_meta_iter = self.meta_iter();
         cur_base_meta_option = base_meta_iter.next();
 
@@ -775,7 +892,8 @@ impl LeafNode {
                 while cmp == std::cmp::Ordering::Less {
                     let key_len = cur_base_meta.get_key_len();
                     let value_len = cur_base_meta.value_len();
-                    merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+                    merged_size +=
+                        key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
                     if merged_size >= split_target_size {
                         // Two split key candidates are already found
                         // Stop
@@ -783,18 +901,18 @@ impl LeafNode {
                             break;
                         }
 
-                        let left_side: u16 = merged_size
-                            - key_len
-                            - value_len
-                            - std::mem::size_of::<LeafKVMeta>() as u16;
+                        let left_side = merged_size
+                            - key_len as usize
+                            - value_len as usize
+                            - std::mem::size_of::<LeafKVMeta>();
                         let right_side = total_merged_size - left_side;
 
                         if merge_split_key_1.is_none() {
                             merge_split_key_1 = Some(cur_base_key);
-                            diff_1 = (left_side as i16 - right_side as i16).abs();
+                            diff_1 = left_side.abs_diff(right_side);
                         } else {
                             merge_split_key_2 = Some(cur_base_key);
-                            diff_2 = (left_side as i16 - right_side as i16).abs();
+                            diff_2 = left_side.abs_diff(right_side);
                         }
                     }
 
@@ -817,7 +935,8 @@ impl LeafNode {
 
             let key_len = mini_meta.get_key_len();
             let value_len = mini_meta.value_len();
-            merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
             if merged_size >= split_target_size {
                 // Two split key candidates are already found
@@ -826,16 +945,18 @@ impl LeafNode {
                     break;
                 }
 
-                let left_side: u16 =
-                    merged_size - key_len - value_len - std::mem::size_of::<LeafKVMeta>() as u16;
+                let left_side = merged_size
+                    - key_len as usize
+                    - value_len as usize
+                    - std::mem::size_of::<LeafKVMeta>();
                 let right_side = total_merged_size - left_side;
 
                 if merge_split_key_1.is_none() {
                     merge_split_key_1 = Some(cur_mini_key);
-                    diff_1 = (left_side as i16 - right_side as i16).abs();
+                    diff_1 = left_side.abs_diff(right_side);
                 } else {
                     merge_split_key_2 = Some(cur_mini_key);
-                    diff_2 = (left_side as i16 - right_side as i16).abs();
+                    diff_2 = left_side.abs_diff(right_side);
                 }
             }
         }
@@ -846,7 +967,8 @@ impl LeafNode {
             let base_meta = cur_base_meta_option.unwrap();
             let key_len = base_meta.get_key_len();
             let value_len = base_meta.value_len();
-            merged_size += key_len + value_len + std::mem::size_of::<LeafKVMeta>() as u16;
+            merged_size +=
+                key_len as usize + value_len as usize + std::mem::size_of::<LeafKVMeta>();
 
             if merged_size >= split_target_size {
                 // Return the splitting key
@@ -855,16 +977,18 @@ impl LeafNode {
                     break;
                 }
 
-                let left_side: u16 =
-                    merged_size - key_len - value_len - std::mem::size_of::<LeafKVMeta>() as u16;
+                let left_side = merged_size
+                    - key_len as usize
+                    - value_len as usize
+                    - std::mem::size_of::<LeafKVMeta>();
                 let right_side = total_merged_size - left_side;
 
                 if merge_split_key_1.is_none() {
                     merge_split_key_1 = Some(cur_base_key);
-                    diff_1 = (left_side as i16 - right_side as i16).abs();
+                    diff_1 = left_side.abs_diff(right_side);
                 } else {
                     merge_split_key_2 = Some(cur_base_key);
-                    diff_2 = (left_side as i16 - right_side as i16).abs();
+                    diff_2 = left_side.abs_diff(right_side);
                 }
             }
             cur_base_meta_option = base_meta_iter.next();
@@ -936,7 +1060,7 @@ impl LeafNode {
             return Err(TreeError::NeedRestart);
         }
 
-        let meta_ptr = self.data.as_ptr() as *const LeafKVMeta;
+        let meta_ptr = self.data_ptr() as *const LeafKVMeta;
         let meta = unsafe { &*meta_ptr.add(index) };
 
         let key_offset = meta.get_offset();
@@ -946,7 +1070,7 @@ impl LeafNode {
             return Err(TreeError::NeedRestart);
         }
 
-        let key_ptr = unsafe { self.data.as_ptr().add(key_offset as usize) };
+        let key_ptr = unsafe { self.data_ptr().add(key_offset as usize) };
         let key_slice =
             unsafe { std::slice::from_raw_parts(key_ptr, (key_len - self.prefix_len) as usize) };
         Ok(key_slice.to_vec())
@@ -959,7 +1083,7 @@ impl LeafNode {
             vec![]
         } else {
             unsafe {
-                let start_ptr = self.data.as_ptr().add(fence_meta.offset as usize);
+                let start_ptr = self.data_ptr().add(fence_meta.offset as usize);
                 let key_slice =
                     std::slice::from_raw_parts(start_ptr, fence_meta.get_key_len() as usize);
                 key_slice.to_vec()
@@ -981,37 +1105,39 @@ impl LeafNode {
     /// By convention, key_cmp(meta, key) returns the ordering matching the expression meta <operator> key if true.
     #[inline]
     pub(crate) fn key_cmp(&self, meta: &LeafKVMeta, key: &[u8]) -> Ordering {
-        let search_key_prefix = &key[(self.prefix_len as usize)..]
-            [..std::cmp::min(key.len() - self.prefix_len as usize, PREVIEW_SIZE)];
+        let prefix_len = self.prefix_len as usize;
+        if prefix_len != 0 {
+            let prefix = self.get_prefix();
+            let shared_len = prefix_len.min(key.len());
+            let prefix_cmp = prefix[..shared_len].cmp(&key[..shared_len]);
+            if prefix_cmp != Ordering::Equal {
+                return prefix_cmp;
+            }
+            if key.len() < prefix_len {
+                return Ordering::Greater;
+            }
+        }
 
-        let prefix_key = &meta.preview_bytes[..std::cmp::min(
-            PREVIEW_SIZE,
-            meta.get_key_len() as usize - self.prefix_len as usize,
-        )];
+        let search_key_postfix = &key[prefix_len..];
+        let search_key_prefix = &search_key_postfix[..search_key_postfix.len().min(PREVIEW_SIZE)];
+
+        let prefix_key = &meta.preview_bytes
+            [..std::cmp::min(PREVIEW_SIZE, meta.get_key_len() as usize - prefix_len)];
         let mut cmp = prefix_key.cmp(search_key_prefix);
 
         // If the prefix matches, compare the full key
         if cmp == Ordering::Equal {
             let full_key = self.get_remaining_key(meta);
-            let search_key_postfix = &key[self.prefix_len as usize..];
             cmp = full_key.cmp(search_key_postfix);
         }
         cmp
     }
 
     pub(crate) fn linear_lower_bound(&self, key: &[u8]) -> u16 {
-        debug_assert!(key.len() >= self.prefix_len as usize);
-
         let mut index = self.first_meta_pos_after_fence();
 
         while index < self.meta.meta_count_with_fence() {
             let key_meta = self.get_kv_meta(index as usize);
-
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                // For bw-tree-like linear search, we use clflush to simulate pointer chasing.
-                core::arch::x86_64::_mm_clflush(key_meta as *const LeafKVMeta as *const u8);
-            }
             let cmp = self.key_cmp(key_meta, key);
 
             if cmp != Ordering::Less {
@@ -1025,29 +1151,64 @@ impl LeafNode {
     }
 
     pub(crate) fn lower_bound(&self, key: &[u8]) -> u16 {
+        self.lower_bound_with_match(key).0
+    }
+
+    /// Return the insertion position and whether that position contains the key.
+    /// Keep the equality result so reads and updates do not compare a found key twice.
+    #[inline]
+    fn lower_bound_with_match(&self, key: &[u8]) -> (u16, bool) {
         let mut lower = self.first_meta_pos_after_fence();
         let mut upper = self.meta.meta_count_with_fence();
+        let prefix_len = self.prefix_len as usize;
 
-        let search_key_prefix = &key[(self.prefix_len as usize)..]
-            [..std::cmp::min(key.len() - self.prefix_len as usize, PREVIEW_SIZE)];
+        if prefix_len != 0 {
+            let prefix = self.get_prefix();
+            let shared_len = prefix_len.min(key.len());
+            match prefix[..shared_len].cmp(&key[..shared_len]) {
+                Ordering::Greater => return (lower, false),
+                Ordering::Less => return (upper, false),
+                Ordering::Equal if key.len() < prefix_len => return (lower, false),
+                Ordering::Equal => {}
+            }
+        }
 
-        debug_assert!(key.len() >= self.prefix_len as usize);
+        let search_key_postfix = &key[prefix_len..];
+        let search_postfix_len = search_key_postfix.len();
+        let search_preview_len = search_postfix_len.min(PREVIEW_SIZE);
+        let search_preview = match search_preview_len {
+            0 => 0,
+            1 => u16::from(search_key_postfix[0]) << 8,
+            _ => u16::from_be_bytes([search_key_postfix[0], search_key_postfix[1]]),
+        };
 
         while lower < upper {
             let mid = lower + (upper - lower) / 2;
             let key_meta = self.get_kv_meta(mid as usize);
 
-            let prefix_key = &key_meta.preview_bytes[..std::cmp::min(
-                PREVIEW_SIZE,
-                key_meta.get_key_len() as usize - self.prefix_len as usize,
-            )];
-            let mut cmp = prefix_key.cmp(search_key_prefix);
+            let remaining_key_len = key_meta.get_key_len() as usize - prefix_len;
+            let preview_len = remaining_key_len.min(PREVIEW_SIZE);
+            let preview = u16::from_be_bytes(key_meta.preview_bytes);
+            // Both metadata bytes are initialized, but bytes outside the real
+            // preview need not be zero. Mask them before comparing padded words.
+            let preview = match preview_len {
+                0 => 0,
+                1 => preview & 0xFF00,
+                _ => preview,
+            };
+            let mut cmp = preview
+                .cmp(&search_preview)
+                .then_with(|| preview_len.cmp(&search_preview_len));
 
-            // If the prefix matches, compare the full key
+            // Word equality plus the preview length gives slice ordering even
+            // for trailing zero bytes. If either suffix ends here, its length
+            // settles the full comparison without reading the payload again.
             if cmp == Ordering::Equal {
-                let remaining_key = self.get_remaining_key(key_meta);
-                let search_key_postfix = &key[self.prefix_len as usize..];
-                cmp = remaining_key.cmp(search_key_postfix);
+                cmp = if remaining_key_len <= PREVIEW_SIZE || search_postfix_len <= PREVIEW_SIZE {
+                    remaining_key_len.cmp(&search_postfix_len)
+                } else {
+                    self.get_remaining_key(key_meta).cmp(search_key_postfix)
+                };
             }
 
             match cmp {
@@ -1055,14 +1216,14 @@ impl LeafNode {
                     upper = mid;
                 }
                 Ordering::Equal => {
-                    return mid;
+                    return (mid, true);
                 }
                 Ordering::Less => {
                     lower = mid + 1;
                 }
             }
         }
-        lower
+        (lower, false)
     }
 
     /// Take a deep breath before you read/change this function.
@@ -1079,7 +1240,13 @@ impl LeafNode {
         op_type: OpType,
         max_fence_len: usize,
     ) -> bool {
-        debug_assert!(key.len() as u16 >= self.prefix_len);
+        // Check the packed metadata limits before narrowing lengths or copying.
+        if key.len() > KEY_LEN_MASK as usize || value.len() > VALUE_LEN_MASK as usize {
+            return false;
+        }
+        let Some(post_fix_len) = key.len().checked_sub(self.prefix_len as usize) else {
+            return false;
+        };
         match op_type {
             OpType::Insert | OpType::Cache => {
                 debug_assert!(!value.is_empty());
@@ -1087,73 +1254,66 @@ impl LeafNode {
             OpType::Delete | OpType::Phantom => {}
         }
 
-        let post_fix_len = key.len() as u16 - self.prefix_len;
+        let post_fix_len = post_fix_len as u16;
         let val_len = value.len() as u16;
         let kv_len = post_fix_len + val_len;
 
-        let value_count_with_fence = self.meta.meta_count_with_fence();
+        let (pos, found) = self.lower_bound_with_match(key);
+        let pos = pos as usize;
 
-        let pos = self.lower_bound(key) as usize;
-
-        if pos < value_count_with_fence as usize {
-            let prefix_len = self.prefix_len as usize;
+        if found {
             let pos_meta = self.get_kv_meta(pos);
-            let pos_key = self.get_remaining_key(pos_meta);
-            let search_key_postfix = &key[prefix_len..];
-            if pos_key.cmp(search_key_postfix) == Ordering::Equal {
-                // The key already exists.
-                counter!(LeafInsertDuplicate);
-                if op_type == OpType::Delete {
-                    let pos_meta = self.get_kv_meta_mut(pos);
-                    pos_meta.mark_as_deleted();
-                    return true;
-                }
+            // The key already exists.
+            counter!(LeafInsertDuplicate);
+            if op_type == OpType::Delete {
+                let pos_meta = self.get_kv_meta_mut(pos);
+                pos_meta.mark_as_deleted();
+                return true;
+            }
 
-                let pos_value = self.get_value(pos_meta);
-                let pos_value_len = pos_value.len() as u16;
+            let pos_value_len = pos_meta.value_len();
+            let pos_offset = pos_meta.offset;
 
-                if pos_value_len >= val_len {
-                    // we are lucky, old value is larger than new value. We just overwrite the old value.
-                    unsafe {
-                        let pair_ptr = self.data.as_ptr().add(pos_meta.offset as usize) as *mut u8;
-                        std::ptr::copy_nonoverlapping(
-                            value.as_ptr(),
-                            pair_ptr.add(post_fix_len as usize),
-                            val_len as usize,
-                        );
-                    }
-                    let pos_meta = self.get_kv_meta_mut(pos);
-                    pos_meta.set_value_len(val_len);
-                    pos_meta.set_op_type(op_type);
-                    return true;
-                }
-
-                if self.meta.remaining_size < kv_len {
-                    return false;
-                }
-                assert!(op_type != OpType::Cache);
-                let offset = self.current_lowest_offset() - kv_len;
+            if pos_value_len >= val_len {
+                // we are lucky, old value is larger than new value. We just overwrite the old value.
                 unsafe {
-                    let pair_ptr = self.data.as_ptr().add(offset as usize) as *mut u8;
-
-                    let pos_meta = self.get_kv_meta_mut(pos);
-                    pos_meta.set_value_len(val_len);
-                    pos_meta.set_op_type(op_type);
-                    pos_meta.offset = offset;
-                    std::ptr::copy_nonoverlapping(
-                        key[self.prefix_len as usize..].as_ptr(),
-                        pair_ptr,
-                        post_fix_len as usize,
-                    );
+                    let pair_ptr = self.data_ptr().add(pos_offset as usize);
                     std::ptr::copy_nonoverlapping(
                         value.as_ptr(),
                         pair_ptr.add(post_fix_len as usize),
                         val_len as usize,
                     );
                 }
-                self.meta.remaining_size -= kv_len;
+                let pos_meta = self.get_kv_meta_mut(pos);
+                pos_meta.set_value_len(val_len);
+                pos_meta.set_op_type(op_type);
                 return true;
             }
+
+            if self.meta.remaining_size < kv_len {
+                return false;
+            }
+            assert!(op_type != OpType::Cache);
+            let offset = self.current_lowest_offset() - kv_len;
+            unsafe {
+                let pos_meta = self.get_kv_meta_mut(pos);
+                pos_meta.set_value_len(val_len);
+                pos_meta.set_op_type(op_type);
+                pos_meta.offset = offset;
+                let pair_ptr = self.data_ptr().add(offset as usize);
+                std::ptr::copy_nonoverlapping(
+                    key[self.prefix_len as usize..].as_ptr(),
+                    pair_ptr,
+                    post_fix_len as usize,
+                );
+                std::ptr::copy_nonoverlapping(
+                    value.as_ptr(),
+                    pair_ptr.add(post_fix_len as usize),
+                    val_len as usize,
+                );
+            }
+            self.meta.remaining_size -= kv_len;
+            return true;
         }
 
         // The key is not already in the node.
@@ -1164,6 +1324,63 @@ impl LeafNode {
             return true;
         }
 
+        self.insert_new_at(key, value, op_type, pos, max_fence_len)
+    }
+
+    /// Rebuilding and splitting visit unique records in key order. Append them
+    /// directly instead of searching the already sorted destination each time.
+    fn append_sorted(&mut self, key: &[u8], value: &[u8], op_type: OpType) -> bool {
+        if key.len() > KEY_LEN_MASK as usize
+            || value.len() > VALUE_LEN_MASK as usize
+            || key.len() < self.prefix_len as usize
+        {
+            return false;
+        }
+        let pos = self.meta.meta_count_with_fence() as usize;
+        debug_assert!(
+            pos == self.first_meta_pos_after_fence() as usize
+                || self.key_cmp(self.get_kv_meta(pos - 1), key) == Ordering::Less
+        );
+        // Match insert's handling of a deletion of an absent base-page record.
+        if op_type == OpType::Delete && self.is_base_page() {
+            return true;
+        }
+        self.insert_new_at(key, value, op_type, pos, 0)
+    }
+
+    fn append_from(
+        &mut self,
+        source: &LeafNode,
+        meta: &LeafKVMeta,
+        op_type: OpType,
+        key_buffer: &mut Vec<u8>,
+    ) -> bool {
+        let remaining_key = source.get_remaining_key(meta);
+        let key = if source.prefix_len == 0 {
+            // Mini pages normally have no prefix, so their keys can be borrowed.
+            remaining_key
+        } else {
+            key_buffer.clear();
+            key_buffer.extend_from_slice(source.get_prefix());
+            key_buffer.extend_from_slice(remaining_key);
+            key_buffer.as_slice()
+        };
+        self.append_sorted(key, source.get_value(meta), op_type)
+    }
+
+    /// The caller has checked lengths and located a vacant metadata position.
+    #[inline]
+    fn insert_new_at(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        op_type: OpType,
+        pos: usize,
+        max_fence_len: usize,
+    ) -> bool {
+        let post_fix_len = (key.len() - self.prefix_len as usize) as u16;
+        let val_len = value.len() as u16;
+        let kv_len = post_fix_len + val_len;
         //Check if the node has capacity for the new record with or without fences
         if self.full_with_fences(
             kv_len + std::mem::size_of::<LeafKVMeta>() as u16,
@@ -1181,19 +1398,16 @@ impl LeafNode {
         unsafe {
             let metas_size = std::mem::size_of::<LeafKVMeta>()
                 * (self.meta.meta_count_with_fence() - pos as u16) as usize;
-            let src_ptr = self
-                .data
-                .as_ptr()
-                .add(pos * std::mem::size_of::<LeafKVMeta>());
-            let dest_ptr = self
-                .data
-                .as_mut_ptr()
-                .add((pos + 1) * std::mem::size_of::<LeafKVMeta>());
-            std::ptr::copy(src_ptr, dest_ptr, metas_size);
-
-            self.write_initial_kv_meta(pos, new_meta);
-
-            let pair_ptr = self.data.as_mut_ptr().add(offset as usize);
+            let data_ptr = self.data_ptr();
+            if metas_size != 0 {
+                std::ptr::copy(
+                    data_ptr.add(pos * std::mem::size_of::<LeafKVMeta>()),
+                    data_ptr.add((pos + 1) * std::mem::size_of::<LeafKVMeta>()),
+                    metas_size,
+                );
+            }
+            data_ptr.cast::<LeafKVMeta>().add(pos).write(new_meta);
+            let pair_ptr = data_ptr.add(offset as usize);
             std::ptr::copy_nonoverlapping(
                 key[self.prefix_len as usize..].as_ptr(),
                 pair_ptr,
@@ -1278,15 +1492,14 @@ impl LeafNode {
 
         let starting_kv_idx = if cache_only { 0 } else { FENCE_KEY_CNT };
 
+        let mut key_buffer = Vec::new();
         for i in 0..sibling_cnt {
             let kv_meta = self.get_kv_meta((new_cur_count + i) as usize + starting_kv_idx);
             if kv_meta.op_type() == OpType::Delete {
                 // skip deleted records.
                 continue;
             }
-            let key = self.get_full_key(kv_meta);
-            let value = self.get_value(kv_meta);
-            let insert_rt = sibling.insert(&key, value, OpType::Insert, 0);
+            let insert_rt = sibling.append_from(self, kv_meta, OpType::Insert, &mut key_buffer);
             assert!(insert_rt);
         }
 
@@ -1363,15 +1576,14 @@ impl LeafNode {
 
         let starting_kv_index = if cache_only { 0 } else { FENCE_KEY_CNT };
 
+        let mut key_buffer = Vec::new();
         for i in 0..sibling_cnt {
             let kv_meta = self.get_kv_meta((new_cur_count + i) as usize + starting_kv_index);
             if kv_meta.op_type() == OpType::Delete {
                 // skip deleted records
                 continue;
             }
-            let key = self.get_full_key(kv_meta);
-            let value = self.get_value(kv_meta);
-            let insert_rt = sibling.insert(&key, value, OpType::Insert, 0);
+            let insert_rt = sibling.append_from(self, kv_meta, OpType::Insert, &mut key_buffer);
             assert!(insert_rt);
         }
 
@@ -1403,32 +1615,30 @@ impl LeafNode {
         skip_key: Option<&[u8]>,
         snapshot_version: u64,
     ) {
-        let mut pairs = Vec::new();
+        // Keep owned scratch data before initialize overwrites the page. Packing
+        // keys and values into one buffer avoids two heap allocations per record.
+        let mut pairs = Vec::with_capacity(self.meta.meta_count_without_fence() as usize);
+        let payload_len = self
+            .meta_iter()
+            .map(|meta| meta.get_key_len() as usize + meta.value_len() as usize)
+            .sum();
+        let mut payload = Vec::with_capacity(payload_len);
+        let prefix = self.get_prefix();
 
         for meta in self.meta_iter() {
-            if skip_tombstone && meta.op_type() == OpType::Delete {
+            if skip_tombstone && meta.op_type().is_absent() {
                 // Skip tombstone values.
                 continue;
             }
 
-            match skip_key {
-                // Skip the record with the skip_key
-                Some(s_k) => {
-                    let k = self.get_full_key(meta);
-                    let cmp = s_k.cmp(&k);
-
-                    if cmp != Ordering::Equal {
-                        pairs.push((k, self.get_value(meta).to_owned(), meta.op_type()));
-                    }
-                }
-                None => {
-                    pairs.push((
-                        self.get_full_key(meta),
-                        self.get_value(meta).to_owned(),
-                        meta.op_type(),
-                    ));
-                }
+            if skip_key.is_some_and(|key| self.key_cmp(meta, key) == Ordering::Equal) {
+                continue;
             }
+
+            payload.extend_from_slice(prefix);
+            payload.extend_from_slice(self.get_remaining_key(meta));
+            payload.extend_from_slice(self.get_value(meta));
+            pairs.push((meta.get_key_len(), meta.value_len(), meta.op_type()));
         }
 
         let has_fence = self.has_fence();
@@ -1454,11 +1664,17 @@ impl LeafNode {
             snapshot_version,
         );
 
-        for (key, value, op_type) in pairs {
-            let rt = if op_type == OpType::Delete {
-                self.insert(&key, &value, OpType::Delete, 0)
+        let mut payload = payload.as_slice();
+        for (key_len, value_len, op_type) in pairs {
+            let (key, rest) = payload.split_at(key_len as usize);
+            let (value, rest) = rest.split_at(value_len as usize);
+            payload = rest;
+            let rt = if op_type.is_absent() {
+                // Clean tombstones must remain absent too: converting Phantom
+                // to Insert/Cache would resurrect a deleted value.
+                self.append_sorted(key, value, op_type)
             } else {
-                self.insert(&key, &value, new_optype, 0)
+                self.append_sorted(key, value, new_optype)
             };
             assert!(rt);
         }
@@ -1527,26 +1743,28 @@ impl LeafNode {
     /// Copy a mini-page to a new memory location
     pub(crate) fn copy_initialize_to(
         &self,
-        dst_node: *mut LeafNode,
+        dst_node: *mut LeafNodeHeader,
         dst_size: usize,
         discard_cold_cache: bool,
         snapshot_version: u64,
     ) {
         assert!(!self.is_base_page());
         assert!(self.meta.node_size as usize <= dst_size);
-        let dst_ref = unsafe { &mut *dst_node };
-        let empty = vec![];
+        unsafe {
+            Self::init_node_with_fence(
+                dst_node.cast::<u8>(),
+                &[],
+                &[],
+                dst_size,
+                self.next_level,
+                false, // Mini-page only, thus no fence
+                self.meta.is_cache_only_leaf(),
+                snapshot_version,
+            );
+        }
+        let dst_ref = unsafe { &mut *Self::from_raw_parts(dst_node, dst_size) };
 
-        dst_ref.initialize(
-            &empty,
-            &empty,
-            dst_size,
-            self.next_level,
-            false, // Mini-page only, thus no fence
-            self.meta.is_cache_only_leaf(),
-            snapshot_version,
-        );
-
+        let mut key_buffer = Vec::new();
         for meta in self.meta_iter() {
             let op = meta.op_type();
 
@@ -1558,8 +1776,7 @@ impl LeafNode {
                 continue;
             }
 
-            let value = self.get_value(meta);
-            let rt = dst_ref.insert(&self.get_full_key(meta), value, op, 0);
+            let rt = dst_ref.append_from(self, meta, op, &mut key_buffer);
             assert!(rt);
         }
     }
@@ -1576,6 +1793,10 @@ impl LeafNode {
         cache_only: bool,
         snapshot_version: u64,
     ) {
+        assert_eq!(
+            node_size,
+            std::mem::size_of::<LeafNodeHeader>() + self.data.len()
+        );
         // The initial version of a page is marked as not changed
         self.snapshot_version = snapshot_version & Self::LEAF_SNAPSHOT_VERSION_MASK;
 
@@ -1658,6 +1879,9 @@ impl LeafNode {
     }
 
     /// Read by key.
+    // Let call sites discard unused DST length metadata and specialize the
+    // binary/linear search choice without an extra wide-reference call boundary.
+    #[inline]
     #[must_use]
     pub(crate) fn read_by_key_inner(
         &self,
@@ -1666,10 +1890,13 @@ impl LeafNode {
         binary_search: bool,
     ) -> LeafReadResult {
         let val_count = self.meta.meta_count_with_fence();
-        let pos = if binary_search {
-            self.lower_bound(search_key)
+        let (pos, found) = if binary_search {
+            self.lower_bound_with_match(search_key)
         } else {
-            self.linear_lower_bound(search_key)
+            let pos = self.linear_lower_bound(search_key);
+            let found = pos < val_count
+                && self.key_cmp(self.get_kv_meta(pos as usize), search_key) == Ordering::Equal;
+            (pos, found)
         };
 
         if pos >= val_count {
@@ -1678,27 +1905,20 @@ impl LeafNode {
         }
 
         let kv_meta = self.get_kv_meta(pos as usize);
-        let target_key = self.get_remaining_key(kv_meta);
-
-        // If the key is not already referenced, we need to mark it as referenced.
-        if !kv_meta.is_referenced() {
-            kv_meta.mark_as_ref();
-        }
-
-        let input_post_key = &search_key[self.prefix_len as usize..];
-        let cmp = target_key.cmp(input_post_key);
-
-        if cmp != Ordering::Equal {
+        if !found {
             counter!(LeafNotFoundDueToKey);
             LeafReadResult::NotFound
         } else {
+            // Only a matching lookup should affect the second-chance eviction state.
+            // Marking the next greater key on every miss pollutes the cache under
+            // negative-read-heavy workloads.
+            let value_len = kv_meta.mark_referenced_and_value_len();
             if kv_meta.op_type().is_absent() {
                 return LeafReadResult::Deleted;
             }
-            let val_len = kv_meta.value_len();
-            let val_ref = self.get_value(kv_meta);
-            debug_assert_eq!(val_len as usize, val_ref.len());
-            out_buffer[..val_len as usize].copy_from_slice(val_ref);
+            let val_ref = self.get_value_with_len(kv_meta, value_len);
+            let val_len = val_ref.len();
+            out_buffer[..val_len].copy_from_slice(val_ref);
             LeafReadResult::Found(val_len as u32)
         }
     }
@@ -1714,7 +1934,7 @@ impl LeafNode {
         cache_only: bool,
     ) -> usize {
         let mut initial_record_size = key_len + value_len + std::mem::size_of::<LeafKVMeta>();
-        initial_record_size += std::mem::size_of::<LeafNode>();
+        initial_record_size += std::mem::size_of::<LeafNodeHeader>();
 
         if let Some(s) = page_classes[0..(page_classes.len() - 1)]
             .iter()
@@ -1761,10 +1981,11 @@ impl LeafNode {
     }
 
     /// Currently free node can only be called with base node. Mini page should be freed differently.
-    pub(crate) fn free_base_page(node: *mut LeafNode) {
-        assert!(unsafe { &*node }.is_base_page());
+    pub(crate) fn free_base_page(node: *mut LeafNodeHeader) {
+        assert!(unsafe { &*Self::from_initialized_ptr(node) }.is_base_page());
         let node_size = unsafe { &*node }.meta.node_size as usize;
-        let layout = Layout::from_size_align(node_size, std::mem::align_of::<LeafNode>()).unwrap();
+        let layout =
+            Layout::from_size_align(node_size, std::mem::align_of::<LeafNodeHeader>()).unwrap();
         unsafe {
             std::alloc::dealloc(node as *mut u8, layout);
         }
@@ -1893,6 +2114,9 @@ impl LeafNode {
         }
     }
 
+    // Keep the bounded leaf view local to the scan operation, so unused DST
+    // metadata need not be passed through a separate call on every record.
+    #[inline]
     pub(crate) fn get_record_by_pos_with_bound(
         &self,
         pos: u32,
@@ -1906,54 +2130,45 @@ impl LeafNode {
 
         let meta = self.get_kv_meta(pos as usize);
 
+        if let Some(bound_key) = bound_key {
+            if self.key_cmp(meta, bound_key) == Ordering::Greater {
+                return GetScanRecordByPosResult::BoundKeyExceeded;
+            }
+        }
+
         if meta.op_type().is_absent() {
             return GetScanRecordByPosResult::Deleted;
         }
 
         match return_field {
             ScanReturnField::Value => {
-                if let Some(bk) = bound_key {
-                    let cmp = self.get_full_key(meta).as_slice().cmp(bk);
-                    if cmp == Ordering::Greater {
-                        return GetScanRecordByPosResult::BoundKeyExceeded;
-                    }
-                }
-
                 let value = self.get_value(meta);
-                let value_len = meta.value_len() as usize;
+                let value_len = value.len();
                 out_buffer[..value_len].copy_from_slice(value);
                 GetScanRecordByPosResult::Found(0, value_len as u32)
             }
             ScanReturnField::Key => {
-                let full_key = self.get_full_key(meta);
-
-                if let Some(bk) = bound_key {
-                    let cmp = full_key.as_slice().cmp(bk);
-                    if cmp == Ordering::Greater {
-                        return GetScanRecordByPosResult::BoundKeyExceeded;
-                    }
-                }
-
-                let key_len = full_key.len();
-                out_buffer[..key_len].copy_from_slice(&full_key);
+                let key_len = self.copy_full_key_to(meta, out_buffer);
                 GetScanRecordByPosResult::Found(key_len as u32, 0)
             }
             ScanReturnField::KeyAndValue => {
-                let full_key = self.get_full_key(meta);
-
-                if let Some(bk) = bound_key {
-                    let cmp = full_key.as_slice().cmp(bk);
-                    if cmp == Ordering::Greater {
-                        return GetScanRecordByPosResult::BoundKeyExceeded;
-                    }
-                }
-
-                let key_len = full_key.len();
-                let value = self.get_value(meta);
+                let key_len = meta.get_key_len() as usize;
+                let prefix_len = self.prefix_len as usize;
                 let value_len = meta.value_len() as usize;
-
-                out_buffer[..key_len].copy_from_slice(&full_key);
-                out_buffer[key_len..key_len + value_len].copy_from_slice(value);
+                // The stored key suffix and value are one initialized,
+                // contiguous record. Copy them together instead of issuing
+                // separate small copies for every scanned record.
+                let record_len = key_len - prefix_len + value_len;
+                let record = unsafe {
+                    std::slice::from_raw_parts(
+                        self.data_ptr().add(meta.get_offset() as usize),
+                        record_len,
+                    )
+                };
+                if prefix_len != 0 {
+                    out_buffer[..prefix_len].copy_from_slice(self.get_prefix());
+                }
+                out_buffer[prefix_len..key_len + value_len].copy_from_slice(record);
 
                 GetScanRecordByPosResult::Found(key_len as u32, value_len as u32)
             }
@@ -2030,6 +2245,10 @@ mod tests {
         assert_eq!(meta.preview_bytes, [3, 4]);
         assert_eq!(meta.op_type(), OpType::Insert);
         assert!(!meta.is_referenced());
+
+        let meta = LeafKVMeta::make_prefixed_meta(0, u16::MAX, &key, 0, OpType::Cache);
+        assert_eq!(meta.value_len(), VALUE_LEN_MASK);
+        assert!(!meta.is_referenced());
     }
 
     #[test]
@@ -2086,6 +2305,85 @@ mod tests {
         assert!(meta.is_deleted());
     }
 
+    #[test]
+    fn prefixed_key_comparison_handles_short_keys_and_deleted_scan_bound() {
+        let page_ptr = LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION);
+        let page = unsafe { &mut *LeafNode::from_raw_parts(page_ptr, 4096) };
+        page.initialize(
+            b"prefix-a",
+            b"prefix-z",
+            4096,
+            MiniPageNextLevel::new_null(),
+            true,
+            false,
+            crate::snapshot::INVALID_SNAPSHOT_VERSION,
+        );
+        assert!(page.insert(b"prefix-m", b"value", OpType::Insert, 32));
+
+        let record_pos = page.first_meta_pos_after_fence() as u32;
+        let meta = page.get_kv_meta(record_pos as usize);
+        assert_eq!(page.key_cmp(meta, b"pre"), Ordering::Greater);
+        assert_eq!(page.key_cmp(meta, b"prefix-m"), Ordering::Equal);
+        assert_eq!(page.key_cmp(meta, b"prefix-z"), Ordering::Less);
+        assert_eq!(page.lower_bound(b"pre"), record_pos as u16);
+
+        let mut read_out = [0u8; 32];
+        assert_eq!(
+            page.read_by_key(b"prefix-l", &mut read_out),
+            LeafReadResult::NotFound
+        );
+        assert!(!meta.is_referenced());
+        assert_eq!(
+            page.read_by_key(b"prefix-m", &mut read_out),
+            LeafReadResult::Found(5)
+        );
+        assert!(meta.is_referenced());
+        assert_eq!(&read_out[..5], b"value");
+
+        let mut out = [0u8; 32];
+        let result =
+            page.get_record_by_pos_with_bound(record_pos, &mut out, ScanReturnField::Key, &None);
+        assert!(matches!(result, GetScanRecordByPosResult::Found(8, 0)));
+        assert_eq!(&out[..8], b"prefix-m");
+
+        assert_eq!(page.prefix_len, 7);
+        out.fill(0xA5);
+        let result = page.get_record_by_pos_with_bound(
+            record_pos,
+            &mut out,
+            ScanReturnField::KeyAndValue,
+            &None,
+        );
+        assert!(matches!(result, GetScanRecordByPosResult::Found(8, 5)));
+        assert_eq!(&out[..13], b"prefix-mvalue");
+        assert_eq!(&out[13..], &[0xA5; 19]);
+
+        // A shorter update leaves old bytes after the live value in the page.
+        // Scanning must copy only the current suffix and value length.
+        assert!(page.insert(b"prefix-m", b"ok", OpType::Insert, 32));
+        out.fill(0xA5);
+        let result = page.get_record_by_pos_with_bound(
+            record_pos,
+            &mut out,
+            ScanReturnField::KeyAndValue,
+            &None,
+        );
+        assert!(matches!(result, GetScanRecordByPosResult::Found(8, 2)));
+        assert_eq!(&out[..10], b"prefix-mok");
+        assert_eq!(&out[10..], &[0xA5; 22]);
+
+        page.get_kv_meta_mut(record_pos as usize).mark_as_deleted();
+        let result = page.get_record_by_pos_with_bound(
+            record_pos,
+            &mut out,
+            ScanReturnField::Key,
+            &Some(b"pre".to_vec()),
+        );
+        assert!(matches!(result, GetScanRecordByPosResult::BoundKeyExceeded));
+
+        LeafNode::free_base_page(page_ptr);
+    }
+
     /// This test verifies that the merge split key divides
     /// the combined records of the base page (self) and its
     /// to-be-merged mini-page in half
@@ -2097,12 +2395,10 @@ mod tests {
         #[case] mini_page_values: Vec<usize>,
         #[case] splitting_key: usize,
     ) {
-        let base = unsafe {
-            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
-        };
-        let mini = unsafe {
-            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
-        }; // Using base page as substitute
+        let base_ptr = LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION);
+        let base = unsafe { &mut *LeafNode::from_raw_parts(base_ptr, 4096) };
+        let mini_ptr = LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION);
+        let mini = unsafe { &mut *LeafNode::from_raw_parts(mini_ptr, 4096) }; // Using base page as substitute
 
         // Insert values to base page and mini page accordingly
         for i in 0..base_page_values.len() {
@@ -2127,12 +2423,13 @@ mod tests {
 
         // Find the splitting key
         let merge_split_key_byte = base.get_merge_split_key(mini);
-        let merge_splitting_key = cast_slice::<u8, usize>(&merge_split_key_byte);
+        // Serialized key bytes have byte alignment, not usize alignment.
+        let merge_splitting_key = usize::from_ne_bytes(merge_split_key_byte.try_into().unwrap());
 
-        assert_eq!(merge_splitting_key[0], splitting_key);
+        assert_eq!(merge_splitting_key, splitting_key);
 
-        LeafNode::free_base_page(base);
-        LeafNode::free_base_page(mini);
+        LeafNode::free_base_page(base_ptr);
+        LeafNode::free_base_page(mini_ptr);
     }
 
     /// This test verifies that a base page is correctly split
@@ -2144,12 +2441,10 @@ mod tests {
     #[case(vec![1], 2)]
     #[case(vec![2], 2)]
     fn test_split_with_key(#[case] base_page_values: Vec<usize>, #[case] splitting_key: usize) {
-        let base = unsafe {
-            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
-        };
-        let sibling = unsafe {
-            &mut *LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION)
-        };
+        let base_ptr = LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION);
+        let base = unsafe { &mut *LeafNode::from_raw_parts(base_ptr, 4096) };
+        let sibling_ptr = LeafNode::make_base_page(4096, crate::snapshot::INVALID_SNAPSHOT_VERSION);
+        let sibling = unsafe { &mut *LeafNode::from_raw_parts(sibling_ptr, 4096) };
 
         // Insert values to base page
         for i in 0..base_page_values.len() {
@@ -2194,7 +2489,7 @@ mod tests {
             assert_eq!(&out_buffer[0..key.len()], key);
         }
 
-        LeafNode::free_base_page(base);
-        LeafNode::free_base_page(sibling);
+        LeafNode::free_base_page(base_ptr);
+        LeafNode::free_base_page(sibling_ptr);
     }
 }

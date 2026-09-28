@@ -1,12 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#[cfg(not(all(feature = "shuttle", test)))]
-use rand::Rng;
-
-#[cfg(all(feature = "shuttle", test))]
-use shuttle::rand::Rng;
-
 use cfg_if::cfg_if;
 
 cfg_if! {
@@ -26,8 +20,8 @@ use crate::{
     mini_page_op::{upgrade_to_full_page, LeafEntryXLocked, LeafOperations, ReadResult},
     nodes::{
         leaf_node::{LeafKVMeta, LeafReadResult, MiniPageNextLevel, OpType},
-        InnerNode, InnerNodeBuilder, LeafNode, PageID, CACHE_LINE_SIZE, DISK_PAGE_SIZE,
-        INNER_NODE_SIZE, MAX_KEY_LEN, MAX_LEAF_PAGE_SIZE, MAX_VALUE_LEN,
+        InnerNode, InnerNodeBuilder, LeafNode, LeafNodeHeader, PageID, CACHE_LINE_SIZE,
+        DISK_PAGE_SIZE, INNER_NODE_SIZE, MAX_KEY_LEN, MAX_LEAF_PAGE_SIZE, MAX_VALUE_LEN,
     },
     range_scan::{ScanIter, ScanIterMut, ScanReturnField},
     snapshot::{CPRSnapShotMgr, PhaseId},
@@ -36,7 +30,7 @@ use crate::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    utils::{get_rng, inner_lock::ReadGuard, Backoff, BfsVisitor, NodeInfo},
+    utils::{inner_lock::ReadGuard, random_range, Backoff, BfsVisitor, NodeInfo},
     wal::{WriteAheadLog, WriteOp},
     Config, StorageBackend,
 };
@@ -114,7 +108,7 @@ impl BfTree {
 
     /// Create the size classes of all memory pages in acending order based on the record size (key + value) and the leaf page size
     /// [s_0, s_1, ..., s_x], ascending order.
-    /// Each s_i is of size 2^i * c + size_of(LeafNode)
+    /// Each s_i is of size 2^i * c + size_of(LeafNodeHeader)
     /// where c = (min_record_size + LeafKVMeta) aligned on CACHE_LINE_SIZE and 2^i * c <= leaf_page_size and s_x = leaf_page_size
     ///
     /// In non cache-only mode, the largest mini page size is s_(x-1) and full page/leaf base page size is s_x.
@@ -196,9 +190,9 @@ impl BfTree {
 
             assert!(
                 leaf_page_size_in_byte
-                    >= 2 * max_record_size_with_meta + std::mem::size_of::<LeafNode>(),
+                    >= 2 * max_record_size_with_meta + std::mem::size_of::<LeafNodeHeader>(),
                 "cb_max_record_size of config should be <= {}",
-                (leaf_page_size_in_byte - std::mem::size_of::<LeafNode>()) / 2
+                (leaf_page_size_in_byte - std::mem::size_of::<LeafNodeHeader>()) / 2
                     - std::mem::size_of::<LeafKVMeta>()
             );
         } else {
@@ -210,10 +204,11 @@ impl BfTree {
             max_mini_page_size = (max_mini_page_size / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
 
             assert!(
-                max_mini_page_size >= max_record_size_with_meta + std::mem::size_of::<LeafNode>(),
+                max_mini_page_size
+                    >= max_record_size_with_meta + std::mem::size_of::<LeafNodeHeader>(),
                 "cb_max_record_size of config should be <= {}",
                 max_mini_page_size
-                    - std::mem::size_of::<LeafNode>()
+                    - std::mem::size_of::<LeafNodeHeader>()
                     - std::mem::size_of::<LeafKVMeta>()
             );
         }
@@ -227,7 +222,7 @@ impl BfTree {
 
         // No need to consider fence here as mini-pages have no fences.
         let mut size_class =
-            base.pow(record_num_per_page_exp) as usize * c + std::mem::size_of::<LeafNode>();
+            base.pow(record_num_per_page_exp) as usize * c + std::mem::size_of::<LeafNodeHeader>();
 
         // Memory page size is aligned on cache line size
         if !size_class.is_multiple_of(CACHE_LINE_SIZE) {
@@ -242,8 +237,8 @@ impl BfTree {
             }
 
             record_num_per_page_exp += 1;
-            size_class =
-                base.pow(record_num_per_page_exp) as usize * c + std::mem::size_of::<LeafNode>();
+            size_class = base.pow(record_num_per_page_exp) as usize * c
+                + std::mem::size_of::<LeafNodeHeader>();
 
             if !size_class.is_multiple_of(CACHE_LINE_SIZE) {
                 size_class = (size_class / CACHE_LINE_SIZE + 1) * CACHE_LINE_SIZE;
@@ -348,7 +343,7 @@ impl BfTree {
                 true,
                 snapshot_guard.snapshot_version(),
             );
-            let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
+            let new_mini_ptr = mini_page_guard.as_ptr().cast::<LeafNodeHeader>();
             let mini_loc = PageLocation::Mini(new_mini_ptr);
 
             let (root_id, root_lock) = leaf_storage
@@ -455,11 +450,13 @@ impl BfTree {
     }
 
     pub(crate) fn should_promote_read(&self) -> bool {
-        get_rng().random_range(0..100) < self.config.read_promotion_rate.load(Ordering::Relaxed)
+        let rate = self.config.read_promotion_rate.load(Ordering::Relaxed);
+        rate >= 100 || (rate != 0 && random_range(0..100) < rate)
     }
 
     pub(crate) fn should_promote_scan_page(&self) -> bool {
-        get_rng().random_range(0..100) < self.config.scan_promotion_rate.load(Ordering::Relaxed)
+        let rate = self.config.scan_promotion_rate.load(Ordering::Relaxed);
+        rate >= 100 || (rate != 0 && random_range(0..100) < rate)
     }
 
     /// Chance% to promote a base read record to mini page.
@@ -509,7 +506,8 @@ impl BfTree {
                                 let root_page_loc = cur_page.get_page_location().clone();
                                 match root_page_loc {
                                     PageLocation::Mini(ptr) => {
-                                        let root_page = cur_page.load_cache_page_mut(ptr);
+                                        let root_page =
+                                            unsafe { cur_page.load_cache_page_mut(ptr) };
                                         if root_page.get_clean_snapshot_version()
                                             < local_thread_snapshot_version
                                         {
@@ -540,7 +538,8 @@ impl BfTree {
                                 let root_page_loc = cur_page.get_page_location().clone();
                                 match root_page_loc {
                                     PageLocation::Mini(ptr) => {
-                                        let root_page = cur_page.load_cache_page_mut(ptr);
+                                        let root_page =
+                                            unsafe { cur_page.load_cache_page_mut(ptr) };
                                         if root_page.get_clean_snapshot_version()
                                             > local_thread_snapshot_version
                                         {
@@ -567,20 +566,16 @@ impl BfTree {
                                 let root_page_loc = cur_page.get_page_location().clone();
                                 match root_page_loc {
                                     PageLocation::Mini(ptr) => {
-                                        let root_page = cur_page.load_cache_page_mut(ptr);
+                                        let root_page =
+                                            unsafe { cur_page.load_cache_page_mut(ptr) };
                                         if root_page.get_clean_snapshot_version()
                                             < local_thread_snapshot_version
                                         {
-                                            let root_page_ptr = unsafe {
-                                                std::slice::from_raw_parts(
-                                                    root_page as *const LeafNode as *const u8,
-                                                    root_page.meta.node_size as usize,
-                                                )
-                                            };
+                                            let root_page_ptr = root_page.snapshot_bytes();
                                             snapshot_guard.snapshot_mini_page(
                                                 cur_page_id,
                                                 root_page_ptr,
-                                                root_page.meta.node_size as usize,
+                                                root_page_ptr.len(),
                                             );
                                             root_page.set_snapshot_version(
                                                 local_thread_snapshot_version,
@@ -600,16 +595,11 @@ impl BfTree {
                                 if root_page.get_clean_snapshot_version()
                                     < local_thread_snapshot_version
                                 {
-                                    let root_page_ptr = unsafe {
-                                        std::slice::from_raw_parts(
-                                            root_page as *const LeafNode as *const u8,
-                                            root_page.meta.node_size as usize,
-                                        )
-                                    };
+                                    let root_page_ptr = root_page.snapshot_bytes();
                                     snapshot_guard.snapshot_base_page(
                                         cur_page_id,
                                         root_page_ptr,
-                                        root_page.meta.node_size as usize,
+                                        root_page_ptr.len(),
                                     );
                                     root_page
                                         .set_snapshot_version(local_thread_snapshot_version, false);
@@ -637,7 +627,7 @@ impl BfTree {
                         true,
                         snapshot_guard.snapshot_version(),
                     );
-                    let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
+                    let new_mini_ptr = mini_page_guard.as_ptr().cast::<LeafNodeHeader>();
                     let mini_loc = PageLocation::Mini(new_mini_ptr);
 
                     // Insert the new page into mapping table
@@ -650,8 +640,13 @@ impl BfTree {
                     let cur_page_loc = cur_page.get_page_location().clone();
                     match cur_page_loc {
                         PageLocation::Mini(ptr) => {
-                            let cur_mini_page = cur_page.load_cache_page_mut(ptr);
-                            let sibling_page = unsafe { &mut *new_mini_ptr };
+                            let cur_mini_page = unsafe { cur_page.load_cache_page_mut(ptr) };
+                            let sibling_page = unsafe {
+                                &mut *LeafNode::from_raw_parts(
+                                    new_mini_ptr,
+                                    self.config.leaf_page_size,
+                                )
+                            };
                             let split_key = cur_mini_page.split(
                                 sibling_page,
                                 true,
@@ -1035,17 +1030,22 @@ impl BfTree {
                     true,
                     snapshot_guard.snapshot_version(),
                 );
-                let new_mini_ptr = mini_page_guard.as_ptr() as *mut LeafNode;
+                let new_mini_ptr = mini_page_guard.as_ptr().cast::<LeafNodeHeader>();
                 let mini_loc = PageLocation::Mini(new_mini_ptr);
 
                 leaf_entry.create_cache_page_loc(mini_loc);
 
-                let mini_page_ref = leaf_entry.load_cache_page_mut(new_mini_ptr);
+                let mini_page_ref = unsafe { leaf_entry.load_cache_page_mut(new_mini_ptr) };
                 let insert_success =
                     mini_page_ref.insert(write_op.key, write_op.value, write_op.op_type, 0);
                 assert!(insert_success);
-
                 debug_assert!(mini_page_ref.meta.meta_count_with_fence() > 0);
+
+                if let Some(wal) = &self.wal {
+                    let lsn = wal.append_and_wait(&write_op, u64::MAX);
+                    leaf_entry.update_lsn(lsn);
+                }
+
                 counter!(InsertCreatedMiniPage);
             }
             _ => {
@@ -1378,7 +1378,7 @@ impl BfTree {
         }
 
         // The start key cannot exceed the configured max key length
-        if key.len() > self.config.max_fence_len / 2 || key.len() > MAX_KEY_LEN {
+        if key.is_empty() || key.len() > self.config.max_fence_len / 2 || key.len() > MAX_KEY_LEN {
             return Err(ScanIterError::InvalidStartKey);
         }
 
@@ -1408,13 +1408,23 @@ impl BfTree {
         }
 
         // The start key cannot exceed the configured max key length
-        if start_key.len() > self.config.max_fence_len / 2 || start_key.len() > MAX_KEY_LEN {
+        if start_key.is_empty()
+            || start_key.len() > self.config.max_fence_len / 2
+            || start_key.len() > MAX_KEY_LEN
+        {
             return Err(ScanIterError::InvalidStartKey);
         }
 
         // The end key cannot exceed the configured max key length
-        if end_key.len() > self.config.max_fence_len / 2 || end_key.len() > MAX_KEY_LEN {
+        if end_key.is_empty()
+            || end_key.len() > self.config.max_fence_len / 2
+            || end_key.len() > MAX_KEY_LEN
+        {
             return Err(ScanIterError::InvalidEndKey);
+        }
+
+        if start_key > end_key {
+            return Err(ScanIterError::InvalidKeyRange);
         }
 
         Ok(ScanIterMut::new_with_end_key(
@@ -1535,10 +1545,9 @@ impl BfTree {
         let page_loc = x_leaf.get_page_location().clone();
         match page_loc {
             PageLocation::Mini(ptr) => {
-                let mini_page = x_leaf.load_cache_page_mut(ptr);
-                let h = self.storage.begin_dealloc_mini_page(mini_page)?;
+                let base_offset = x_leaf.load_cache_page(ptr).next_level;
+                let h = self.storage.begin_dealloc_mini_page(ptr)?;
                 let _merge_result = x_leaf.try_merge_mini_page(&h, parent, &self.storage)?;
-                let base_offset = mini_page.next_level;
                 x_leaf.change_to_base_loc();
                 self.storage.finish_dealloc_mini_page(h);
 
@@ -1607,11 +1616,11 @@ pub(crate) fn eviction_callback(
     mini_page_handle: &TombstoneHandle,
     tree: &BfTree,
 ) -> Result<(), TreeError> {
-    let mini_page = mini_page_handle.ptr as *mut LeafNode;
+    let mini_page = mini_page_handle.ptr.cast::<LeafNodeHeader>();
     let key_to_this_page = if tree.cache_only {
-        unsafe { &*mini_page }.try_get_key_to_reach_this_node()?
+        unsafe { &*LeafNode::from_initialized_ptr(mini_page) }.try_get_key_to_reach_this_node()?
     } else {
-        unsafe { &*mini_page }.get_key_to_reach_this_node()
+        unsafe { &*LeafNode::from_initialized_ptr(mini_page) }.get_key_to_reach_this_node()
     };
 
     // Here we need to set aggressive split to true, because we would split parent node due to leaf split.
@@ -1675,7 +1684,41 @@ pub(crate) fn eviction_callback(
 #[cfg(test)]
 mod tests {
     use crate::error::ConfigError;
-    use crate::BfTree;
+    use crate::wal::{LogEntryImpl, WriteOp};
+    use crate::{BfTree, LeafInsertResult, WalConfig, WalReader};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn cache_only_tree_can_write_wal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wal_path = temp_dir.path().join("cache-only.wal");
+        let mut wal_config = WalConfig::new(&wal_path);
+        wal_config
+            .segment_size(512)
+            .flush_interval(Duration::from_micros(1));
+
+        let mut config = crate::Config::new(":cache:", 64 * 1024);
+        config.enable_write_ahead_log(Arc::new(wal_config));
+        let tree = BfTree::with_config(config, None).unwrap();
+        assert_eq!(tree.insert(b"key", b"value"), LeafInsertResult::Success);
+        drop(tree);
+
+        let reader = WalReader::new(&wal_path, 512);
+        let entries = reader
+            .segment_iter()
+            .flat_map(|segment| {
+                segment
+                    .entry_iter()
+                    .map(|(_, data)| data.to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let op = WriteOp::read_from_buffer(&entries[0]);
+        assert_eq!(op.key, b"key");
+        assert_eq!(op.value, b"value");
+    }
 
     #[test]
     fn test_mini_page_size_classes() {

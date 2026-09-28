@@ -67,11 +67,14 @@ pub struct WriteGuard<'a> {
 }
 
 impl<'a> WriteGuard<'a> {
-    pub(crate) fn as_ref(&self) -> &'a InnerNode {
+    /// The returned reference cannot outlive the borrow of this lock guard.
+    pub(crate) fn as_ref(&self) -> &InnerNode {
         unsafe { &*self.node.get() }
     }
 
-    pub(crate) fn as_mut(&mut self) -> &'a mut InnerNode {
+    /// Keep the mutable borrow tied to the guard, so it cannot be borrowed
+    /// again or released while the returned reference is still in use.
+    pub(crate) fn as_mut(&mut self) -> &mut InnerNode {
         unsafe { &mut *self.node.get() }
     }
 
@@ -100,5 +103,40 @@ impl Drop for WriteGuard<'_> {
         self.as_mut()
             .version_lock
             .fetch_add(0b10, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodes::{InnerNodeBuilder, PageID};
+
+    #[test]
+    fn write_guard_reborrows_and_releases_the_version_lock() {
+        let test = || {
+            let mut builder = InnerNodeBuilder::new();
+            builder
+                .set_children_is_leaf(true)
+                .set_left_most_page_id(PageID::from_id(0));
+            let ptr = builder.build(crate::snapshot::INVALID_SNAPSHOT_VERSION);
+            // SAFETY: The newly allocated node is exclusively owned here, and
+            // no reference survives the test's final free_node call.
+            let node = unsafe { &*ptr.cast::<UnsafeCell<InnerNode>>() };
+            unsafe { &*std::ptr::addr_of!((*ptr).version_lock) }.store(2, Ordering::Relaxed);
+            {
+                let mut guard = WriteGuard { node };
+                guard.as_mut().disk_offset = 17;
+                assert_eq!(guard.as_ref().disk_offset, 17);
+                guard.as_mut().disk_offset = 23;
+                assert_eq!(guard.as_ref().disk_offset, 23);
+            }
+            assert_eq!(unsafe { &*ptr }.version_lock.load(Ordering::Acquire), 4);
+            assert_eq!(unsafe { &*ptr }.disk_offset, 23);
+            InnerNode::free_node(ptr);
+        };
+        #[cfg(feature = "shuttle")]
+        shuttle::check_random(test, 1);
+        #[cfg(not(feature = "shuttle"))]
+        test();
     }
 }
