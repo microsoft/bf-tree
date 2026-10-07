@@ -52,3 +52,33 @@ To snapshot, we serialize the page table to disk; nothing needs to be changed fo
 To recover, we also need to reconstruct the page table.
 Specifically, we use the `(leaf_offset, leaf_size)` pair in the metadata to read the (PageID, offset) pairs from the disk; we then use it to reconstruct the page table.
 
+## Full-cache snapshot recovery regression
+
+The native `snapshot::tests::full_cache_recovery` tests cover full cache pages
+written into a CPR snapshot's base-page section. A restored page can already
+contain `Cache` or `Phantom` records; promoting it again must preserve the
+records rather than panic on their existing cache state.
+
+The regression requirements are:
+
+- Force full-page promotion with a 100% scan promotion rate and assert that
+  cache records are present; do not depend on random promotion.
+- Exercise both snapshot sweep and writer-side capture. Snapshot guards hold
+  the writer test at known CPR phases, and the test verifies that writer-side
+  base-page capture actually occurred.
+- Compare every point lookup and the entire ordered key/value scan against an
+  independent model, including updates, deletes, recreation and new keys.
+- Repeat three snapshot/recovery cycles, exercise both cache and phantom
+  records, and verify that the live tree remains correct after capture.
+- Recover into private copies and verify that the original snapshot remains
+  unchanged.
+
+Run these bounded, non-Shuttle tests with:
+
+```text
+cargo test --release snapshot::tests::full_cache_recovery -- --test-threads=1
+```
+
+With the cache-state tolerance removed from `covert_insert_records_to_cache`,
+re-promotion should reproduce `Base page should not have op type: Cache`.
+These regressions do not replace the existing concurrent CPR/Shuttle suites.
