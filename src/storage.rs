@@ -145,9 +145,8 @@ impl PageTable {
         counter!(AllocDiskID);
         let loc = PageLocation::Base(self.vfs.alloc_offset(self.config.leaf_page_size)); // Allocate space in disk for a full leaf page
         let entry = RwLock::new(loc);
-        let (id, value) = self.table.insert(entry);
+        let (id, lock_guard) = self.table.insert_with(entry, |value| value.write());
         let pid = PageID::from_id(id);
-        let lock_guard = value.try_write().unwrap();
         let base_ptr = LeafNode::make_base_page(self.config.leaf_page_size, snapshot_version);
         let x_locked = LeafEntryXLocked::with_buffer(
             lock_guard,
@@ -178,9 +177,8 @@ impl PageTable {
             }
         }
         let entry = RwLock::new(mini_loc);
-        let (id, value) = self.table.insert(entry);
+        let (id, lock_guard) = self.table.insert_with(entry, |value| value.write());
         let pid = PageID::from_id(id);
-        let lock_guard = value.try_write().unwrap();
 
         let x_locked = LeafEntryXLocked::new(
             lock_guard,
@@ -473,6 +471,106 @@ mod tests {
                 PageLocation::Base(offset) => vfs.dealloc_offset(offset),
                 _ => unreachable!(),
             }
+        }
+    }
+
+    #[cfg(feature = "shuttle")]
+    mod allocation_publication {
+        use crate::{
+            nodes::{leaf_node::MiniPageNextLevel, LeafNode, PageID},
+            snapshot::INVALID_SNAPSHOT_VERSION,
+            storage::PageLocation,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                thread, Arc,
+            },
+            BfTree, Config,
+        };
+
+        fn check_allocation(mini_page: bool) {
+            shuttle::check_dfs(
+                move || {
+                    let mut config = Config::new(":memory:", 4096 * 4);
+                    config.cache_only(mini_page);
+                    let tree = Arc::new(BfTree::with_config(config, None).unwrap());
+                    let next_id = tree.storage.page_table.table.peek_next_id();
+                    let initialized = Arc::new(AtomicBool::new(false));
+
+                    let writer_tree = tree.clone();
+                    let writer_initialized = initialized.clone();
+                    let mut writer = Some(thread::spawn(move || {
+                        let storage = &writer_tree.storage;
+                        let mini_guard = mini_page.then(|| {
+                            storage
+                                .alloc_mini_page(storage.config.leaf_page_size)
+                                .unwrap()
+                        });
+                        let (pid, leaf) = if let Some(ref mini_guard) = mini_guard {
+                            LeafNode::initialize_mini_page(
+                                mini_guard,
+                                storage.config.leaf_page_size,
+                                MiniPageNextLevel::new_null(),
+                                true,
+                                INVALID_SNAPSHOT_VERSION,
+                            );
+                            storage
+                                .page_table
+                                .insert_mini_page_mapping(PageLocation::Mini(
+                                    mini_guard.as_ptr() as *mut LeafNode
+                                ))
+                        } else {
+                            storage
+                                .page_table
+                                .alloc_base_page_mapping(INVALID_SNAPSHOT_VERSION)
+                        };
+                        assert_eq!(pid.as_id(), next_id);
+                        writer_initialized.store(true, Ordering::Release);
+                        thread::yield_now();
+                        drop(leaf);
+                    }));
+
+                    // Snapshot sweep discovers pages through this iterator, not through the tree.
+                    for (lock, pid) in tree.storage.page_table.iter() {
+                        if pid.as_id() != next_id {
+                            continue;
+                        }
+                        // Avoid the blocking lock's spin loop under Shuttle's unfair DFS schedules.
+                        if let Ok(guard) = lock.try_read() {
+                            // The allocator must be able to finish while a published page is read.
+                            writer.take().unwrap().join().unwrap();
+                            assert!(
+                                initialized.load(Ordering::Acquire),
+                                "a published page must be write-locked until initialization finishes"
+                            );
+                            assert!(matches!(
+                                &*guard,
+                                PageLocation::Base(_) | PageLocation::Mini(_)
+                            ));
+                        }
+                    }
+                    if let Some(writer) = writer {
+                        writer.join().unwrap();
+                    }
+                    assert!(initialized.load(Ordering::Acquire));
+                    assert_eq!(tree.storage.page_table.table.peek_next_id(), next_id + 1);
+
+                    tree.storage
+                        .page_table
+                        .get_mut(&PageID::from_id(next_id))
+                        .dealloc_self(&tree.storage, mini_page);
+                },
+                Some(10_000),
+            );
+        }
+
+        #[test]
+        fn base_allocation_is_locked_before_publication() {
+            check_allocation(false);
+        }
+
+        #[test]
+        fn mini_allocation_is_locked_before_publication() {
+            check_allocation(true);
         }
     }
 }

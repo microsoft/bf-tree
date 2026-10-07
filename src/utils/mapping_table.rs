@@ -189,6 +189,16 @@ impl<T> MappingTable<T> {
     ///
     /// The id can be used to retrieve the record later using `get`.
     pub fn insert(&self, val: T) -> (u64, &T) {
+        self.insert_with(val, |record| record)
+    }
+
+    /// Initialize a record before its ID becomes visible to iterators.
+    /// The callback runs under the insertion mutex and must not reenter the table.
+    pub(crate) fn insert_with<'a, R>(
+        &'a self,
+        val: T,
+        initialize: impl FnOnce(&'a T) -> R,
+    ) -> (u64, R) {
         let mut states = self.states.lock().unwrap();
 
         let page_id = states.next_id;
@@ -196,6 +206,6 @@ impl<T> MappingTable<T> {
 
         self.set(page_id, val, &mut states);
 
-        (page_id, self.get(page_id))
+        (page_id, initialize(self.get(page_id)))
     }
 }

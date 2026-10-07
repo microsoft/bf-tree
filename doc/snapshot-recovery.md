@@ -44,6 +44,33 @@ This is done by looking up the inner mapping we just loaded; it tells us where t
 If the child ptr points to an inner node, we need to correct the child node's child pointers recursively; if it points to a leaf node, i.e., it is a page ID rather than a virtual memory address, we don't need to correct it,
 as page ID translations are handled by the page table (described below).
 
+### Allocation and snapshot sweep
+
+A newly allocated page must already be write-locked when its mapping becomes
+visible to the snapshot sweep. Publishing an unlocked mapping and then calling
+`try_write().unwrap()` allows the sweep to acquire a reader lock in between,
+causing allocation to panic. Merely changing that call to a blocking write lock
+still allows readers to observe a page before its initialization is complete.
+
+Both base-page allocation and mini-page insertion acquire the new entry's write
+lock inside `MappingTable::insert_with`, while the insertion mutex still prevents
+iterators from observing the new ID. The returned guard protects initialization
+until the caller releases it. The callback must not reenter the mapping table;
+it only locks the fresh, unpublished entry.
+
+The Shuttle regressions in `storage::tests::allocation_publication` explore up to
+10,000 schedules per allocation path. A snapshot-style iterator probes for a reader
+lock on the newly published entry and, if successful, holds it while waiting for
+allocation to finish. The nonblocking probe avoids starving the writer in an
+unfair DFS schedule. The allocator must complete without a panic or deadlock,
+and the reader must observe completed initialization. On the unfixed code, both tests reproduce the
+allocation `try_write().unwrap()` panic without relying on spurious weak-CAS
+failures.
+
+```text
+cargo test --release --features shuttle storage::tests::allocation_publication -- --test-threads=1
+```
+
 ### Leaf mapping
 Leaf mapping is a page table that maps page ID to disk offset.
 
@@ -51,4 +78,3 @@ To snapshot, we serialize the page table to disk; nothing needs to be changed fo
 
 To recover, we also need to reconstruct the page table.
 Specifically, we use the `(leaf_offset, leaf_size)` pair in the metadata to read the (PageID, offset) pairs from the disk; we then use it to reconstruct the page table.
-
