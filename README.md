@@ -136,6 +136,21 @@ cargo build --release
 cargo test
 ```
 
+Circular-buffer free-list reuse has a deterministic spurious-CAS regression.
+It exercises the production allocator with a test-only atomic wrapper and
+checks reuse and eviction without relying on hardware producing a spurious
+failure. Separate integration tests use native atomics for repeated reuse and
+capacity-pressure/wraparound coverage:
+
+```bash
+cargo test --lib circular_buffer
+cargo test --test circular_buffer_reuse
+```
+
+The injector is disabled with `shuttle`; Shuttle tests continue to use Shuttle's
+atomics. Free-list allocation must not abandon an unlinked entry on a spurious
+CAS failure, since eviction cannot remove that orphan from the list.
+
 #### Shuttle Tests
 
 Concurrent systems are nondeterministic, and subject to exponential amount of different thread interleaving. We use [shuttle](https://github.com/awslabs/shuttle)
