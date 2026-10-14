@@ -4,12 +4,19 @@
 mod freelist;
 mod metrics;
 
+#[cfg(all(test, not(feature = "shuttle")))]
+mod spurious_cas;
+#[cfg(not(all(test, not(feature = "shuttle"))))]
+use crate::sync::atomic::AtomicU8;
+#[cfg(all(test, not(feature = "shuttle")))]
+use spurious_cas::AtomicU8;
+
 use std::{cell::UnsafeCell, marker::PhantomData, sync::TryLockError};
 
 use crate::{
     circular_buffer::freelist::FreeList,
     sync::{
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Mutex, MutexGuard,
     },
     utils::Backoff,
@@ -551,8 +558,9 @@ impl CircularBuffer {
 
             assert!(old_meta.size as usize >= size);
 
-            // we need to ensure while we are allocating this, no one else is evicting it.
-            match old_meta.states.state.compare_exchange_weak(
+            // The entry is already unlinked: a spurious failure would orphan it
+            // in FreeListed state and prevent eviction from making progress.
+            match old_meta.states.state.compare_exchange(
                 MetaState::FreeListed.into(),
                 MetaState::NotReady.into(),
                 Ordering::AcqRel,
