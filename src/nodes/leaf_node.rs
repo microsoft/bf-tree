@@ -281,7 +281,9 @@ impl LeafNode {
                     meta.set_op_type(OpType::Phantom);
                 }
                 OpType::Cache | OpType::Phantom => {
-                    unreachable!("Base page should not have op type: {:?}", op_type);
+                    // Already in cache state — nothing to convert.
+                    // Mirrors convert_cache_records_to_insert, which already
+                    // tolerates the already-converted case as a no-op.
                 }
             };
 
