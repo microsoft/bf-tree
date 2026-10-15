@@ -114,12 +114,12 @@ impl<T> RwLock<T> {
     pub fn try_write(&self) -> Result<RwLockWriteGuard<'_, T>, ()> {
         let s = self.lock_val.load(Ordering::Relaxed);
         if s <= 1 {
-            match self.lock_val.compare_exchange_weak(
-                s,
-                u32::MAX,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
+            // Callers may rely on success for an uncontended fresh entry.
+            // A single weak CAS can fail even when no other thread holds it.
+            match self
+                .lock_val
+                .compare_exchange(s, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
+            {
                 Ok(_) => return Ok(RwLockWriteGuard { lock: self }),
                 Err(_) => return Err(()),
             }

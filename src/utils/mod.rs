@@ -8,7 +8,8 @@ pub(crate) mod rw_lock;
 pub(crate) mod stats;
 pub(crate) mod test_util;
 
-use std::cell::UnsafeCell;
+#[cfg(not(all(feature = "shuttle", test)))]
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{cell::Cell, fmt};
@@ -89,23 +90,18 @@ impl Default for Backoff {
     }
 }
 
-use std::rc::Rc;
-
+#[cfg(not(all(feature = "shuttle", test)))]
 use rand::rngs::SmallRng;
-use rand::{RngCore, SeedableRng};
+#[cfg(not(all(feature = "shuttle", test)))]
+use rand::{Rng, SeedableRng};
 
 use crate::nodes::PageID;
 use crate::BfTree;
 use inner_lock::ReadGuard;
 
-pub struct SmallThreadRng {
-    rng: Rc<UnsafeCell<rand::rngs::SmallRng>>,
-}
-
 #[cfg(not(all(feature = "shuttle", test)))]
-pub(crate) fn get_rng() -> SmallThreadRng {
-    let rng = THREAD_RNG_KEY.with(|t| t.clone());
-    SmallThreadRng { rng }
+pub(crate) fn random_range(range: std::ops::Range<usize>) -> usize {
+    THREAD_RNG_KEY.with(|rng| rng.borrow_mut().random_range(range))
 }
 
 pub(crate) fn thread_id_to_u64(tid: std::thread::ThreadId) -> u64 {
@@ -114,51 +110,17 @@ pub(crate) fn thread_id_to_u64(tid: std::thread::ThreadId) -> u64 {
     hasher.finish()
 }
 
+#[cfg(not(all(feature = "shuttle", test)))]
 thread_local! {
     // Initialize a thread-local SmallRng
-    static THREAD_RNG_KEY: Rc<UnsafeCell<SmallRng>> = Rc::new( UnsafeCell::new( SmallRng::seed_from_u64(
+    static THREAD_RNG_KEY: RefCell<SmallRng> = RefCell::new(SmallRng::seed_from_u64(
         thread_id_to_u64(std::thread::current().id())
-    )));
-}
-
-impl RngCore for SmallThreadRng {
-    #[inline(always)]
-    fn next_u32(&mut self) -> u32 {
-        // SAFETY: We must make sure to stop using `rng` before anyone else
-        // creates another mutable reference
-        let rng = unsafe { &mut *self.rng.get() };
-        rng.next_u32()
-    }
-
-    #[inline(always)]
-    fn next_u64(&mut self) -> u64 {
-        // SAFETY: We must make sure to stop using `rng` before anyone else
-        // creates another mutable reference
-        let rng = unsafe { &mut *self.rng.get() };
-        rng.next_u64()
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        // SAFETY: We must make sure to stop using `rng` before anyone else
-        // creates another mutable reference
-        let rng = unsafe { &mut *self.rng.get() };
-        rng.fill_bytes(dest)
-    }
+    ));
 }
 
 #[cfg(all(feature = "shuttle", test))]
-pub(crate) fn get_rng() -> ShuttleThreadRng {
-    ShuttleThreadRng(shuttle::rand::thread_rng())
-}
-
-#[cfg(all(feature = "shuttle", test))]
-pub(crate) struct ShuttleThreadRng(shuttle::rand::rngs::ThreadRng);
-
-#[cfg(all(feature = "shuttle", test))]
-impl ShuttleThreadRng {
-    pub(crate) fn random_range(&mut self, range: std::ops::Range<usize>) -> usize {
-        shuttle::rand::Rng::gen_range(&mut self.0, range)
-    }
+pub(crate) fn random_range(range: std::ops::Range<usize>) -> usize {
+    shuttle::rand::Rng::gen_range(&mut shuttle::rand::thread_rng(), range)
 }
 
 pub(crate) enum NodeInfo {

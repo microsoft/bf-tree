@@ -6,14 +6,9 @@ use std::{
     path::PathBuf,
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
-
 use crate::counter;
 
-use super::{OffsetAlloc, VfsImpl};
+use super::{read_exact_at, write_all_at, OffsetAlloc, VfsImpl};
 
 pub(crate) struct StdVfs {
     file: File,
@@ -53,32 +48,18 @@ impl VfsImpl for StdVfs {
         self.offset_alloc.dealloc_offset(offset)
     }
 
-    #[cfg(unix)]
     fn read(&self, offset: usize, buf: &mut [u8]) {
         counter!(IOReadRequest);
-        self.file.read_at(buf, offset as u64).unwrap();
-    }
-
-    #[cfg(windows)]
-    fn read(&self, offset: usize, buf: &mut [u8]) {
-        counter!(IOReadRequest);
-        self.file.seek_read(buf, offset as u64).unwrap();
+        read_exact_at(&self.file, buf, offset as u64).unwrap();
     }
 
     fn flush(&self) {
         self.file.sync_all().unwrap();
     }
 
-    #[cfg(unix)]
     fn write(&self, offset: usize, buf: &[u8]) {
         counter!(IOWriteRequest);
-        self.file.write_at(buf, offset as u64).unwrap();
-    }
-
-    #[cfg(windows)]
-    fn write(&self, offset: usize, buf: &[u8]) {
-        counter!(IOWriteRequest);
-        self.file.seek_write(buf, offset as u64).unwrap();
+        write_all_at(&self.file, buf, offset as u64).unwrap();
     }
 
     fn reset(&self) {

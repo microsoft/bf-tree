@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::nodes::LeafNode;
+use crate::nodes::{LeafNode, LeafNodeHeader};
 use crate::snapshot::INVALID_SNAPSHOT_VERSION;
 
 use super::VfsImpl;
@@ -40,6 +40,6 @@ impl VfsImpl for MemoryVfs {
     }
 
     fn dealloc_offset(&self, offset: usize) {
-        LeafNode::free_base_page(offset as *mut LeafNode);
+        LeafNode::free_base_page(offset as *mut LeafNodeHeader);
     }
 }

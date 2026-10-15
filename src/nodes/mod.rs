@@ -7,7 +7,7 @@ mod node_meta;
 mod page_id;
 
 pub(crate) use inner_node::{InnerNode, InnerNodeBuilder, INVALID_DISK_OFFSET};
-pub(crate) use leaf_node::LeafNode;
+pub(crate) use leaf_node::{LeafNode, LeafNodeHeader};
 pub(crate) use page_id::PageID;
 
 pub(crate) const INNER_NODE_SIZE: usize = 4096;

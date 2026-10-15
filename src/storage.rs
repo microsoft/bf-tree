@@ -16,7 +16,7 @@ use crate::{
     error::TreeError,
     fs::{MemoryVfs, StdVfs, VfsImpl},
     mini_page_op::{LeafEntrySLocked, LeafEntryXLocked},
-    nodes::{LeafNode, PageID},
+    nodes::{LeafNode, LeafNodeHeader, PageID},
     snapshot::CPRSnapShotMgr,
     utils::{rw_lock::RwLock, MappingTable},
     Config, StorageBackend,
@@ -25,11 +25,15 @@ use std::{path::Path, sync::Arc};
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) enum PageLocation {
-    Mini(*mut LeafNode),
-    Full(*mut LeafNode), // full pages are in memory
+    Mini(*mut LeafNodeHeader),
+    Full(*mut LeafNodeHeader), // full pages are in memory
     Base(usize),
     Null,
 }
+
+// Bound metadata belongs to temporary leaf references, not every page-table
+// entry. Keep the mapping's footprint unchanged by the DST representation.
+const _: () = assert!(std::mem::size_of::<PageLocation>() == 2 * std::mem::size_of::<usize>());
 
 impl From<CircularBufferError> for TreeError {
     fn from(value: CircularBufferError) -> Self {
@@ -284,9 +288,12 @@ impl LeafStorage {
 
     /// Returns the dealloc handle.
     /// Errors on contention
+    /// `mini_page` must be the allocation pointer retained in the page table or
+    /// allocation guard, not a pointer reborrowed from a leaf reference: allocator
+    /// metadata immediately precedes the leaf's own borrowing range.
     pub(crate) fn begin_dealloc_mini_page(
         &self,
-        mini_page: *mut LeafNode,
+        mini_page: *mut LeafNodeHeader,
     ) -> Result<TombstoneHandle, TreeError> {
         match unsafe {
             self.circular_buffer
@@ -301,8 +308,9 @@ impl LeafStorage {
     pub(crate) fn finish_dealloc_mini_page(&self, mini_page: TombstoneHandle) {
         #[cfg(debug_assertions)]
         {
-            let mini_page_ref = unsafe { &*(mini_page.ptr as *mut LeafNode) };
-            let size = mini_page_ref.meta.node_size;
+            let size = unsafe {
+                std::ptr::addr_of!((*mini_page.ptr.cast::<LeafNodeHeader>()).meta.node_size).read()
+            };
             unsafe {
                 std::ptr::write_bytes(mini_page.ptr, 0, size as usize);
             }
@@ -342,35 +350,29 @@ impl LeafStorage {
     ) -> Result<CircularBufferPtr<'_>, TreeError> {
         let new_page = self.circular_buffer.alloc(size)?;
 
-        let mini_page_ptr = mini_page.ptr as *mut LeafNode;
-        let snapshot_ver = unsafe { &*mini_page_ptr }.get_clean_snapshot_version();
-        unsafe { &*mini_page_ptr }.copy_initialize_to(
-            new_page.as_ptr() as *mut LeafNode,
+        let mini_page_ptr = mini_page.ptr.cast::<LeafNodeHeader>();
+        let src_ref = unsafe { &*LeafNode::from_initialized_ptr(mini_page_ptr) };
+        let snapshot_ver = src_ref.get_clean_snapshot_version();
+        let snapshot_changed = src_ref.is_snapshot_version_changed();
+        src_ref.copy_initialize_to(
+            new_page.as_ptr().cast::<LeafNodeHeader>(),
             size,
             true,
             snapshot_ver,
         );
 
         // Ensure snapshot version does not change
-        let dst_ref = unsafe { &mut *(new_page.as_ptr() as *mut LeafNode) };
-        dst_ref.set_snapshot_version(
-            unsafe { &mut *(mini_page_ptr) }.get_clean_snapshot_version(),
-            false,
-        );
+        let dst_ref = unsafe {
+            &mut *LeafNode::from_raw_parts(new_page.as_ptr().cast::<LeafNodeHeader>(), size)
+        };
+        dst_ref.set_snapshot_version(snapshot_ver, false);
 
-        if unsafe { &*mini_page_ptr }.is_snapshot_version_changed() {
+        if snapshot_changed {
             dst_ref.set_snapshot_version_changed_flag();
         }
 
+        debug_assert!(dst_ref.meta.meta_count_with_fence() > 0);
         self.circular_buffer.dealloc(mini_page);
-        unsafe {
-            debug_assert!(
-                (&*(new_page.as_ptr() as *mut LeafNode))
-                    .meta
-                    .meta_count_with_fence()
-                    > 0
-            );
-        }
         Ok(new_page)
     }
 }

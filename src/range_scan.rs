@@ -142,84 +142,84 @@ impl<'b> ScanIterMut<'_, 'b> {
     }
 
     pub fn next(&mut self, out_buffer: &mut [u8]) -> Option<(usize, usize)> {
-        if self.scan_cnt == 0 && self.end_key.is_none() {
-            return None;
-        }
-
-        match self.leaf_lock.scan_record_by_pos_with_bound(
-            &self.scan_position,
-            out_buffer,
-            self.return_field,
-            &self.end_key,
-        ) {
-            GetScanRecordByPosResult::Deleted => {
-                self.scan_position.move_to_next();
-                self.next(out_buffer)
+        loop {
+            if self.scan_cnt == 0 {
+                return None;
             }
-            GetScanRecordByPosResult::Found(key_len, value_len) => {
-                self.scan_position.move_to_next();
-                self.scan_cnt -= 1;
 
-                // since we are mut, we need to mark as dirty.
-                match self.leaf_lock.get_page_location() {
-                    PageLocation::Base(_offset) => {
-                        self.leaf_lock.load_base_page_mut();
-                    }
-                    PageLocation::Full(_) => {
-                        // do nothing.
-                    }
-                    PageLocation::Mini(_) => {
-                        unreachable!()
-                    }
-                    PageLocation::Null => panic!("range_scan next on Null page"),
+            match self.leaf_lock.scan_record_by_pos_with_bound(
+                &self.scan_position,
+                out_buffer,
+                self.return_field,
+                &self.end_key,
+            ) {
+                GetScanRecordByPosResult::Deleted => {
+                    self.scan_position.move_to_next();
                 }
-                Some((key_len as usize, value_len as usize))
-            }
-            GetScanRecordByPosResult::EndOfLeaf => {
-                // we need to load next leaf.
-                let right_sibling = self.leaf_lock.get_right_sibling();
+                GetScanRecordByPosResult::Found(key_len, value_len) => {
+                    self.scan_position.move_to_next();
+                    self.scan_cnt -= 1;
 
-                if right_sibling.is_empty() {
+                    // since we are mut, we need to mark as dirty.
+                    match self.leaf_lock.get_page_location() {
+                        PageLocation::Base(_offset) => {
+                            self.leaf_lock.load_base_page_mut();
+                        }
+                        PageLocation::Full(_) => {
+                            // do nothing.
+                        }
+                        PageLocation::Mini(_) => {
+                            unreachable!()
+                        }
+                        PageLocation::Null => panic!("range_scan next on Null page"),
+                    }
+                    return Some((key_len as usize, value_len as usize));
+                }
+                GetScanRecordByPosResult::EndOfLeaf => {
+                    // we need to load next leaf.
+                    let right_sibling = self.leaf_lock.get_right_sibling();
+
+                    if right_sibling.is_empty() {
+                        self.scan_cnt = 0;
+                        return None;
+                    }
+
+                    let backoff = Backoff::new();
+
+                    let mut aggressive_split = false;
+                    loop {
+                        let (pos, lock) = match move_cursor_to_leaf_mut(
+                            self.tree,
+                            &right_sibling,
+                            aggressive_split,
+                        ) {
+                            Ok((pos, lock)) => (pos, lock),
+                            Err(TreeError::Locked) => {
+                                backoff.spin();
+                                continue;
+                            }
+                            Err(TreeError::CircularBufferFull) => {
+                                // We can't call eviction here because we are holding a lock, which may happened to be evicted!
+                                // It is safe bc circular buffer full is caused by promoting to full page, which is a performance concern not correctness.
+                                //
+                                aggressive_split = true;
+                                continue;
+                            }
+                            Err(TreeError::NeedRestart) => {
+                                aggressive_split = true;
+                                backoff.spin();
+                                continue;
+                            }
+                        };
+                        self.scan_position = pos;
+                        self.leaf_lock = lock;
+                        break;
+                    }
+                }
+                GetScanRecordByPosResult::BoundKeyExceeded => {
                     self.scan_cnt = 0;
                     return None;
                 }
-
-                let backoff = Backoff::new();
-
-                let mut aggressive_split = false;
-                loop {
-                    let (pos, lock) = match move_cursor_to_leaf_mut(
-                        self.tree,
-                        &right_sibling,
-                        aggressive_split,
-                    ) {
-                        Ok((pos, lock)) => (pos, lock),
-                        Err(TreeError::Locked) => {
-                            backoff.spin();
-                            continue;
-                        }
-                        Err(TreeError::CircularBufferFull) => {
-                            // We can't call eviction here because we are holding a lock, which may happened to be evicted!
-                            // It is safe bc circular buffer full is caused by promoting to full page, which is a performance concern not correctness.
-                            //
-                            aggressive_split = true;
-                            continue;
-                        }
-                        Err(TreeError::NeedRestart) => {
-                            aggressive_split = true;
-                            backoff.spin();
-                            continue;
-                        }
-                    };
-                    self.scan_position = pos;
-                    self.leaf_lock = lock;
-                    break;
-                }
-                self.next(out_buffer)
-            }
-            GetScanRecordByPosResult::BoundKeyExceeded => {
-                self.scan_cnt = 0;
-                None
             }
         }
     }
@@ -305,82 +305,82 @@ impl<'b> ScanIter<'_, 'b> {
     /// next() terminates if 1) reached the last key. 2) scanned `scan_cnt` records, if set. 3) reached end_key, if set.
     /// Returns the length of the record fields copied into `out_buffer` or None if there is no more value.
     pub fn next(&mut self, out_buffer: &mut [u8]) -> Option<(usize, usize)> {
-        if self.scan_cnt == 0 && self.end_key.is_none() {
-            return None;
-        }
+        loop {
+            if self.scan_cnt == 0 {
+                return None;
+            }
 
-        match self.leaf_lock.get_record_by_pos_with_bound(
-            &self.scan_position,
-            out_buffer,
-            self.return_field,
-            &self.end_key,
-        ) {
-            GetScanRecordByPosResult::Deleted => {
-                self.scan_position.move_to_next();
-                self.next(out_buffer)
-            }
-            GetScanRecordByPosResult::Found(key_len, value_len) => {
-                self.scan_position.move_to_next();
-                self.scan_cnt -= 1;
-                Some((key_len as usize, value_len as usize))
-            }
-            GetScanRecordByPosResult::EndOfLeaf => {
-                // we need to load next leaf.
-                counter!(ScanGoNextLeaf);
-                let right_sibling = if !self.tree.cache_only {
-                    self.leaf_lock.get_right_sibling()
-                } else {
-                    if let Some(key) = self.next_key.as_ref() {
-                        key.clone()
+            match self.leaf_lock.get_record_by_pos_with_bound(
+                &self.scan_position,
+                out_buffer,
+                self.return_field,
+                &self.end_key,
+            ) {
+                GetScanRecordByPosResult::Deleted => {
+                    self.scan_position.move_to_next();
+                }
+                GetScanRecordByPosResult::Found(key_len, value_len) => {
+                    self.scan_position.move_to_next();
+                    self.scan_cnt -= 1;
+                    return Some((key_len as usize, value_len as usize));
+                }
+                GetScanRecordByPosResult::EndOfLeaf => {
+                    // we need to load next leaf.
+                    counter!(ScanGoNextLeaf);
+                    let right_sibling = if !self.tree.cache_only {
+                        self.leaf_lock.get_right_sibling()
                     } else {
-                        panic!("next_key is None in cache_only mode");
-                    }
-                };
+                        if let Some(key) = self.next_key.as_ref() {
+                            key.clone()
+                        } else {
+                            panic!("next_key is None in cache_only mode");
+                        }
+                    };
 
-                if right_sibling.is_empty() {
+                    if right_sibling.is_empty() {
+                        self.scan_cnt = 0;
+                        return None;
+                    }
+
+                    let backoff = Backoff::new();
+
+                    let mut aggressive_split = false;
+                    loop {
+                        let (pos, lock) = match move_cursor_to_leaf(
+                            self.tree,
+                            &right_sibling,
+                            aggressive_split,
+                            self.next_key.as_mut(),
+                        ) {
+                            Ok((pos, lock)) => (pos, lock),
+                            Err(TreeError::Locked) => {
+                                backoff.spin();
+                                continue;
+                            }
+                            Err(TreeError::CircularBufferFull) => {
+                                // We can't call eviction here because we are holding a lock, which may happened to be evicted!
+                                // It is safe bc circular buffer full is caused by promoting to full page, which is a performance concern not correctness.
+                                //
+                                // Should we consider making the below function to be unsafe? To arise the awareness?
+                                // _ = self.tree.evict_from_circular_buffer();
+                                aggressive_split = true;
+                                continue;
+                            }
+                            Err(TreeError::NeedRestart) => {
+                                aggressive_split = true;
+                                backoff.spin();
+                                continue;
+                            }
+                        };
+                        self.scan_position = pos;
+                        self.leaf_lock = lock;
+                        break;
+                    }
+                }
+                GetScanRecordByPosResult::BoundKeyExceeded => {
                     self.scan_cnt = 0;
                     return None;
                 }
-
-                let backoff = Backoff::new();
-
-                let mut aggressive_split = false;
-                loop {
-                    let (pos, lock) = match move_cursor_to_leaf(
-                        self.tree,
-                        &right_sibling,
-                        aggressive_split,
-                        self.next_key.as_mut(),
-                    ) {
-                        Ok((pos, lock)) => (pos, lock),
-                        Err(TreeError::Locked) => {
-                            backoff.spin();
-                            continue;
-                        }
-                        Err(TreeError::CircularBufferFull) => {
-                            // We can't call eviction here because we are holding a lock, which may happened to be evicted!
-                            // It is safe bc circular buffer full is caused by promoting to full page, which is a performance concern not correctness.
-                            //
-                            // Should we consider making the below function to be unsafe? To arise the awareness?
-                            // _ = self.tree.evict_from_circular_buffer();
-                            aggressive_split = true;
-                            continue;
-                        }
-                        Err(TreeError::NeedRestart) => {
-                            aggressive_split = true;
-                            backoff.spin();
-                            continue;
-                        }
-                    };
-                    self.scan_position = pos;
-                    self.leaf_lock = lock;
-                    break;
-                }
-                self.next(out_buffer)
-            }
-            GetScanRecordByPosResult::BoundKeyExceeded => {
-                self.scan_cnt = 0;
-                None
             }
         }
     }
@@ -417,9 +417,9 @@ fn promote_or_merge_mini_page<'a>(
         }
         PageLocation::Mini(ptr) => {
             counter!(ScanMergeMiniPage);
-            let mini_page = leaf.load_cache_page_mut(*ptr);
+            let base_offset = leaf.load_cache_page(*ptr).next_level;
             // acquire the handle so that the eviction process with not contend with us.
-            let h = tree.storage.begin_dealloc_mini_page(mini_page)?;
+            let h = tree.storage.begin_dealloc_mini_page(*ptr)?;
             let merge_result = leaf.try_merge_mini_page(&h, parent, &tree.storage)?;
 
             match merge_result {
@@ -430,7 +430,6 @@ fn promote_or_merge_mini_page<'a>(
                     //      this is done with probability to avoid polluting the cache.
                     if tree.should_promote_scan_page() {
                         // upgrade to full page
-                        let base_offset = mini_page.next_level;
                         leaf.change_to_base_loc();
                         tree.storage.finish_dealloc_mini_page(h);
 
@@ -483,7 +482,7 @@ fn move_cursor_to_leaf_mut<'a>(
     if let Ok(pos) = leaf.get_scan_position(key, false) {
         match pos {
             ScanPosition::Base(_) => {
-                if !tree.should_promote_scan_page() {
+                if parent.is_none() || !tree.should_promote_scan_page() {
                     return Ok((pos, leaf));
                 }
                 // o.w. fall through and upgrade to full page.
@@ -564,6 +563,62 @@ mod tests {
     use crate::{BfTree, Config};
     use crate::{LeafInsertResult, ScanReturnField};
     use std::mem::size_of;
+
+    #[test]
+    fn mutable_scan_of_root_leaf_with_full_promotion_rate() {
+        let mut config = Config::default();
+        config.scan_promotion_rate(100);
+        let tree = BfTree::with_config(config, None).unwrap();
+        let mut out = [0; 16];
+        {
+            let mut scan = tree
+                .scan_mut_with_count(b"a", 1, ScanReturnField::KeyAndValue)
+                .unwrap();
+            assert_eq!(scan.next(&mut out), None);
+        }
+        assert_eq!(tree.insert(b"a", b"one"), LeafInsertResult::Success);
+        let mut scan = tree
+            .scan_mut_with_end_key(b"a", b"z", ScanReturnField::KeyAndValue)
+            .unwrap();
+        assert_eq!(scan.next(&mut out), Some((1, 3)));
+        assert_eq!(&out[..4], b"aone");
+        for _ in 0..3 {
+            assert_eq!(scan.next(&mut out), None);
+        }
+    }
+
+    #[test]
+    fn mutable_scans_validate_keys_before_acquiring_a_leaf() {
+        use crate::ScanIterError;
+
+        let tree = BfTree::default();
+        assert!(matches!(
+            tree.scan_mut_with_count(b"", 1, ScanReturnField::Key),
+            Err(ScanIterError::InvalidStartKey)
+        ));
+        for (start, end, expected) in [
+            (
+                b"".as_slice(),
+                b"z".as_slice(),
+                ScanIterError::InvalidStartKey,
+            ),
+            (
+                b"a".as_slice(),
+                b"".as_slice(),
+                ScanIterError::InvalidEndKey,
+            ),
+            (
+                b"z".as_slice(),
+                b"a".as_slice(),
+                ScanIterError::InvalidKeyRange,
+            ),
+        ] {
+            match tree.scan_mut_with_end_key(start, end, ScanReturnField::Key) {
+                Err(actual) => assert_eq!(actual, expected),
+                Ok(_) => panic!("invalid mutable scan range was accepted"),
+            }
+        }
+    }
 
     #[test]
     fn test_scan_with_count() {
@@ -737,6 +792,58 @@ mod tests {
         let cmp_res = prev_key.as_slice().cmp(end_key);
         assert!(cmp_res == std::cmp::Ordering::Equal);
         assert!(cnt == 40);
+    }
+
+    #[test]
+    fn test_scan_skips_many_deleted_records_with_bounded_stack() {
+        const DELETED_RECORD_COUNT: u64 = 10_000;
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let tree = BfTree::default();
+
+                for id in 0..=DELETED_RECORD_COUNT {
+                    assert_eq!(
+                        tree.insert(&id.to_be_bytes(), &[0]),
+                        LeafInsertResult::Success
+                    );
+                }
+
+                for id in 0..DELETED_RECORD_COUNT {
+                    tree.delete(&id.to_be_bytes());
+                }
+
+                let start_key = 0u64.to_be_bytes();
+                let expected_key = DELETED_RECORD_COUNT.to_be_bytes();
+                let mut output_buffer = [0u8; size_of::<u64>()];
+
+                let mut scan_iter = tree
+                    .scan_with_count(&start_key, 1, ScanReturnField::Key)
+                    .expect("Scan failed");
+                let (key_len, value_len) = scan_iter
+                    .next(&mut output_buffer)
+                    .expect("Expected the live record after the deleted range");
+                assert_eq!(key_len, expected_key.len());
+                assert_eq!(value_len, 0);
+                assert_eq!(output_buffer, expected_key);
+                assert!(scan_iter.next(&mut output_buffer).is_none());
+                drop(scan_iter);
+
+                let mut scan_iter = tree
+                    .scan_mut_with_count(&start_key, 1, ScanReturnField::Key)
+                    .expect("Mutable scan failed");
+                let (key_len, value_len) = scan_iter
+                    .next(&mut output_buffer)
+                    .expect("Expected the live record after the deleted range");
+                assert_eq!(key_len, expected_key.len());
+                assert_eq!(value_len, 0);
+                assert_eq!(output_buffer, expected_key);
+                assert!(scan_iter.next(&mut output_buffer).is_none());
+            })
+            .expect("Failed to spawn test thread")
+            .join()
+            .expect("Scan thread failed");
     }
 
     fn cache_only_tree(cb_size_byte: Option<usize>) -> BfTree {
