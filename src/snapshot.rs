@@ -1935,6 +1935,176 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{atomic::AtomicBool, Arc};
 
+    #[cfg(not(feature = "shuttle"))]
+    mod full_cache_recovery {
+        use crate::{
+            mini_page_op::LeafOperations,
+            nodes::leaf_node::{LeafReadResult, OpType},
+            snapshot::{CPRSnapShotMgr, CPRSnapshotGuard, PhaseId},
+            storage::PageLocation,
+            sync::thread,
+            BfTree, Config, LeafInsertResult, ScanReturnField, StorageBackend,
+        };
+        use std::{
+            collections::BTreeMap,
+            path::Path,
+            time::{Duration, Instant},
+        };
+
+        type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+
+        fn put(tree: &BfTree, model: &mut Model, id: u64, version: u8) {
+            let key = id.to_be_bytes().to_vec();
+            let mut value = key.repeat(8);
+            value[63] = version;
+            assert_eq!(tree.insert(&key, &value), LeafInsertResult::Success);
+            model.insert(key, value);
+        }
+
+        fn check_state(tree: &BfTree, model: &Model) {
+            let mut buffer = [0u8; 512];
+            for id in 0u64..260 {
+                let key = id.to_be_bytes();
+                let expected = model.get(key.as_slice());
+                match tree.read(&key, &mut buffer) {
+                    LeafReadResult::Found(length) => {
+                        assert_eq!(
+                            Some(&buffer[..length as usize]),
+                            expected.map(Vec::as_slice)
+                        );
+                    }
+                    LeafReadResult::Deleted | LeafReadResult::NotFound => {
+                        assert!(expected.is_none(), "missing key {id}");
+                    }
+                    result => panic!("unexpected read result: {result:?}"),
+                }
+            }
+            let start = 0u64.to_be_bytes();
+            let mut scan = tree
+                .scan_with_count(&start, usize::MAX, ScanReturnField::KeyAndValue)
+                .unwrap();
+            for (key, value) in model {
+                let (key_len, value_len) = scan.next(&mut buffer).expect("missing scan record");
+                assert_eq!(&buffer[..key_len], key);
+                assert_eq!(&buffer[key_len..key_len + value_len], value);
+            }
+            assert!(scan.next(&mut buffer).is_none(), "extra scan record");
+        }
+
+        fn full_cache_counts(tree: &BfTree) -> (usize, usize) {
+            let mut cached = 0;
+            let mut phantom = 0;
+            for (_, pid) in tree.storage.page_table.iter() {
+                let leaf = tree.mapping_table().get(&pid);
+                if let PageLocation::Full(ptr) = leaf.get_page_location() {
+                    let page = leaf.load_cache_page(*ptr);
+                    for index in 0..page.meta.meta_count_with_fence() {
+                        match page.get_kv_meta(index as usize).op_type() {
+                            OpType::Cache => cached += 1,
+                            OpType::Phantom => phantom += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (cached, phantom)
+        }
+
+        fn wait_for_phase(manager: &CPRSnapShotMgr, phase: PhaseId) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while manager.get_global_phase_id() != phase {
+                assert!(Instant::now() < deadline, "snapshot phase timed out");
+                thread::yield_now();
+            }
+        }
+
+        fn capture_with_writer(tree: &BfTree, path: &Path, model: &Model) {
+            let manager = tree.snapshot_mgr.as_ref().unwrap();
+            let mut live = model.clone();
+            thread::scope(|scope| {
+                let rest = CPRSnapshotGuard::new(Some(manager.clone())).unwrap();
+                let snapshot = scope.spawn(|| tree.cpr_snapshot(path));
+                wait_for_phase(manager, PhaseId::Prepare);
+                let prepare = CPRSnapshotGuard::new(Some(manager.clone())).unwrap();
+                drop(rest);
+                wait_for_phase(manager, PhaseId::InProgress);
+                put(tree, &mut live, 0, 99);
+                tree.delete(&1u64.to_be_bytes());
+                live.remove(1u64.to_be_bytes().as_slice());
+                // The prepare guard holds the snapshot thread before sweep,
+                // and the only writer has finished updating these mappings.
+                let mappings = unsafe { &*manager.thread_local_base_mappings.get() };
+                assert!(mappings.iter().any(|mapping| !mapping.is_empty()));
+                drop(prepare);
+                snapshot.join().unwrap();
+            });
+            check_state(tree, &live);
+        }
+
+        fn run(writer_capture: bool) {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config::new(directory.path().join("live"), 4 * 1024 * 1024);
+            config
+                .storage_backend(StorageBackend::Std)
+                .cb_min_record_size(4)
+                .cb_max_record_size(256)
+                .cb_max_key_len(8)
+                .leaf_page_size(4096)
+                .read_promotion_rate(0)
+                .scan_promotion_rate(100)
+                .use_snapshot(true);
+            let mut tree = BfTree::with_config(config, None).unwrap();
+            let mut model = Model::new();
+            for id in 0..256 {
+                put(&tree, &mut model, id, 0);
+            }
+            let mut saw_phantom = false;
+            for round in 0..3u8 {
+                if round > 0 {
+                    put(&tree, &mut model, 31 + u64::from(round), round);
+                }
+                put(&tree, &mut model, 0, round);
+                put(&tree, &mut model, 256 + u64::from(round), round);
+                let removed = (32 + u64::from(round)).to_be_bytes();
+                tree.delete(&removed);
+                model.remove(removed.as_slice());
+                check_state(&tree, &model);
+                let (cached, phantom) = full_cache_counts(&tree);
+                assert!(cached > 0, "test must snapshot full-cache records");
+                saw_phantom |= phantom > 0;
+
+                let snapshot = directory.path().join(format!("snapshot-{round}"));
+                if writer_capture {
+                    capture_with_writer(&tree, &snapshot, &model);
+                } else {
+                    tree.cpr_snapshot(&snapshot);
+                    check_state(&tree, &model);
+                }
+                let image = std::fs::read(&snapshot).unwrap();
+                let working = directory.path().join(format!("recovered-{round}"));
+                std::fs::copy(&snapshot, &working).unwrap();
+                drop(tree);
+                tree = BfTree::new_from_cpr_snapshot(&working, true, None, None, None).unwrap();
+                check_state(&tree, &model);
+                let (cached, phantom) = full_cache_counts(&tree);
+                assert!(cached > 0, "recovery scan must re-promote base pages");
+                saw_phantom |= phantom > 0;
+                assert_eq!(std::fs::read(&snapshot).unwrap(), image);
+            }
+            assert!(saw_phantom, "test must exercise cached deletion records");
+        }
+
+        #[test]
+        fn sweep_preserves_complete_state_after_full_page_repromotion() {
+            run(false);
+        }
+
+        #[test]
+        fn writer_capture_preserves_complete_state_after_full_page_repromotion() {
+            run(true);
+        }
+    }
+
     /// Multiple writer threads write to a BfTree in parallel while a separate thread taking multiple snapshots
     /// A new BfTree recovered from the snapshot should contain a prefix of all the inserts from each writer thread.
     /// A snapshot taken later should cover the previous snapshots.
