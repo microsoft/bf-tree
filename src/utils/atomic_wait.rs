@@ -12,7 +12,7 @@ mod platform {
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
-                a,
+                a.as_ptr(),
                 libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
                 expected,
                 core::ptr::null::<libc::timespec>(),
@@ -25,9 +25,9 @@ mod platform {
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
-                ptr,
+                ptr.cast::<u32>().cast_mut(),
                 libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-                1i32,
+                1u32,
             );
         };
     }
@@ -37,11 +37,19 @@ mod platform {
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
-                ptr,
+                ptr.cast::<u32>().cast_mut(),
                 libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-                i32::MAX,
+                i32::MAX as u32,
             );
         };
+    }
+
+    #[test]
+    fn wait_and_wake_without_waiters() {
+        let atomic = AtomicU32::new(1);
+        wait(&atomic, 0);
+        wake_one(&atomic);
+        wake_all(&atomic);
     }
 }
 
