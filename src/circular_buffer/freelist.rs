@@ -202,6 +202,21 @@ mod test {
     use super::*;
     use rstest::rstest;
 
+    #[repr(C)]
+    struct AlignedBlock<const N: usize> {
+        _alignment: [ListNode; 0],
+        _bytes: [u8; N],
+    }
+
+    impl<const N: usize> AlignedBlock<N> {
+        fn new() -> Self {
+            Self {
+                _alignment: [],
+                _bytes: [0; N],
+            }
+        }
+    }
+
     #[rstest]
     #[case(64, 1952, 4096)] // 1 leaf page = 1 disk page
     #[case(3072, 3072, 8192)] // 1 leaf page = 1 disk page, uniform record size
@@ -227,7 +242,7 @@ mod test {
     #[test]
     fn test_add_and_remove() {
         let free_list = FreeList::new(32, 1952, 4096, 32, false);
-        let block = Box::into_raw(Box::new([0u8; 128])); // Allocate a block of 128 bytes.
+        let block = Box::into_raw(Box::new(AlignedBlock::<128>::new()));
         let lock_guard = free_list.try_add(block as *mut u8, 128).unwrap();
         drop(lock_guard);
         let removed = free_list.remove(128).unwrap();
@@ -241,7 +256,7 @@ mod test {
     #[test]
     fn test_find_and_remove() {
         let free_list = FreeList::new(32, 1952, 4096, 32, false);
-        let block = Box::into_raw(Box::new([0u8; 128]));
+        let block = Box::into_raw(Box::new(AlignedBlock::<128>::new()));
         let lock_guard = free_list.try_add(block as *mut u8, 128).unwrap();
         drop(lock_guard);
         assert!(free_list.find_and_remove(block as *mut u8, 128));
@@ -268,7 +283,7 @@ mod test {
             let b = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 b.wait(); // Ensure all threads start simultaneously.
-                let block = Box::into_raw(Box::new([0u8; 64]));
+                let block = Box::into_raw(Box::new(AlignedBlock::<64>::new()));
                 if let Ok(lock_guard) = fl.try_add(block as *mut u8, 64) {
                     drop(lock_guard);
                     let removed = fl.find_and_remove(block as *mut u8, 64);

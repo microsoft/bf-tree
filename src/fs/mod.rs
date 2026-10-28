@@ -44,6 +44,10 @@ pub(crate) trait VfsImpl: Send + Sync {
 
     fn reset(&self) {}
 
+    fn requires_aligned_io(&self) -> bool {
+        false
+    }
+
     fn open(path: impl AsRef<std::path::Path>) -> Self
     where
         Self: Sized;

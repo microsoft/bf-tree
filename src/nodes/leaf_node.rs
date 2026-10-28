@@ -249,7 +249,8 @@ impl LeafNode {
 
     pub(crate) fn make_base_page(node_size: usize, snapshot_version: u64) -> *mut Self {
         let layout = Layout::from_size_align(node_size, std::mem::align_of::<LeafNode>()).unwrap();
-        let ptr = unsafe { std::alloc::alloc(layout) };
+        // Snapshots serialize the entire page, including its unused space.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         unsafe {
             Self::init_node_with_fence(
                 ptr,
@@ -357,6 +358,10 @@ impl LeafNode {
         let meta_ptr = self.data.as_ptr() as *const LeafKVMeta;
         let meta = unsafe { &*meta_ptr.add(LOW_FENCE_IDX) };
 
+        if meta.is_infinite_low_fence_key() {
+            return vec![];
+        }
+
         let key_offset = meta.get_offset();
         let key_ptr = unsafe { self.data.as_ptr().add(key_offset as usize) };
         unsafe {
@@ -377,14 +382,19 @@ impl LeafNode {
     }
 
     pub(crate) fn get_remaining_key(&self, meta: &LeafKVMeta) -> &[u8] {
+        let remaining_key_len = meta.get_key_len() - self.prefix_len;
+        if remaining_key_len == 0 {
+            return &[];
+        }
         let key_offset = meta.get_offset();
         let key_ptr = unsafe { self.data.as_ptr().add(key_offset as usize) };
-        unsafe {
-            std::slice::from_raw_parts(key_ptr, (meta.get_key_len() - self.prefix_len) as usize)
-        }
+        unsafe { std::slice::from_raw_parts(key_ptr, remaining_key_len as usize) }
     }
 
     pub(crate) fn get_prefix(&self) -> &[u8] {
+        if self.prefix_len == 0 {
+            return &[];
+        }
         let m = self.get_kv_meta(LOW_FENCE_IDX);
         let key_offset = m.get_offset();
         unsafe {

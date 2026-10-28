@@ -625,23 +625,8 @@ impl<'a> LeafEntryXLocked<'a> {
                             if mini_page.get_clean_snapshot_version()
                                 < local_thread_snapshot_version =>
                         {
-                            let mini_page_ptr = unsafe {
-                                std::slice::from_raw_parts(
-                                    mini_page as *const LeafNode as *const u8,
-                                    mini_page.meta.node_size as usize,
-                                )
-                            };
-                            // Temporarily change the next level to none for snapshotting
-                            // and reverse back afterwards.
-                            let next_level = mini_page.next_level;
-                            mini_page.next_level = MiniPageNextLevel::new_null();
-                            snapshot_guard.snapshot_base_page(
-                                pid,
-                                mini_page_ptr,
-                                mini_page.meta.node_size as usize,
-                            );
+                            snapshot_guard.snapshot_full_page(pid, mini_page);
                             mini_page.set_snapshot_version(local_thread_snapshot_version, true);
-                            mini_page.next_level = next_level;
                         }
                         _ => {}
                     }
@@ -761,6 +746,9 @@ impl<'a> LeafEntryXLocked<'a> {
                             return Ok(());
                         }
                     }
+                    histogram!(HitMiniPage, root_page.meta.node_size as u64);
+                    counter!(InsertToMiniPageSuccess);
+                    return Ok(());
                 }
 
                 let mini_page = self.load_cache_page_mut(ptr);

@@ -1,14 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{
-    utils::{BfsVisitor, NodeInfo},
-    BfTree, Config, LeafInsertResult, LeafReadResult, ScanReturnField,
-};
 use std::collections::BTreeMap;
 
+use crate::{
+    utils::{BfsVisitor, NodeInfo},
+    BfTree, Config, LeafInsertResult, LeafReadResult, ScanReturnField, StorageBackend,
+};
+
 fn check_state(tree: &BfTree, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
-    let mut buffer = vec![0u8; 1024];
+    let mut buffer = vec![0; 1024];
     for (key, value) in model {
         assert_eq!(
             tree.read(key, &mut buffer),
@@ -36,6 +37,7 @@ fn inner_root_split_preserves_complete_state_through_recovery() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = Config::new(directory.path().join("live"), 64 * 1024 * 1024);
     config
+        .storage_backend(StorageBackend::Std)
         .leaf_page_size(4096)
         .cb_max_key_len(8)
         .cb_max_record_size(1024)
