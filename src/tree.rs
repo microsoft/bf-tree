@@ -970,6 +970,8 @@ impl BfTree {
                 let next_is_leaf = next_node.meta.children_is_leaf();
                 let pos = next_node.lower_bound(key);
                 let kv_meta = next_node.get_kv_meta(pos as u16);
+                #[cfg(all(test, not(feature = "shuttle")))]
+                crate::tests::migrated_concurrency::before_inner_child_read();
                 cur_page = next_node.get_value(kv_meta);
                 cur_is_leaf = next_is_leaf;
 
@@ -987,6 +989,8 @@ impl BfTree {
                     }
                 }
 
+                // Validate the decoded child before the next iteration dereferences it.
+                next.check_version()?;
                 parent = Some(next);
             }
         }

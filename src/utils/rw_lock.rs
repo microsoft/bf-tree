@@ -20,6 +20,11 @@ pub struct RwLock<T> {
 }
 
 impl<T> RwLock<T> {
+    #[cfg(all(test, not(feature = "shuttle")))]
+    pub(crate) fn has_writer_intent(&self) -> bool {
+        !self.lock_val.load(Ordering::Acquire).is_multiple_of(2)
+    }
+
     pub fn new(val: T) -> Self {
         Self {
             val: UnsafeCell::new(val),
@@ -57,12 +62,10 @@ impl<T> RwLock<T> {
         if v.is_multiple_of(2) {
             let new_v = v + 2;
 
-            match self.lock_val.compare_exchange_weak(
-                v,
-                new_v,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .lock_val
+                .compare_exchange(v, new_v, Ordering::Acquire, Ordering::Relaxed)
+            {
                 Ok(_) => Ok(RwLockReadGuard { lock: self }),
                 Err(_) => Err(()),
             }
@@ -114,12 +117,10 @@ impl<T> RwLock<T> {
     pub fn try_write(&self) -> Result<RwLockWriteGuard<'_, T>, ()> {
         let s = self.lock_val.load(Ordering::Relaxed);
         if s <= 1 {
-            match self.lock_val.compare_exchange_weak(
-                s,
-                u32::MAX,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .lock_val
+                .compare_exchange(s, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
+            {
                 Ok(_) => return Ok(RwLockWriteGuard { lock: self }),
                 Err(_) => return Err(()),
             }

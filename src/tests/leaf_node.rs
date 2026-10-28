@@ -8,6 +8,40 @@ use std::collections::HashMap;
 
 use crate::nodes::leaf_node::{LeafNode, LeafReadResult, OpType};
 
+#[test]
+fn empty_prefix_and_infinite_fence_do_not_use_sentinel_offsets() {
+    use crate::nodes::leaf_node::{LeafKVMeta, MiniPageNextLevel};
+    let ptr = LeafNode::make_base_page(4096, 0);
+    let leaf = unsafe { &mut *ptr };
+    assert!(leaf.get_prefix().is_empty());
+    leaf.initialize(
+        &[],
+        &[],
+        4096,
+        MiniPageNextLevel::new_null(),
+        true,
+        false,
+        0,
+    );
+    assert!(leaf.get_low_fence_full_key().is_empty());
+    assert!(leaf.get_prefix().is_empty());
+    let empty = LeafKVMeta::make_prefixed_meta(u16::MAX, 0, &[], 0, OpType::Delete);
+    assert!(leaf.get_remaining_key(&empty).is_empty());
+    leaf.initialize(
+        b"prefix-a",
+        b"prefix-z",
+        4096,
+        MiniPageNextLevel::new_null(),
+        true,
+        false,
+        0,
+    );
+    assert_eq!(leaf.get_prefix(), b"prefix-");
+    let prefix_only = LeafKVMeta::make_prefixed_meta(u16::MAX, 0, b"prefix-", 7, OpType::Delete);
+    assert!(leaf.get_remaining_key(&prefix_only).is_empty());
+    LeafNode::free_base_page(ptr);
+}
+
 #[derive(Clone, Arbitrary, Debug)]
 enum LeafTestOp {
     Insert,
