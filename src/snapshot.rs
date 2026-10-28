@@ -2121,7 +2121,10 @@ mod port_regressions {
 
     #[test]
     fn snapshot_full_page_preserves_source_when_write_panics() {
+        let dir = tempfile::tempdir().unwrap();
         let manager = CPRSnapShotMgr::new(0);
+        *manager.vfs.write().unwrap() =
+            make_vfs(&StorageBackend::Std, dir.path().join("full.snap"));
         let page = LeafNode::make_base_page(DISK_PAGE_SIZE, 0);
         unsafe { (*page).next_level = MiniPageNextLevel::new(1234) };
         FAIL_STAGE.with(|failure| failure.set(Some("page_write")));
