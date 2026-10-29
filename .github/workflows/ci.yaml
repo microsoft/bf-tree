@@ -49,15 +49,16 @@ jobs:
       # - run: >
       #     env RUSTFLAGS="-Z sanitizer=memory"
       #     cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --tests
+      # Shuttle's atomics/platform shims require cfg(test); exclude integration targets.
       - run: >
           env RUST_BACKTRACE=1
-          cargo test --features "shuttle" --release shuttle_bf_tree_concurrent_operations
+          cargo test --lib --features "shuttle" --release shuttle_bf_tree_concurrent_operations
       - run: >
           env RUST_BACKTRACE=1
-          cargo test --features "shuttle" --release shuttle_cpr_snapshot_disk
+          cargo test --lib --features "shuttle" --release shuttle_cpr_snapshot_disk
       - run: >
           env RUST_BACKTRACE=1
-          cargo test --features "shuttle" --release shuttle_cpr_snapshot_cache_only
+          cargo test --lib --features "shuttle" --release shuttle_cpr_snapshot_cache_only
 
   miri:
     needs: check-fmt-build

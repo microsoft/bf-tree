@@ -49,7 +49,8 @@ impl<'a> ReadGuard<'a> {
 
     pub(crate) fn upgrade(self) -> Result<WriteGuard<'a>, (Self, TreeError)> {
         let new_version = self.version + 0b10;
-        match self.as_ref().version_lock.compare_exchange_weak(
+        // Private-node callers require failure to mean a changed version, not a spurious CAS failure.
+        match self.as_ref().version_lock.compare_exchange(
             self.version,
             new_version,
             Ordering::Release,
