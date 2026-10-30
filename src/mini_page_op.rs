@@ -1404,9 +1404,11 @@ impl<'a> LeafEntryXLocked<'a> {
                 let mut mini_stats = mini_page.get_stats();
                 let next_level = mini_page.next_level;
 
-                let base_ref = self.load_base_page(next_level.as_offset());
-                let stats = base_ref.get_stats();
-                mini_stats.base_node = Some(Box::new(stats));
+                if !next_level.is_null() {
+                    let base_ref = self.load_base_page(next_level.as_offset());
+                    let stats = base_ref.get_stats();
+                    mini_stats.base_node = Some(Box::new(stats));
+                }
                 mini_stats
             }
             PageLocation::Full(ptr) => {

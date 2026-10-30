@@ -4,7 +4,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,9 +15,9 @@ use crate::{
         MAX_LEAF_PAGE_SIZE,
     },
     snapshot::BfTreeMeta,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use serde::Deserialize;
-use std::sync::atomic::AtomicUsize;
 
 const DEFAULT_PROMOTION_RATE_DEBUG: usize = 50;
 const DEFAULT_PROMOTION_RATE_RLEASE: usize = 30;

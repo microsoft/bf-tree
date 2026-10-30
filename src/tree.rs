@@ -968,19 +968,15 @@ impl BfTree {
 
                 let next_node = next.as_ref();
                 let next_is_leaf = next_node.meta.children_is_leaf();
-                let pos = next_node.lower_bound(key);
-                let kv_meta = next_node.get_kv_meta(pos as u16);
+                let pos = next.lower_bound(key)?;
                 #[cfg(all(test, not(feature = "shuttle")))]
                 crate::tests::migrated_concurrency::before_inner_child_read();
-                cur_page = next_node.get_value(kv_meta);
+                cur_page = next.checked_record(pos)?.value();
                 cur_is_leaf = next_is_leaf;
 
                 // If required and exists, the next key at (pos + 1) is the high fence key
-                if return_high_fence_key
-                    && ((pos + 1) as u16) < next_node.meta.meta_count_with_fence()
-                {
-                    let hk_kv_meta = next_node.get_kv_meta((pos + 1) as u16);
-                    let hk = next_node.get_full_key(hk_kv_meta);
+                if return_high_fence_key && pos + 1 < next.checked_record_count()? {
+                    let hk = next.checked_record(pos + 1)?.full_key();
                     if let Some(v) = high_fence.as_deref_mut() {
                         v.resize(hk.len(), 0u8);
                         v.copy_from_slice(&hk);
@@ -1119,6 +1115,7 @@ impl BfTree {
     /// assert_eq!(read_size, LeafReadResult::Found(5));
     /// assert_eq!(&buffer[..5], b"value");
     /// ```
+    /// Empty keys or values return `LeafInsertResult::InvalidKV` without modifying records.
     pub fn insert(&self, key: &[u8], value: &[u8]) -> LeafInsertResult {
         // The input key cannot exceed the configured max key length
         if key.len() > self.config.max_fence_len / 2 || key.len() > MAX_KEY_LEN {
@@ -1131,6 +1128,10 @@ impl BfTree {
                 "Key too small {}, at least one byte",
                 key.len()
             ));
+        }
+
+        if value.is_empty() {
+            return LeafInsertResult::InvalidKV("Value too small 0, at least one byte".to_owned());
         }
 
         // The input key value pair cannot exceed the configured max record size

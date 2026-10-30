@@ -21,6 +21,46 @@ use crate::{BfTree, Config, StorageBackend};
 use shuttle::rand::{thread_rng, Rng};
 
 #[cfg(feature = "shuttle")]
+#[test]
+fn shuttle_visitors_retry_locked_inner_nodes() {
+    use crate::{
+        sync::Arc,
+        utils::{inner_lock::ReadGuard, BfsVisitor},
+    };
+    shuttle::check_random(
+        || {
+            let mut config = Config::default();
+            config
+                .cache_only(true)
+                .cb_size_byte(64 * 1024)
+                .cb_max_record_size(128);
+            let tree = Arc::new(BfTree::with_config(config, None).unwrap());
+            for key in 0..64u64 {
+                assert_eq!(
+                    tree.insert(&key.to_be_bytes(), &[1; 64]),
+                    LeafInsertResult::Success
+                );
+            }
+            let (root, is_leaf) = tree.get_root_page();
+            assert!(!is_leaf);
+            let writer = ReadGuard::try_read(root.as_inner_node())
+                .unwrap()
+                .upgrade()
+                .unwrap();
+            let observed = tree.clone();
+            let visitor = thread::spawn(move || {
+                assert!(BfsVisitor::new_all_nodes(&observed).count() > 1);
+                assert_eq!(observed.get_stats().1, 64);
+            });
+            thread::yield_now();
+            drop(writer);
+            visitor.join().unwrap();
+        },
+        100,
+    );
+}
+
+#[cfg(feature = "shuttle")]
 #[rstest::rstest]
 fn shuttle_migrated_read_write_scan(#[values(false, true)] full_pages: bool) {
     use crate::sync::Arc;
