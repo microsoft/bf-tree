@@ -68,7 +68,7 @@ impl VfsImpl for StdDirectVfs {
 
     fn read(&self, offset: usize, buf: &mut [u8]) {
         counter!(IOReadRequest);
-        self.file.read_at(buf, offset as u64).unwrap();
+        self.file.read_exact_at(buf, offset as u64).unwrap();
     }
 
     fn flush(&self) {
@@ -77,6 +77,15 @@ impl VfsImpl for StdDirectVfs {
 
     fn write(&self, offset: usize, buf: &[u8]) {
         counter!(IOWriteRequest);
-        self.file.write_at(buf, offset as u64).unwrap();
+        self.file.write_all_at(buf, offset as u64).unwrap();
+    }
+
+    fn requires_aligned_io(&self) -> bool {
+        true
+    }
+
+    fn reset(&self) {
+        self.file.set_len(0).unwrap();
+        self.offset_alloc.reset(0);
     }
 }

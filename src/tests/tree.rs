@@ -1,6 +1,33 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#[cfg(all(feature = "metrics-rt", not(feature = "shuttle")))]
+#[test]
+fn cache_only_root_insert_is_not_repeated() {
+    use crate::{
+        metric::{get_tls_recorder, Counter},
+        Config, LeafInsertResult,
+    };
+    let mut config = Config::default();
+    config.cache_only(true);
+    let tree = crate::BfTree::with_config(config, None).unwrap();
+    get_tls_recorder().reset();
+    assert_eq!(tree.insert(b"key", &[1; 64]), LeafInsertResult::Success);
+    assert_eq!(
+        get_tls_recorder().counters.counters[Counter::LeafInsertNew as usize],
+        1
+    );
+    assert_eq!(
+        get_tls_recorder().counters.counters[Counter::LeafInsertDuplicate as usize],
+        0
+    );
+    assert_eq!(tree.insert(b"key", &[2; 64]), LeafInsertResult::Success);
+    assert_eq!(
+        get_tls_recorder().counters.counters[Counter::LeafInsertDuplicate as usize],
+        1
+    );
+}
+
 use std::hint::black_box;
 use std::{collections::HashMap, ops::Range};
 
@@ -11,6 +38,34 @@ use proptest::{
     test_runner::{Config, TestRunner},
 };
 use proptest_derive::Arbitrary;
+
+#[cfg(not(feature = "shuttle"))]
+#[rstest::rstest]
+fn empty_values_are_rejected_without_changing_records(#[values(false, true)] cache_only: bool) {
+    let mut config = BfTreeConfig::default();
+    config.cache_only(cache_only).cb_min_record_size(4);
+    let tree = BfTree::with_config(config, None).unwrap();
+    assert_eq!(
+        tree.insert(b"present", b"value"),
+        crate::LeafInsertResult::Success
+    );
+    for key in [b"present".as_slice(), b"absent"] {
+        assert!(matches!(
+            tree.insert(key, b""),
+            crate::LeafInsertResult::InvalidKV(_)
+        ));
+    }
+    let mut out = [0; 32];
+    assert_eq!(tree.read(b"present", &mut out), LeafReadResult::Found(5));
+    assert_eq!(&out[..5], b"value");
+    assert_eq!(tree.read(b"absent", &mut out), LeafReadResult::NotFound);
+    let mut scan = tree
+        .scan_with_count(b"a", usize::MAX, crate::ScanReturnField::KeyAndValue)
+        .unwrap();
+    assert_eq!(scan.next(&mut out), Some((7, 5)));
+    assert_eq!(&out[..12], b"presentvalue");
+    assert_eq!(scan.next(&mut out), None);
+}
 
 #[derive(Clone, Arbitrary, Debug)]
 enum TreeOp {
@@ -211,4 +266,51 @@ fn test_tree_insert_read_9() {
     config.cache_only = true;
 
     leaf_insert_read_inner(1000..10000, &config);
+}
+
+#[test]
+fn aggressive_traversal_preserves_root_leaf_splitting() {
+    let mut config = BfTreeConfig::default();
+    config
+        .storage_backend(crate::StorageBackend::Memory)
+        .cache_only(false)
+        .use_snapshot(false)
+        .cb_min_record_size(64)
+        .cb_max_record_size(256);
+    let tree = BfTree::with_config(config, None).unwrap();
+    for key in 0..4u64 {
+        assert_eq!(
+            tree.insert(&key.to_be_bytes(), &[0x11; 200]),
+            crate::LeafInsertResult::Success
+        );
+    }
+    let (root, is_leaf) = tree.get_root_page();
+    assert!(is_leaf);
+    tree.mapping_table()
+        .get_mut(&root)
+        .load_base_page_mut()
+        .set_split_flag();
+    let (found, parent) = tree
+        .traverse_to_leaf(&0u64.to_be_bytes(), false, false, None)
+        .unwrap();
+    assert_eq!(found, root);
+    assert!(parent.is_none());
+    assert!(matches!(
+        tree.traverse_to_leaf(&0u64.to_be_bytes(), true, false, None),
+        Err(crate::error::TreeError::NeedRestart)
+    ));
+    assert!(!tree.get_root_page().1);
+    let (found, parent) = tree
+        .traverse_to_leaf(&0u64.to_be_bytes(), true, false, None)
+        .unwrap();
+    assert_eq!(found, root);
+    assert!(parent.is_some());
+    for key in 0..4u64 {
+        let mut bytes = [0; 200];
+        assert_eq!(
+            tree.read(&key.to_be_bytes(), &mut bytes),
+            LeafReadResult::Found(200)
+        );
+        assert_eq!(bytes, [0x11; 200]);
+    }
 }

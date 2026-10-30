@@ -20,6 +20,131 @@ use crate::{BfTree, Config, StorageBackend};
 #[cfg(feature = "shuttle")]
 use shuttle::rand::{thread_rng, Rng};
 
+#[cfg(feature = "shuttle")]
+#[test]
+fn shuttle_visitors_retry_locked_inner_nodes() {
+    use crate::{
+        sync::Arc,
+        utils::{inner_lock::ReadGuard, BfsVisitor},
+    };
+    shuttle::check_random(
+        || {
+            let mut config = Config::default();
+            config
+                .cache_only(true)
+                .cb_size_byte(64 * 1024)
+                .cb_max_record_size(128);
+            let tree = Arc::new(BfTree::with_config(config, None).unwrap());
+            for key in 0..64u64 {
+                assert_eq!(
+                    tree.insert(&key.to_be_bytes(), &[1; 64]),
+                    LeafInsertResult::Success
+                );
+            }
+            let (root, is_leaf) = tree.get_root_page();
+            assert!(!is_leaf);
+            let writer = ReadGuard::try_read(root.as_inner_node())
+                .unwrap()
+                .upgrade()
+                .unwrap();
+            let observed = tree.clone();
+            let visitor = thread::spawn(move || {
+                assert!(BfsVisitor::new_all_nodes(&observed).count() > 1);
+                assert_eq!(observed.get_stats().1, 64);
+            });
+            thread::yield_now();
+            drop(writer);
+            visitor.join().unwrap();
+        },
+        100,
+    );
+}
+
+#[cfg(feature = "shuttle")]
+#[rstest::rstest]
+fn shuttle_migrated_read_write_scan(#[values(false, true)] full_pages: bool) {
+    use crate::sync::Arc;
+    shuttle::check_random(
+        move || {
+            let mut config = Config::default();
+            config
+                .storage_backend(StorageBackend::Memory)
+                .cache_only(false)
+                .read_promotion_rate(100)
+                .scan_promotion_rate(100)
+                .read_record_cache(!full_pages)
+                .write_load_full_page(full_pages)
+                .cb_min_record_size(32)
+                .cb_max_record_size(512)
+                .cb_size_byte(16 * 1024);
+            let tree = Arc::new(BfTree::with_config(config, None).unwrap());
+            for key in 0..96u64 {
+                assert_eq!(
+                    tree.insert(&key.to_be_bytes(), &[0; 128]),
+                    LeafInsertResult::Success
+                );
+            }
+            let handles: Vec<_> = (0..3u64)
+                .map(|writer| {
+                    let tree = tree.clone();
+                    thread::spawn(move || {
+                        for step in 0..48u64 {
+                            let key = (writer * 32 + step % 32).to_be_bytes();
+                            let value =
+                                vec![(writer * 48 + step) as u8; 64 + (step as usize % 3) * 128];
+                            assert_eq!(tree.insert(&key, &value), LeafInsertResult::Success);
+                            let mut out = vec![0; value.len()];
+                            assert_eq!(
+                                tree.read(&key, &mut out),
+                                LeafReadResult::Found(value.len() as u32)
+                            );
+                            assert_eq!(out, value);
+                            if step % 3 == 0 {
+                                tree.delete(&key);
+                                assert!(matches!(
+                                    tree.read(&key, &mut out),
+                                    LeafReadResult::Deleted | LeafReadResult::NotFound
+                                ));
+                                assert_eq!(tree.insert(&key, &value), LeafInsertResult::Success);
+                            }
+                            if step % 8 == 0 {
+                                let mut scan = tree
+                                    .scan_with_count(&key, 12, crate::ScanReturnField::Key)
+                                    .unwrap();
+                                let mut out = [0; 8];
+                                let mut previous = None;
+                                while let Some((len, _)) = scan.next(&mut out) {
+                                    assert_eq!(len, 8);
+                                    assert!(out >= key);
+                                    assert!(previous.is_none_or(|last| last < out));
+                                    previous = Some(out);
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            for writer in 0..3u64 {
+                for index in 0..32u64 {
+                    let step = if index < 16 { index + 32 } else { index };
+                    let key = (writer * 32 + index).to_be_bytes();
+                    let value = vec![(writer * 48 + step) as u8; 64 + (step as usize % 3) * 128];
+                    let mut out = vec![0; value.len()];
+                    assert_eq!(
+                        tree.read(&key, &mut out),
+                        LeafReadResult::Found(value.len() as u32)
+                    );
+                    assert_eq!(out, value);
+                }
+            }
+        },
+        200,
+    );
+}
+
 #[cfg(not(feature = "shuttle"))]
 use rand::Rng;
 
