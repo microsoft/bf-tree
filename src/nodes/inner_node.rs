@@ -5,13 +5,17 @@ use crate::{storage::DiskOffsetGuard, sync::atomic::AtomicU64};
 use std::cmp::Ordering;
 
 use super::{node_meta::NodeMeta, PageID, INNER_NODE_SIZE};
-use crate::utils::stats::InnerStats;
+use crate::{
+    error::TreeError,
+    utils::{inner_lock::ReadGuard, stats::InnerStats},
+};
 
 pub(crate) const INVALID_DISK_OFFSET: usize = usize::MAX;
 const INNER_NODE_ROOT_FLAG: u64 = 0x8000_0000_0000_0000;
 const INNER_NODE_SNAPSHOT_VERSION_MASK: u64 = 0x7FFF_FFFF_FFFF_FFFF;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct InnerKVMeta {
     pub offset: u16,
     pub key_len: u16, // internal node has fixed value length of 8.
@@ -518,21 +522,6 @@ impl InnerNode {
         self.update_at_pos(pos, new_id);
     }
 
-    pub(crate) fn get_stats(&self) -> InnerStats {
-        let keys: Vec<Vec<u8>> = KeyIter {
-            node: self,
-            cur_idx: 0,
-        }
-        .collect();
-        let child_id = self.get_child_iter().collect::<Vec<PageID>>();
-
-        InnerStats {
-            child_keys: keys,
-            child_id,
-            child_is_leaf: self.meta.children_is_leaf(),
-        }
-    }
-
     pub(crate) fn get_child_iter(&self) -> ChildIter<'_> {
         ChildIter {
             node: self,
@@ -557,23 +546,117 @@ impl InnerNode {
     }
 }
 
-struct KeyIter<'a> {
-    node: &'a InnerNode,
-    cur_idx: usize,
+pub(crate) struct CheckedInnerRecord<'a> {
+    meta: InnerKVMeta,
+    suffix_and_value: &'a [u8],
 }
 
-impl Iterator for KeyIter<'_> {
-    type Item = Vec<u8>;
+impl CheckedInnerRecord<'_> {
+    fn prefix(&self) -> &[u8] {
+        &self.meta.key_prefix
+            [..std::cmp::min(self.meta.key_len as usize, InnerKVMeta::KEY_LOOK_AHEAD_SIZE)]
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.cur_idx >= self.node.meta.meta_count_with_fence() as usize {
-            return None;
+    fn suffix(&self) -> &[u8] {
+        &self.suffix_and_value[..self.suffix_and_value.len() - std::mem::size_of::<PageID>()]
+    }
+
+    pub(crate) fn full_key(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(self.meta.key_len as usize);
+        key.extend_from_slice(self.prefix());
+        key.extend_from_slice(self.suffix());
+        key
+    }
+
+    pub(crate) fn value(&self) -> PageID {
+        let mut bytes = [0; std::mem::size_of::<PageID>()];
+        bytes.copy_from_slice(&self.suffix_and_value[self.suffix().len()..]);
+        PageID::new(u64::from_ne_bytes(bytes))
+    }
+}
+
+impl ReadGuard<'_> {
+    pub(crate) fn checked_record_count(&self) -> Result<u16, TreeError> {
+        let count = self.as_ref().meta.meta_count_with_fence();
+        if count == 0
+            || count as usize > InnerNode::max_data_size() / std::mem::size_of::<InnerKVMeta>()
+        {
+            return Err(TreeError::Locked);
         }
+        Ok(count)
+    }
 
-        let meta = self.node.get_kv_meta(self.cur_idx as u16);
-        let key = self.node.get_full_key(meta);
-        self.cur_idx += 1;
-        Some(key)
+    /// Bounds speculative access; the caller must still validate the version.
+    pub(crate) fn checked_record(&self, index: u16) -> Result<CheckedInnerRecord<'_>, TreeError> {
+        let capacity = InnerNode::max_data_size();
+        let meta_offset = index as usize * std::mem::size_of::<InnerKVMeta>();
+        if meta_offset + std::mem::size_of::<InnerKVMeta>() > capacity {
+            return Err(TreeError::Locked);
+        }
+        let data = self.as_ref().data.as_ptr();
+        // Capture metadata once; a writer may replace this slot before payload access.
+        let meta = unsafe { std::ptr::read(data.add(meta_offset).cast::<InnerKVMeta>()) };
+        let offset = meta.offset as usize;
+        let len = (meta.key_len as usize).saturating_sub(InnerKVMeta::KEY_LOOK_AHEAD_SIZE)
+            + std::mem::size_of::<PageID>();
+        if offset + len > capacity {
+            return Err(TreeError::Locked);
+        }
+        let suffix_and_value = unsafe { std::slice::from_raw_parts(data.add(offset), len) };
+        Ok(CheckedInnerRecord {
+            meta,
+            suffix_and_value,
+        })
+    }
+
+    pub(crate) fn lower_bound(&self, key: &[u8]) -> Result<u16, TreeError> {
+        let mut lower = 1;
+        let mut upper = self.checked_record_count()?;
+        let prefix_len = std::cmp::min(InnerKVMeta::KEY_LOOK_AHEAD_SIZE, key.len());
+        let (prefix, suffix) = key.split_at(prefix_len);
+        while lower < upper {
+            let mid = lower + (upper - lower) / 2;
+            let record = self.checked_record(mid)?;
+            match record
+                .prefix()
+                .cmp(prefix)
+                .then_with(|| record.suffix().cmp(suffix))
+            {
+                Ordering::Greater => upper = mid,
+                Ordering::Equal => return Ok(mid),
+                Ordering::Less => lower = mid + 1,
+            }
+        }
+        Ok(lower - 1)
+    }
+
+    pub(crate) fn checked_children(&self) -> Result<(bool, Vec<PageID>), TreeError> {
+        let child_is_leaf = self.as_ref().meta.children_is_leaf();
+        let count = self.checked_record_count()?;
+        let mut children = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            children.push(self.checked_record(index)?.value());
+        }
+        self.check_version()?;
+        Ok((child_is_leaf, children))
+    }
+
+    pub(crate) fn get_stats(&self) -> Result<InnerStats, TreeError> {
+        let child_is_leaf = self.as_ref().meta.children_is_leaf();
+        let count = self.checked_record_count()?;
+        let mut child_keys = Vec::with_capacity(count as usize);
+        let mut child_id = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let record = self.checked_record(index)?;
+            child_keys.push(record.full_key());
+            child_id.push(record.value());
+        }
+        self.check_version()?;
+        Ok(InnerStats {
+            child_keys,
+            child_id,
+            child_is_leaf,
+        })
     }
 }
 

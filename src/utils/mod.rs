@@ -227,13 +227,17 @@ impl Iterator for BfsVisitor<'_> {
             match node_info {
                 NodeInfo::Leaf { .. } => Some(node_info),
                 NodeInfo::Inner { level, ptr } => {
-                    let inner = ReadGuard::try_read(ptr).unwrap();
-                    let child_is_leaf = inner.as_ref().meta.children_is_leaf();
+                    let backoff = Backoff::new();
+                    let (child_is_leaf, children) = loop {
+                        match ReadGuard::try_read(ptr).and_then(|inner| inner.checked_children()) {
+                            Ok(children) => break children,
+                            Err(_) => backoff.spin(),
+                        }
+                    };
                     if self.inner_nodes_only && child_is_leaf {
                         return Some(node_info);
                     }
 
-                    let children = inner.as_ref().get_child_iter();
                     for child in children {
                         let node_info = NodeInfo::new(level + 1, child, child_is_leaf);
                         self.node_queue.push_back(node_info)

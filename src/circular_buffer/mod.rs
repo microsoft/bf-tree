@@ -11,7 +11,7 @@ use crate::sync::atomic::AtomicU8;
 #[cfg(all(test, not(feature = "shuttle")))]
 use spurious_cas::AtomicU8;
 
-use std::{cell::UnsafeCell, marker::PhantomData, sync::TryLockError};
+use std::{cell::Cell, marker::PhantomData, sync::TryLockError};
 
 use crate::{
     circular_buffer::freelist::FreeList,
@@ -245,10 +245,6 @@ impl AllocMeta {
         Self { size, states }
     }
 
-    fn data_ptr(&self) -> *mut u8 {
-        unsafe { (self as *const Self as *mut u8).add(std::mem::size_of::<Self>()) }
-    }
-
     fn state(&self) -> MetaState {
         self.states.state()
     }
@@ -339,16 +335,18 @@ impl std::error::Error for CircularBufferError {}
 #[derive(Debug)]
 struct States {
     head_addr: AtomicUsize,
-    evicting_addr: usize,
-    tail_addr: usize,
+    // Accessed only while CircularBuffer::lock is held.
+    evicting_addr: Cell<usize>,
+    // Copy-on-access queries read the tail without taking the allocation lock.
+    tail_addr: AtomicUsize,
 }
 
 impl States {
     fn new() -> Self {
         Self {
             head_addr: AtomicUsize::new(0),
-            evicting_addr: 0,
-            tail_addr: 0,
+            evicting_addr: Cell::new(0),
+            tail_addr: AtomicUsize::new(0),
         }
     }
 
@@ -357,7 +355,7 @@ impl States {
     }
 
     fn tail_addr(&self) -> usize {
-        self.tail_addr
+        self.tail_addr.load(Ordering::Relaxed)
     }
 }
 
@@ -369,7 +367,7 @@ impl States {
 /// and we don't want a big lock on everything.
 #[derive(Debug)]
 pub struct CircularBuffer {
-    states: UnsafeCell<States>,
+    states: States,
     capacity: usize,
     data_ptr: *mut u8,
     lock: Mutex<()>,
@@ -436,7 +434,7 @@ impl CircularBuffer {
         let copy_on_access_threshold = (capacity as f64 * (1.0 - copy_on_access_percent)) as usize;
 
         Self {
-            states: UnsafeCell::new(States::new()),
+            states: States::new(),
             capacity,
             free_list: FreeList::new(
                 min_record_size,
@@ -496,8 +494,7 @@ impl CircularBuffer {
         metrics
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn try_get_states(&self) -> Result<(MutexGuard<'_, ()>, &mut States), CircularBufferError> {
+    fn try_get_states(&self) -> Result<(MutexGuard<'_, ()>, &States), CircularBufferError> {
         let lock = match self.lock.try_lock() {
             Ok(v) => v,
             Err(TryLockError::Poisoned(_)) => {
@@ -506,15 +503,11 @@ impl CircularBuffer {
             Err(TryLockError::WouldBlock) => return Err(CircularBufferError::WouldBlock),
         };
 
-        let states = unsafe { &mut *self.states.get() };
-        Ok((lock, states))
+        Ok((lock, &self.states))
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn lock_states(&self) -> (MutexGuard<'_, ()>, &mut States) {
-        (self.lock.lock().unwrap(), unsafe {
-            &mut *self.states.get()
-        })
+    fn lock_states(&self) -> (MutexGuard<'_, ()>, &States) {
+        (self.lock.lock().unwrap(), &self.states)
     }
 
     /// Allocate a piece of memory from the circular buffer, returns a guard that will panic if not used.
@@ -576,7 +569,8 @@ impl CircularBuffer {
         }
 
         let logical_remaining = self.capacity - (states.tail_addr() - states.head_addr()); // Total amount of un-used memory
-        let physical_remaining = self.capacity - (states.tail_addr & (self.capacity - 1)); // Total amount of contiguous memory starting from the tail
+        let tail_addr = states.tail_addr();
+        let physical_remaining = self.capacity - (tail_addr & (self.capacity - 1)); // Total amount of contiguous memory starting from the tail
 
         let aligned_size = align_up(size, CB_ALLOC_META_SIZE);
         let required = aligned_size + std::mem::size_of::<AllocMeta>();
@@ -588,12 +582,14 @@ impl CircularBuffer {
         if physical_remaining < required {
             // fill the remaining physical space with a tombstone meta.
             assert!(physical_remaining >= CB_ALLOC_META_SIZE);
-            let physical_addr = self.logical_to_physical(states.tail_addr);
+            let physical_addr = self.logical_to_physical(tail_addr);
             let meta = AllocMeta::new((physical_remaining - CB_ALLOC_META_SIZE) as u32, true);
             unsafe {
                 physical_addr.cast::<AllocMeta>().write(meta);
             }
-            states.tail_addr += physical_remaining;
+            states
+                .tail_addr
+                .store(tail_addr + physical_remaining, Ordering::Relaxed);
             std::mem::drop(lock_guard);
             return self.alloc(size);
         }
@@ -601,11 +597,13 @@ impl CircularBuffer {
         let meta = AllocMeta::new(aligned_size as u32, false);
 
         unsafe {
-            let physical_addr = self.logical_to_physical(states.tail_addr);
+            let physical_addr = self.logical_to_physical(tail_addr);
             physical_addr.cast::<AllocMeta>().write(meta);
         }
-        let return_addr = states.tail_addr + std::mem::size_of::<AllocMeta>();
-        states.tail_addr += required;
+        let return_addr = tail_addr + std::mem::size_of::<AllocMeta>();
+        states
+            .tail_addr
+            .store(tail_addr + required, Ordering::Relaxed);
 
         let ptr = CircularBufferPtr::new(self.logical_to_physical(return_addr));
         Ok(ptr)
@@ -644,7 +642,7 @@ impl CircularBuffer {
     }
 
     fn get_fuzzy_tail_addr(&self) -> usize {
-        unsafe { &*self.states.get() }.tail_addr()
+        self.states.tail_addr()
     }
 
     /// This is used to sanity check that
@@ -841,11 +839,11 @@ impl CircularBuffer {
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     fn try_bump_head_address_to_evicting_addr(
         &self,
-        states: &mut States,
+        states: &States,
     ) -> Result<u32, CircularBufferError> {
         let mut head_addr = states.head_addr();
         let old_addr = head_addr;
-        let evicting_addr = states.evicting_addr;
+        let evicting_addr = states.evicting_addr.get();
         while head_addr < evicting_addr {
             let meta = self.get_meta(head_addr);
             if !meta.states.is_evicted() {
@@ -878,7 +876,7 @@ impl CircularBuffer {
         let (_lock, states) = self.lock_states();
         loop {
             if self.try_bump_head_address_to_evicting_addr(states).is_ok() {
-                assert_eq!(states.evicting_addr, states.head_addr());
+                assert_eq!(states.evicting_addr.get(), states.head_addr());
                 assert_eq!(states.head_addr(), states.tail_addr());
                 return;
             } else {
@@ -903,7 +901,7 @@ impl CircularBuffer {
         let (start_addr, end_addr) = {
             let (lock, states) = self.lock_states();
 
-            let evicting_addr = states.evicting_addr;
+            let evicting_addr = states.evicting_addr.get();
 
             if evicting_addr == states.tail_addr() {
                 // we are behind schedule here, should we call bump head address?
@@ -919,13 +917,14 @@ impl CircularBuffer {
 
             let advance = size + CB_ALLOC_META_SIZE;
 
-            states.evicting_addr += advance;
+            states.evicting_addr.set(evicting_addr + advance);
             drop(lock);
             (evicting_addr, evicting_addr + advance)
         };
 
         let meta = self.get_meta(start_addr);
-        let data_ptr = meta.data_ptr();
+        // Preserve backing-allocation provenance, not the narrower metadata reference.
+        let data_ptr = unsafe { self.logical_to_physical(start_addr).add(CB_ALLOC_META_SIZE) };
 
         let backoff = Backoff::new();
 
@@ -1013,6 +1012,77 @@ mod tests {
     use super::*;
     use crate::{BfTree, Config};
     use rstest::rstest;
+
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn circular_buffer_payload_and_state_borrows() {
+        let buffer = CircularBuffer::new(8192, 0.1, 64, 1952, 4096, 32, None, false);
+        let size = *buffer.free_list.size_classes.last().unwrap();
+        {
+            let (_lock, states) = buffer.lock_states();
+            assert_eq!(buffer.get_fuzzy_tail_addr(), 0);
+            assert_eq!(states.tail_addr(), 0);
+        }
+        for tag in 0..4u8 {
+            let allocation = buffer.alloc(size).unwrap();
+            let ptr = allocation.as_ptr();
+            drop(allocation);
+            buffer.dealloc(unsafe { buffer.acquire_exclusive_dealloc_handle(ptr).unwrap() });
+            let reused = buffer.alloc(size).unwrap();
+            assert_eq!(reused.as_ptr(), ptr);
+            unsafe { reused.as_ptr().write_bytes(tag, 64) };
+            drop(reused);
+            let mut visited = false;
+            buffer
+                .evict_n(usize::MAX, |handle| {
+                    visited = true;
+                    let bytes = unsafe { std::slice::from_raw_parts_mut(handle.as_ptr(), 64) };
+                    assert_eq!(bytes, &[tag; 64]);
+                    bytes.fill(tag.wrapping_add(1));
+                    Ok(handle)
+                })
+                .unwrap();
+            assert!(visited);
+        }
+    }
+
+    #[test]
+    fn circular_buffer_tail_queries_during_allocation() {
+        fn run() {
+            use crate::sync::{thread, Arc};
+            struct SharedBuffer(CircularBuffer);
+            // Exercise the same concurrent access permitted by BfTree's Send/Sync impls.
+            unsafe impl Send for SharedBuffer {}
+            unsafe impl Sync for SharedBuffer {}
+            let buffer = Arc::new(SharedBuffer(CircularBuffer::new(
+                8192, 0.1, 64, 1952, 4096, 32, None, false,
+            )));
+            let size = *buffer.0.free_list.size_classes.last().unwrap();
+            let writer_buffer = buffer.clone();
+            let writer = thread::spawn(move || {
+                for _ in 0..16 {
+                    drop(writer_buffer.0.alloc(size).unwrap());
+                }
+            });
+            let reader_buffer = buffer.clone();
+            let reader = thread::spawn(move || {
+                for _ in 0..16 {
+                    assert!(reader_buffer.0.get_fuzzy_tail_addr() < reader_buffer.0.capacity);
+                    let _ = reader_buffer
+                        .0
+                        .ptr_is_copy_on_access(reader_buffer.0.data_ptr);
+                }
+            });
+            writer.join().unwrap();
+            reader.join().unwrap();
+            buffer.0.evict_n(usize::MAX, Ok).unwrap();
+            assert_eq!(buffer.0.get_metrics().head_tail_distance, 0);
+        }
+        #[cfg(feature = "shuttle")]
+        shuttle::check_random(run, 100);
+        #[cfg(not(feature = "shuttle"))]
+        run();
+    }
 
     #[rstest]
     #[case(64, 1952, 4096)] // 1 leaf page = 1 disk page

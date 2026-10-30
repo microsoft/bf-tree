@@ -39,6 +39,34 @@ use proptest::{
 };
 use proptest_derive::Arbitrary;
 
+#[cfg(not(feature = "shuttle"))]
+#[rstest::rstest]
+fn empty_values_are_rejected_without_changing_records(#[values(false, true)] cache_only: bool) {
+    let mut config = BfTreeConfig::default();
+    config.cache_only(cache_only).cb_min_record_size(4);
+    let tree = BfTree::with_config(config, None).unwrap();
+    assert_eq!(
+        tree.insert(b"present", b"value"),
+        crate::LeafInsertResult::Success
+    );
+    for key in [b"present".as_slice(), b"absent"] {
+        assert!(matches!(
+            tree.insert(key, b""),
+            crate::LeafInsertResult::InvalidKV(_)
+        ));
+    }
+    let mut out = [0; 32];
+    assert_eq!(tree.read(b"present", &mut out), LeafReadResult::Found(5));
+    assert_eq!(&out[..5], b"value");
+    assert_eq!(tree.read(b"absent", &mut out), LeafReadResult::NotFound);
+    let mut scan = tree
+        .scan_with_count(b"a", usize::MAX, crate::ScanReturnField::KeyAndValue)
+        .unwrap();
+    assert_eq!(scan.next(&mut out), Some((7, 5)));
+    assert_eq!(&out[..12], b"presentvalue");
+    assert_eq!(scan.next(&mut out), None);
+}
+
 #[derive(Clone, Arbitrary, Debug)]
 enum TreeOp {
     Insert,

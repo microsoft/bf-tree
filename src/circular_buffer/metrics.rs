@@ -30,7 +30,7 @@ impl CircularBufferMetrics {
             capacity: cap,
             head_addr: states.head_addr(),
             tail_addr: states.tail_addr(),
-            evicting_addr: states.evicting_addr,
+            evicting_addr: states.evicting_addr.get(),
             head_tail_distance,
             allocated_cnt: 0,
             not_ready_cnt: 0,

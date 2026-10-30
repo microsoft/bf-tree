@@ -56,8 +56,13 @@ impl BfTree {
                     });
                 }
                 NodeInfo::Inner { level, ptr } => {
-                    let inner = ReadGuard::try_read(ptr).unwrap();
-                    let stats = inner.as_ref().get_stats();
+                    let backoff = crate::utils::Backoff::new();
+                    let stats = loop {
+                        match ReadGuard::try_read(ptr).and_then(|inner| inner.get_stats()) {
+                            Ok(stats) => break stats,
+                            Err(_) => backoff.spin(),
+                        }
+                    };
 
                     nodes.push(PerNodeStats {
                         level,
