@@ -198,15 +198,13 @@ Fuzz testing is a bug finding technique that generates random inputs to the syst
 
 #### Production Stress Matrix
 
-On November 1, 2026, a Linux production-stress campaign on GCR-SANDBOX-017
-completed **2,744 cases with zero failures**, pinned to CPU socket 0 (80 logical
-CPUs). It included 56 warmup cases and four rounds of 672 cases, using both
+On November 1, 2026, a production-stress campaign completed **2,744 cases with
+zero failures**. It included 56 warmup cases and four rounds of 672 cases, using both
 release builds and release builds with debug assertions and overflow checks.
 
 Each full round covered three value-size profiles, four memory-budget labels
 (minimum, double-minimum, quarter-data, and data), seven read/write/scan mixes,
-and eight worker counts: 1, 2, 4, 8, 16, 36, 72, and 144. The 144-worker cases
-intentionally oversubscribed the socket. Full cases used 262,144 records and a
+and eight worker counts: 1, 2, 4, 8, 16, 36, 72, and 144. Full cases used 262,144 records and a
 30-second workload; warmups used 65,536 records and 15 seconds. Preload,
 verification, drain, and teardown time were additional.
 
@@ -228,15 +226,12 @@ env BF_PRODUCTION_CASE='{"seed":42,"records":262144,"threads":8,"seconds":30,"ba
 ```
 
 Omitted JSON fields use the defaults in `src/tests/production_stress.rs`.
-The campaign's external supervisor enforced socket affinity and was configured
-to capture three GDB full-thread backtraces, process snapshots, and a core dump
+The campaign's external supervisor was configured to capture three GDB
+full-thread backtraces, process snapshots, and a core dump
 on stalls, then hold the original process for diagnosis. It used a 60-second workload
 no-progress trigger and 660-720-second whole-case diagnostic deadlines, with no
 overall campaign timeout. Timeouts, missing results, and zero-test runs were not
 counted as passes. The standalone command above does not provide that supervision.
-
-Campaign manifests, configurations, results, and per-case logs are retained on
-GCR-SANDBOX-017 at `/home/shayi/tests/code30-production-20261030-2240`.
 
 ### Benchmarking
 
