@@ -118,6 +118,65 @@ impl WriteAheadLogInner {
     }
 }
 
+#[cfg(all(test, not(feature = "shuttle")))]
+mod flush_failure_tests {
+    use super::*;
+    use crate::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailedWrite(AtomicUsize);
+
+    impl VfsImpl for FailedWrite {
+        fn open(_: impl AsRef<Path>) -> Self {
+            unreachable!()
+        }
+        fn alloc_offset(&self, _: usize) -> usize {
+            unreachable!()
+        }
+        fn dealloc_offset(&self, _: usize) {
+            unreachable!()
+        }
+        fn read(&self, _: usize, _: &mut [u8]) {
+            unreachable!()
+        }
+        fn flush(&self) {
+            unreachable!()
+        }
+        fn write(&self, offset: usize, bytes: &[u8]) {
+            assert_eq!(offset, 1024);
+            assert_eq!(bytes.len(), BLOCK_SIZE);
+            self.0.fetch_add(1, Ordering::Relaxed);
+            panic!("injected WAL write failure");
+        }
+    }
+
+    #[test]
+    fn wal_write_failure_does_not_advance_flushed_lsn() {
+        let file = Arc::new(FailedWrite(AtomicUsize::new(0)));
+        let mut buffer = RawBuffer::new(BLOCK_SIZE);
+        unsafe { buffer.as_mut_slice_at_exact(0, BLOCK_SIZE) }.fill(0x55);
+        let mut inner = WriteAheadLogInner {
+            buffer,
+            file_handle: file.clone(),
+            buffer_cursor: 32,
+            file_offset: 1024,
+            next_lsn: 8,
+            flushed_lsn: 3,
+            need_flush: true,
+        };
+        let error =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.flush())).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<&str>().copied(),
+            Some("injected WAL write failure")
+        );
+        assert_eq!(file.0.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.flushed_lsn, 3);
+        assert_eq!(inner.file_offset, 1024);
+        assert_eq!(inner.buffer_cursor, 32);
+        assert!(inner.need_flush);
+    }
+}
+
 pub(crate) struct WriteAheadLog {
     inner: Mutex<WriteAheadLogInner>,
     flushed_cond: Condvar,    // for workers that waiting for flush

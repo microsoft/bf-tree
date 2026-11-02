@@ -25,7 +25,14 @@ pub(crate) fn before_inner_child_read() {
 }
 
 #[rstest::rstest]
-fn traversal_rejects_unvalidated_inner_child(#[values(false, true)] aggressive: bool) {
+#[case::child_pointer(false, false)]
+#[case::child_span(true, false)]
+#[case::high_fence_span(true, true)]
+fn traversal_rejects_unvalidated_inner_child(
+    #[values(false, true)] aggressive: bool,
+    #[case] invalid_span: bool,
+    #[case] high_fence: bool,
+) {
     let mut config = Config::default();
     config
         .cb_size_byte(8 * 1024 * 1024)
@@ -48,10 +55,14 @@ fn traversal_rejects_unvalidated_inner_child(#[values(false, true)] aggressive: 
         }
     }
     let root = tree.get_root_page().0;
-    let child = {
+    let poisoned_index = u16::from(high_fence);
+    let (child, saved_meta) = {
         let reader = ReadGuard::try_read(root.as_inner_node()).unwrap();
         assert!(!reader.as_ref().meta.children_is_leaf());
-        reader.as_ref().get_value(reader.as_ref().get_kv_meta(0))
+        (
+            reader.checked_record(0).unwrap().value(),
+            *reader.as_ref().get_kv_meta(poisoned_index),
+        )
     };
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -64,8 +75,14 @@ fn traversal_rejects_unvalidated_inner_child(#[values(false, true)] aggressive: 
                     release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 }));
             });
+            let mut fence = Vec::new();
             matches!(
-                tree.traverse_to_leaf(&0u64.to_be_bytes(), aggressive, false, None),
+                tree.traverse_to_leaf(
+                    &0u64.to_be_bytes(),
+                    aggressive,
+                    high_fence,
+                    Some(&mut fence)
+                ),
                 Err(TreeError::Locked)
             )
         });
@@ -75,10 +92,28 @@ fn traversal_rejects_unvalidated_inner_child(#[values(false, true)] aggressive: 
             .upgrade()
             .unwrap();
         // Model transient bytes observed during an optimistic inner-node read.
-        writer.as_mut().update_at_pos(0, PageID::from_id(0));
+        if invalid_span {
+            super::inner_read_bounds::set_record_span(
+                writer.as_mut(),
+                poisoned_index,
+                u16::MAX,
+                saved_meta.key_len,
+            );
+        } else {
+            writer.as_mut().update_at_pos(0, PageID::from_id(0));
+        }
         release_tx.send(()).unwrap();
         let result = worker.join();
-        writer.as_mut().update_at_pos(0, child);
+        if invalid_span {
+            super::inner_read_bounds::set_record_span(
+                writer.as_mut(),
+                poisoned_index,
+                saved_meta.offset,
+                saved_meta.key_len,
+            );
+        } else {
+            writer.as_mut().update_at_pos(0, child);
+        }
         result
     });
     assert!(result.unwrap());

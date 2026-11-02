@@ -1165,6 +1165,8 @@ impl CPRSnapShotMgr {
             #[cfg(all(test, not(feature = "shuttle")))]
             port_regressions::checkpoint("publish");
             std::fs::rename(&tmp_path, final_path).expect("failed to publish snapshot");
+            #[cfg(all(test, not(feature = "shuttle")))]
+            port_regressions::checkpoint("published");
             #[cfg(unix)]
             if let Some(parent) = final_path.parent() {
                 if let Ok(dir) = std::fs::File::open(parent) {
@@ -1949,15 +1951,179 @@ mod port_regressions {
 
     thread_local! {
         static FAIL_STAGE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+        static CRASH_STAGE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     }
 
     pub(super) fn checkpoint(stage: &'static str) {
+        CRASH_STAGE.with(|crash| {
+            if crash.get() == Some(stage) {
+                let directory = std::env::var_os("BF_SNAPSHOT_CRASH_DIRECTORY").unwrap();
+                let mut witness =
+                    std::fs::File::create(Path::new(&directory).join("witness")).unwrap();
+                std::io::Write::write_all(&mut witness, stage.as_bytes()).unwrap();
+                witness.sync_all().unwrap();
+                // Only an armed disposable child exits without running destructors.
+                std::process::exit(86);
+            }
+        });
         FAIL_STAGE.with(|failure| {
             if failure.get() == Some(stage) {
                 failure.set(None);
                 panic!("injected snapshot failure at {stage}");
             }
         });
+    }
+
+    #[rstest::rstest]
+    fn publication_crash_recovers_complete_generation(
+        #[values("finalize", "flush", "publish", "published")] stage: &'static str,
+    ) {
+        fn expected(generation: u8) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+            (0..if generation == 0 { 128u64 } else { 160 })
+                .filter(|id| generation == 0 || *id >= 128 || id % 3 != 0)
+                .map(|id| {
+                    let mut value = vec![
+                        generation;
+                        if generation == 0 {
+                            64
+                        } else if id % 2 == 0 {
+                            192
+                        } else {
+                            16
+                        }
+                    ];
+                    value[..8].copy_from_slice(&id.to_be_bytes());
+                    (id.to_be_bytes().to_vec(), value)
+                })
+                .collect()
+        }
+        fn verify(tree: &BfTree, model: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>) {
+            let mut out = [0; 512];
+            for id in 0..=250u64 {
+                let key = id.to_be_bytes();
+                match tree.read(&key, &mut out) {
+                    crate::LeafReadResult::Found(size) => assert_eq!(
+                        model.get(key.as_slice()).map(Vec::as_slice),
+                        Some(&out[..size as usize])
+                    ),
+                    crate::LeafReadResult::Deleted | crate::LeafReadResult::NotFound => {
+                        assert!(!model.contains_key(key.as_slice()))
+                    }
+                    other => panic!("unexpected read: {other:?}"),
+                }
+            }
+            let mut scan = tree
+                .scan_with_count(
+                    &0u64.to_be_bytes(),
+                    usize::MAX,
+                    crate::ScanReturnField::KeyAndValue,
+                )
+                .unwrap();
+            for (key, value) in model {
+                assert_eq!(scan.next(&mut out), Some((key.len(), value.len())));
+                assert_eq!(&out[..key.len()], key);
+                assert_eq!(&out[key.len()..key.len() + value.len()], value);
+            }
+            assert_eq!(scan.next(&mut out), None);
+        }
+        if let Some(directory) = std::env::var_os("BF_SNAPSHOT_CRASH_DIRECTORY") {
+            let directory = Path::new(&directory);
+            let mut config = Config::new(directory.join("live"), 1024 * 1024);
+            config
+                .storage_backend(StorageBackend::Std)
+                .use_snapshot(true)
+                .cb_max_key_len(8)
+                .cb_max_record_size(256)
+                .read_promotion_rate(0)
+                .scan_promotion_rate(0);
+            let tree = BfTree::with_config(config, None).unwrap();
+            for (key, value) in expected(0) {
+                assert_eq!(tree.insert(&key, &value), crate::LeafInsertResult::Success);
+            }
+            assert!(!tree.get_root_page().1);
+            let path = directory.join("published.snapshot");
+            tree.cpr_snapshot(&path);
+            std::fs::copy(&path, directory.join("prior.sealed")).unwrap();
+            for id in (0..128u64).step_by(3) {
+                tree.delete(&id.to_be_bytes());
+            }
+            for (key, value) in expected(1) {
+                assert_eq!(tree.insert(&key, &value), crate::LeafInsertResult::Success);
+            }
+            verify(&tree, &expected(1));
+            CRASH_STAGE.with(|crash| crash.set(Some(stage)));
+            tree.cpr_snapshot(&path);
+            panic!("publication crash point was not reached");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let current = std::thread::current();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                current.name().unwrap(),
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("BF_SNAPSHOT_CRASH_DIRECTORY", directory.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86));
+        assert_eq!(
+            std::fs::read(directory.path().join("witness")).unwrap(),
+            stage.as_bytes()
+        );
+        let path = directory.path().join("published.snapshot");
+        let prior = std::fs::read(directory.path().join("prior.sealed")).unwrap();
+        let sealed = std::fs::read(&path).unwrap();
+        let published = stage == "published";
+        assert_eq!(
+            directory.path().join("published.snapshot_tmp").exists(),
+            !published
+        );
+        if published {
+            assert_ne!(sealed, prior);
+        } else {
+            assert_eq!(sealed, prior);
+        }
+        // This branch recovers in place: preserve sealed images by using private copies.
+        for (source, generation, label) in [
+            (path.clone(), u8::from(published), "current"),
+            (directory.path().join("prior.sealed"), 0, "prior"),
+        ] {
+            let working = directory.path().join(label);
+            std::fs::copy(source, &working).unwrap();
+            let recovered =
+                BfTree::new_from_cpr_snapshot(&working, false, None, None, None).unwrap();
+            verify(&recovered, &expected(generation));
+        }
+        let working = directory.path().join("retry-working");
+        std::fs::copy(&path, &working).unwrap();
+        let recovered = BfTree::new_from_cpr_snapshot(&working, true, None, None, None).unwrap();
+        let mut model = expected(u8::from(published));
+        let key = 250u64.to_be_bytes().to_vec();
+        assert_eq!(
+            recovered.insert(&key, &[9; 32]),
+            crate::LeafInsertResult::Success
+        );
+        model.insert(key, vec![9; 32]);
+        let retry = directory.path().join("retry.snapshot");
+        if !published {
+            std::fs::copy(
+                directory.path().join("published.snapshot_tmp"),
+                directory.path().join("retry.snapshot_tmp"),
+            )
+            .unwrap();
+        }
+        recovered.cpr_snapshot(&retry);
+        assert!(!directory.path().join("retry.snapshot_tmp").exists());
+        drop(recovered);
+        let reopened = BfTree::new_from_cpr_snapshot(&retry, false, None, None, None).unwrap();
+        verify(&reopened, &model);
+        assert_eq!(std::fs::read(&path).unwrap(), sealed);
+        assert_eq!(
+            std::fs::read(directory.path().join("prior.sealed")).unwrap(),
+            prior
+        );
     }
 
     #[rstest::rstest]
@@ -2184,16 +2350,24 @@ mod port_regressions {
         tree.cpr_snapshot(&path);
         let original = std::fs::read(&path).unwrap();
 
-        std::fs::write(&path, &original[..original.len() - SECTOR_SIZE]).unwrap();
-        assert!(matches!(
-            BfTree::new_from_cpr_snapshot(&path, false, None, None, None),
-            Err(ConfigError::SnapshotFileInvalid(_))
-        ));
-        std::fs::write(&path, &original[..100]).unwrap();
-        assert!(matches!(
-            BfTree::new_from_cpr_snapshot(&path, false, None, None, None),
-            Err(ConfigError::SnapshotFileInvalid(_))
-        ));
+        for length in [
+            0,
+            100,
+            std::mem::size_of::<BfTreeMeta>() - 1,
+            DISK_PAGE_SIZE,
+            original.len() - 1,
+            original.len() - SECTOR_SIZE,
+        ] {
+            std::fs::write(&path, &original[..length]).unwrap();
+            assert!(
+                matches!(
+                    BfTree::new_from_cpr_snapshot(&path, false, None, None, None),
+                    Err(ConfigError::SnapshotFileInvalid(_))
+                ),
+                "accepted truncated snapshot of {length} bytes"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original[..length]);
+        }
         for (offset, replacement) in [
             (0, vec![b'X']),
             (std::mem::offset_of!(BfTreeMeta, cache_only), vec![2]),
@@ -2216,7 +2390,7 @@ mod port_regressions {
         ] {
             let mut corrupted = original.clone();
             corrupted[offset..offset + replacement.len()].copy_from_slice(&replacement);
-            std::fs::write(&path, corrupted).unwrap();
+            std::fs::write(&path, &corrupted).unwrap();
             assert!(
                 matches!(
                     BfTree::new_from_cpr_snapshot(&path, false, None, None, None),
@@ -2224,6 +2398,7 @@ mod port_regressions {
                 ),
                 "invalid header at offset {offset} was accepted"
             );
+            assert_eq!(std::fs::read(&path).unwrap(), corrupted);
         }
     }
 
@@ -2425,8 +2600,8 @@ mod tests {
 
         fn put(tree: &BfTree, model: &mut Model, id: u64, version: u8) {
             let key = id.to_be_bytes().to_vec();
-            let mut value = key.repeat(8);
-            value[63] = version;
+            let mut value = key.repeat([8, 24, 2][usize::from(version % 3)]);
+            *value.last_mut().unwrap() = version;
             assert_eq!(tree.insert(&key, &value), LeafInsertResult::Success);
             model.insert(key, value);
         }
