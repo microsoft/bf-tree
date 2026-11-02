@@ -1,6 +1,21 @@
 
 # Fuzzing quick start
 
+The targets share their bounded operation drivers with deterministic regressions:
+
+```bash
+cargo test --manifest-path fuzz/Cargo.toml --test regressions
+```
+
+`bf_tree` uses a promotion-policy byte followed by eight-byte operations. It
+checks independent keys and values, deletes, inclusive/count scans, and recovered
+snapshots against an ordered map. `circular_buffer` uses three-byte operations
+to check live payloads across size-class boundaries, explicit frees, reuse, and
+eviction. Each tree input owns a temporary directory that is removed on exit.
+
+These encodings replace the old `arbitrary`-derived corpus format; old corpus
+bytes do not replay the same operations.
+
 
 ### Setup
 ```bash

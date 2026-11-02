@@ -15,6 +15,17 @@ mod tree;
 
 mod concurrent;
 
+mod linearizability;
+
+#[cfg(not(feature = "shuttle"))]
+mod stateful_tree;
+
+#[cfg(not(feature = "shuttle"))]
+mod concurrent_scans;
+
+#[cfg(all(target_os = "linux", not(feature = "shuttle")))]
+mod resource_lifecycle;
+
 #[cfg(not(feature = "shuttle"))]
 pub(crate) mod migrated_concurrency;
 

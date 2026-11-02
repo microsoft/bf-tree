@@ -41,13 +41,17 @@ impl TestNode {
     }
 
     fn set_span(&mut self, index: u16, offset: u16, key_len: u16) {
-        let mut meta = unsafe { *(*self.0).get_kv_meta(index) };
-        let slot = size_of::<InnerNode>() + index as usize * size_of_val(&meta);
-        meta.offset = offset;
-        meta.key_len = key_len;
-        unsafe {
-            std::ptr::write(self.0.cast::<u8>().add(slot).cast(), meta);
-        }
+        set_record_span(unsafe { &mut *self.0 }, index, offset, key_len);
+    }
+}
+
+pub(super) fn set_record_span(node: &mut InnerNode, index: u16, offset: u16, key_len: u16) {
+    let mut meta = *node.get_kv_meta(index);
+    let slot = size_of::<InnerNode>() + index as usize * size_of_val(&meta);
+    meta.offset = offset;
+    meta.key_len = key_len;
+    unsafe {
+        std::ptr::write((node as *mut InnerNode).cast::<u8>().add(slot).cast(), meta);
     }
 }
 

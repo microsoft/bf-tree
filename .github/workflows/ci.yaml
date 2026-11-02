@@ -41,9 +41,18 @@ jobs:
       - run: sudo apt update && sudo apt install -y llvm-dev
       - run: echo "PATH=/usr/lib/llvm-14/bin:$PATH" >> $GITHUB_ENV
       - run: cargo test
+      - name: Serial resource lifecycle checks
+        run: env BFTREE_RESOURCE_CHECK=1 cargo test --release --lib resource_lifecycle -- --test-threads=1
+      - name: Deterministic fuzz regressions
+        run: cargo test --manifest-path fuzz/Cargo.toml --test regressions
       - run: >
           env ASAN_OPTIONS="detect_odr_violation=0" RUSTFLAGS="-Z sanitizer=address"
           cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu --tests
+      - name: Fuzz regressions under ASan and leak detection
+        run: >
+          env ASAN_OPTIONS="detect_odr_violation=0:detect_leaks=1" RUSTFLAGS="-Zsanitizer=address"
+          cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
+          --manifest-path fuzz/Cargo.toml --test regressions
       # Temporarily disabled
       # I believe it is a bug elsewhere, not from us.
       # - run: >
@@ -59,6 +68,17 @@ jobs:
       - run: >
           env RUST_BACKTRACE=1
           cargo test --lib --features "shuttle" --release shuttle_cpr_snapshot_cache_only
+      - name: Modeled point histories and publication
+        run: >
+          cargo test --lib --features shuttle --release --
+          tests::linearizability allocation_publication
+          circular_buffer_tail_queries shuttle_visitors_retry
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: linearizability-schedules
+          path: target/linearizability-schedules/
+          if-no-files-found: ignore
 
   miri:
     needs: check-fmt-build
@@ -70,6 +90,10 @@ jobs:
       - uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26 # v3.7.0
       - run: rustup toolchain install nightly --component miri --component rust-src
       - run: cargo +nightly miri setup
+      - name: Circular-buffer boundary and reuse fuzz regression under Miri
+        run: >
+          cargo +nightly miri test --manifest-path fuzz/Cargo.toml
+          --test regressions circular_buffer_wrap_reuse_boundary_seeds
       # CPR handshake weak-memory litmus tests. Weak-memory emulation is on by
       # default (the meaningful configuration); seeds 0..3 match the controls
       # documented in the `cpr_handshake_miri` module in src/snapshot.rs.
