@@ -21,7 +21,7 @@ use crate::{
     check_parent,
     circular_buffer::{CircularBufferMetrics, TombstoneHandle},
     counter,
-    error::{ConfigError, TreeError},
+    error::{BufferTooSmall, ConfigError, TreeError},
     histogram, info,
     mini_page_op::{upgrade_to_full_page, LeafEntryXLocked, LeafOperations, ReadResult},
     nodes::{
@@ -64,6 +64,22 @@ unsafe impl Send for BfTree {}
 pub enum LeafInsertResult {
     Success,
     InvalidKV(String),
+}
+
+/// Completion of a delete operation, without an existence guarantee.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum LeafDeleteResult {
+    Success,
+    InvalidKey,
+}
+
+/// Persisted record limits of an open tree.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct TreeRecordLimits {
+    pub minimum_record_bytes: usize,
+    pub maximum_record_bytes: usize,
+    pub maximum_key_bytes: usize,
+    pub leaf_page_bytes: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1099,6 +1115,16 @@ impl BfTree {
         Ok(evicted)
     }
 
+    /// Returns the effective limits, including those restored from a snapshot.
+    pub fn record_limits(&self) -> TreeRecordLimits {
+        TreeRecordLimits {
+            minimum_record_bytes: self.config.cb_min_record_size,
+            maximum_record_bytes: self.config.cb_max_record_size,
+            maximum_key_bytes: (self.config.max_fence_len / 2).min(MAX_KEY_LEN),
+            leaf_page_bytes: self.config.leaf_page_size,
+        }
+    }
+
     /// Insert a key-value pair to the system, overrides existing value if present.
     ///
     /// ```
@@ -1188,7 +1214,8 @@ impl BfTree {
     /// Read a record from the tree.
     /// Returns the number of bytes read.
     ///
-    /// TODO: don't panic if the out_buffer is too small, instead returns a error.
+    /// Panics if the output buffer is too small.
+    /// Use [`BfTree::read_checked`] to obtain the required capacity instead.
     ///
     /// ```
     /// use bf_tree::BfTree;
@@ -1205,14 +1232,28 @@ impl BfTree {
     /// assert_eq!(&buffer[..5], b"value");
     /// ```
     pub fn read(&self, key: &[u8], out_buffer: &mut [u8]) -> LeafReadResult {
+        self.read_checked(key, out_buffer)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Reads a record without panicking for insufficient output capacity.
+    ///
+    /// The required capacity can change before a retry. Use output bytes only
+    /// after `Found`: a failed call can retain bytes from an internal attempt.
+    /// Native I/O failures and internal defects can still panic.
+    pub fn read_checked(
+        &self,
+        key: &[u8],
+        out_buffer: &mut [u8],
+    ) -> Result<LeafReadResult, BufferTooSmall> {
         // The input key cannot exceed the configured max key length
         if key.len() > self.config.max_fence_len / 2 || key.len() > MAX_KEY_LEN {
-            return LeafReadResult::InvalidKey;
+            return Ok(LeafReadResult::InvalidKey);
         }
 
         // The input key has to be one byte at least
         if key.is_empty() {
-            return LeafReadResult::InvalidKey;
+            return Ok(LeafReadResult::InvalidKey);
         }
 
         let backoff = Backoff::new();
@@ -1266,14 +1307,22 @@ impl BfTree {
     /// assert_eq!(rt, LeafReadResult::Deleted);
     /// ```
     pub fn delete(&self, key: &[u8]) {
+        let _ = self.delete_checked(key);
+    }
+
+    /// Deletes a key and reports invalid input explicitly.
+    ///
+    /// `Success` means the delete completed, not that a live record existed.
+    /// Native I/O failures and internal defects can still panic.
+    pub fn delete_checked(&self, key: &[u8]) -> LeafDeleteResult {
         // The input key cannot exceed the configured max key length
         if key.len() > self.config.max_fence_len / 2 || key.len() > MAX_KEY_LEN {
-            return;
+            return LeafDeleteResult::InvalidKey;
         }
 
         // The input key has to be one byte at least
         if key.is_empty() {
-            return;
+            return LeafDeleteResult::InvalidKey;
         }
 
         let backoff = Backoff::new();
@@ -1285,7 +1334,7 @@ impl BfTree {
         loop {
             let result = self.write_inner(WriteOp::make_delete(key), aggressive_split);
             match result {
-                Ok(_) => return,
+                Ok(_) => return LeafDeleteResult::Success,
                 Err(TreeError::CircularBufferFull) => {
                     info!("delete failed, started evict from circular buffer");
                     aggressive_split = true;
@@ -1435,31 +1484,34 @@ impl BfTree {
         key: &[u8],
         out_buffer: &mut [u8],
         aggressive_split: bool,
-    ) -> Result<LeafReadResult, TreeError> {
+    ) -> Result<Result<LeafReadResult, BufferTooSmall>, TreeError> {
         let (node, parent) = self.traverse_to_leaf(key, aggressive_split, false, None)?;
 
         let mut leaf = self.mapping_table().get(&node);
 
         check_parent!(self, node, parent);
 
-        let out = leaf.read(
+        let out = match leaf.read(
             key,
             out_buffer,
             self.config.mini_page_binary_search,
             self.cache_only,
-        );
+        ) {
+            Ok(out) => out,
+            Err(error) => return Ok(Err(error)),
+        };
         match out {
             ReadResult::Mini(r) | ReadResult::Full(r) => {
                 if leaf.cache_page_about_to_evict(&self.storage) {
                     let mut x_leaf = match leaf.try_upgrade(self.snapshot_mgr.clone(), node) {
                         Ok(v) => v,
-                        Err(_) => return Ok(r),
+                        Err(_) => return Ok(Ok(r)),
                     };
                     // we don't care about the result here, because we are in read path, we don't want to block.
                     _ = x_leaf.move_cache_page_to_tail(&self.storage);
                 }
 
-                Ok(r)
+                Ok(Ok(r))
             }
 
             ReadResult::Base(r) => {
@@ -1472,17 +1524,17 @@ impl BfTree {
 
                 let v = match r {
                     LeafReadResult::Found(v) => v,
-                    _ => return Ok(r),
+                    _ => return Ok(Ok(r)),
                 };
 
                 if parent.is_none() || !self.should_promote_read() {
-                    return Ok(r);
+                    return Ok(Ok(r));
                 }
 
                 let mut x_leaf = match leaf.try_upgrade(self.snapshot_mgr.clone(), node) {
                     Ok(x) => x,
                     Err(_) => {
-                        return Ok(r);
+                        return Ok(Ok(r));
                     }
                 };
 
@@ -1504,12 +1556,12 @@ impl BfTree {
                     match out {
                         Ok(_) => {
                             counter!(ReadPromotionOk);
-                            Ok(r)
+                            Ok(Ok(r))
                         }
                         Err(TreeError::Locked) => {
                             // We are doing this very optimistically, if contention happens, we just abort and return.
                             counter!(ReadPromotionFailed);
-                            Ok(r)
+                            Ok(Ok(r))
                         }
                         Err(TreeError::CircularBufferFull) => {
                             counter!(ReadPromotionFailed);
@@ -1523,12 +1575,12 @@ impl BfTree {
                     }
                 } else {
                     match self.upgrade_to_full_page(x_leaf, parent.unwrap()) {
-                        Ok(_) | Err(TreeError::Locked) => Ok(r),
+                        Ok(_) | Err(TreeError::Locked) => Ok(Ok(r)),
                         Err(e) => Err(e),
                     }
                 }
             }
-            ReadResult::None => Ok(LeafReadResult::NotFound),
+            ReadResult::None => Ok(Ok(LeafReadResult::NotFound)),
         }
     }
 

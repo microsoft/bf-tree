@@ -153,6 +153,9 @@ impl<'b> ScanIterMut<'_, 'b> {
                 self.return_field,
                 &self.end_key,
             ) {
+                GetScanRecordByPosResult::BufferTooSmall(required) => {
+                    panic!("{}", crate::BufferTooSmall { required });
+                }
                 GetScanRecordByPosResult::Deleted => {
                     self.scan_position.move_to_next();
                     continue;
@@ -316,9 +319,22 @@ impl<'b> ScanIter<'_, 'b> {
     /// next() terminates if 1) reached the last key. 2) scanned `scan_cnt` records, if set. 3) reached end_key, if set.
     /// Returns the length of the record fields copied into `out_buffer` or None if there is no more value.
     pub fn next(&mut self, out_buffer: &mut [u8]) -> Option<(usize, usize)> {
+        self.next_checked(out_buffer)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Reads the next record without panicking for insufficient capacity.
+    ///
+    /// A short buffer leaves its bytes unchanged and does not consume the live
+    /// record. Deleted entries can be skipped before that result. Native I/O
+    /// failures and internal defects can still panic.
+    pub fn next_checked(
+        &mut self,
+        out_buffer: &mut [u8],
+    ) -> Result<Option<(usize, usize)>, crate::BufferTooSmall> {
         loop {
-            if self.scan_cnt == 0 && self.end_key.is_none() {
-                return None;
+            if self.scan_cnt == 0 {
+                return Ok(None);
             }
 
             match self.leaf_lock.get_record_by_pos_with_bound(
@@ -327,6 +343,9 @@ impl<'b> ScanIter<'_, 'b> {
                 self.return_field,
                 &self.end_key,
             ) {
+                GetScanRecordByPosResult::BufferTooSmall(required) => {
+                    return Err(crate::BufferTooSmall { required });
+                }
                 GetScanRecordByPosResult::Deleted => {
                     self.scan_position.move_to_next();
                     continue;
@@ -334,24 +353,21 @@ impl<'b> ScanIter<'_, 'b> {
                 GetScanRecordByPosResult::Found(key_len, value_len) => {
                     self.scan_position.move_to_next();
                     self.scan_cnt -= 1;
-                    return Some((key_len as usize, value_len as usize));
+                    return Ok(Some((key_len as usize, value_len as usize)));
                 }
                 GetScanRecordByPosResult::EndOfLeaf => {
-                    // we need to load next leaf.
                     counter!(ScanGoNextLeaf);
                     let right_sibling = if !self.tree.cache_only {
                         self.leaf_lock.get_right_sibling()
+                    } else if let Some(key) = self.next_key.as_ref() {
+                        key.clone()
                     } else {
-                        if let Some(key) = self.next_key.as_ref() {
-                            key.clone()
-                        } else {
-                            panic!("next_key is None in cache_only mode");
-                        }
+                        panic!("next_key is None in cache_only mode");
                     };
 
                     if right_sibling.is_empty() {
                         self.scan_cnt = 0;
-                        return None;
+                        return Ok(None);
                     }
 
                     if self
@@ -360,7 +376,7 @@ impl<'b> ScanIter<'_, 'b> {
                         .is_some_and(|end| &right_sibling > end)
                     {
                         self.scan_cnt = 0;
-                        return None;
+                        return Ok(None);
                     }
 
                     let backoff = Backoff::new();
@@ -401,7 +417,7 @@ impl<'b> ScanIter<'_, 'b> {
                 }
                 GetScanRecordByPosResult::BoundKeyExceeded => {
                     self.scan_cnt = 0;
-                    return None;
+                    return Ok(None);
                 }
             }
         }

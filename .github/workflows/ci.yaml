@@ -8,6 +8,26 @@ on:
     branches: [main]
 
 jobs:
+  checked-c-abi:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26
+      - run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo +1.93.0 fmt --manifest-path bf-tree-ffi/Cargo.toml -- --check
+      - run: cargo +1.93.0 clippy --manifest-path bf-tree-ffi/Cargo.toml --locked --all-targets --no-deps -- -D warnings
+      - run: cargo +1.93.0 test --manifest-path bf-tree-ffi/Cargo.toml --locked --release
+      - if: runner.os == 'Windows'
+        run: cmake -S bf-tree-ffi -B bf-tree-ffi/build -A x64
+      - if: runner.os == 'Linux'
+        run: cmake -S bf-tree-ffi -B bf-tree-ffi/build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build bf-tree-ffi/build --config Release --parallel 4
+      - run: ctest --test-dir bf-tree-ffi/build -C Release --output-on-failure
+
   check-fmt-build:
     runs-on: ubuntu-22.04
     timeout-minutes: 30

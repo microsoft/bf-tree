@@ -29,10 +29,10 @@ mod tree;
 mod utils;
 
 pub use config::{Config, StorageBackend, WalConfig};
-pub use error::ConfigError;
+pub use error::{BufferTooSmall, ConfigError, SnapshotError};
 pub use nodes::leaf_node::LeafReadResult;
 pub use range_scan::{ScanIter, ScanReturnField};
-pub use tree::{BfTree, LeafInsertResult, ScanIterError};
+pub use tree::{BfTree, LeafDeleteResult, LeafInsertResult, ScanIterError, TreeRecordLimits};
 pub use wal::WalReader;
 
 #[macro_export]

@@ -170,35 +170,35 @@ pub(crate) trait LeafOperations {
         out_buffer: &mut [u8],
         mini_page_binary_search: bool,
         cache_only: bool,
-    ) -> ReadResult {
+    ) -> Result<ReadResult, crate::BufferTooSmall> {
         let page_loc = self.get_page_location();
 
         let next_level = match page_loc {
             PageLocation::Base(offset) => {
                 let base_ref = self.load_base_page(*offset);
-                let out = base_ref.read_by_key(key, out_buffer);
-                return ReadResult::Base(out);
+                let out = base_ref.read_by_key_inner(key, out_buffer, true)?;
+                return Ok(ReadResult::Base(out));
             }
             PageLocation::Full(ptr) => {
                 counter!(FullPageRead);
                 let base_ref = self.load_cache_page(*ptr);
-                let out = base_ref.read_by_key(key, out_buffer);
+                let out = base_ref.read_by_key_inner(key, out_buffer, true)?;
                 histogram!(HitMiniPage, base_ref.meta.node_size as u64);
-                return ReadResult::Full(out);
+                return Ok(ReadResult::Full(out));
             }
             PageLocation::Mini(ptr) => {
                 counter!(MiniPageRead);
                 let mini_page = self.load_cache_page(*ptr);
-                let out = mini_page.read_by_key_inner(key, out_buffer, mini_page_binary_search);
+                let out = mini_page.read_by_key_inner(key, out_buffer, mini_page_binary_search)?;
                 histogram!(HitMiniPage, mini_page.meta.node_size as u64);
                 match out {
                     LeafResult::Found(_) | LeafResult::Deleted | LeafResult::InvalidKey => {
-                        return ReadResult::Mini(out);
+                        return Ok(ReadResult::Mini(out));
                     }
                     LeafResult::NotFound => {
                         // In cache only mode, we return not found
                         if cache_only {
-                            return ReadResult::None;
+                            return Ok(ReadResult::None);
                         }
 
                         // fall through
@@ -208,14 +208,14 @@ pub(crate) trait LeafOperations {
                 }
             }
             PageLocation::Null => {
-                return ReadResult::None;
+                return Ok(ReadResult::None);
             }
         };
 
         let base_ref = self.load_base_page(next_level.as_offset());
 
-        let out = base_ref.read_by_key(key, out_buffer);
-        ReadResult::Base(out)
+        let out = base_ref.read_by_key_inner(key, out_buffer, true)?;
+        Ok(ReadResult::Base(out))
     }
 
     /// Returns the pos of the key when scanning, i.e., the keys[pos] >= key.
