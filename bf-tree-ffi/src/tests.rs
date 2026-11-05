@@ -552,6 +552,113 @@ fn snapshot_recovery_preserves_modes_generation_and_private_backing() {
 }
 
 #[test]
+fn recovery_checks_limits_and_uses_snapshot_scratch_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    let snapshot = directory.path().join("snapshot.cpr");
+    let working = directory.path().join("working.cpr");
+    let mut config = memory_config();
+    config.minimum_record_bytes = 8;
+    config.maximum_record_bytes = 3000;
+    config.maximum_key_bytes = 24;
+    config.leaf_page_bytes = 8192;
+    let mut raw = ptr::null_mut();
+    assert_eq!(
+        unsafe { bf_tree_create(&config, &mut raw, ptr::null_mut()) },
+        BfTreeStatus::Ok
+    );
+    let original = Handle(raw);
+    let key = [b'k'; 20];
+    let value = vec![0x5A; 2500];
+    original.put(&key, &value);
+    let snapshot_text = snapshot.to_str().unwrap();
+    let mut generation = 0;
+    assert_eq!(
+        unsafe {
+            bf_tree_cpr_snapshot(
+                original.0,
+                snapshot_text.as_ptr(),
+                snapshot_text.len(),
+                &mut generation,
+                ptr::null_mut(),
+            )
+        },
+        BfTreeStatus::Ok
+    );
+
+    fs::copy(&snapshot, &working).unwrap();
+    let working_text = working.to_str().unwrap();
+    let mut request = memory_config();
+    request.minimum_record_bytes = 0;
+    assert_eq!(
+        unsafe {
+            bf_tree_recover(
+                &request,
+                working_text.as_ptr(),
+                working_text.len(),
+                generation,
+                0,
+                &mut raw,
+                ptr::null_mut(),
+            )
+        },
+        BfTreeStatus::Ok
+    );
+    let restored = Handle(raw);
+    let mut output = vec![0; value.len()];
+    assert_eq!(
+        restored.read(&key, &mut output),
+        (BfTreeStatus::Ok, value.len())
+    );
+    assert_eq!(output, value);
+    let mut bytes = vec![0; key.len() + value.len()];
+    assert_eq!(
+        bounded(
+            &restored,
+            &options(&key, b"", 1, 3000),
+            &mut bytes,
+            &mut [record()],
+        ),
+        (BfTreeStatus::Ok, bytes.len(), 1)
+    );
+    assert_eq!(&bytes[..key.len()], &key);
+    assert_eq!(&bytes[key.len()..], &value);
+
+    for (minimum, maximum, key, leaf) in [
+        (4, 0, 0, 0),
+        (0, 1952, 0, 0),
+        (0, 0, 16, 0),
+        (0, 0, 0, 4096),
+    ] {
+        let mut request = memory_config();
+        request.minimum_record_bytes = minimum;
+        request.maximum_record_bytes = maximum;
+        request.maximum_key_bytes = key;
+        request.leaf_page_bytes = leaf;
+        let copy = directory
+            .path()
+            .join(format!("mismatch-{minimum}-{maximum}-{key}-{leaf}.cpr"));
+        fs::copy(&snapshot, &copy).unwrap();
+        let text = copy.to_str().unwrap();
+        let mut rejected = ptr::dangling_mut::<BfTreeHandle>();
+        assert_eq!(
+            unsafe {
+                bf_tree_recover(
+                    &request,
+                    text.as_ptr(),
+                    text.len(),
+                    generation,
+                    0,
+                    &mut rejected,
+                    ptr::null_mut(),
+                )
+            },
+            BfTreeStatus::InvalidConfig
+        );
+        assert!(rejected.is_null());
+    }
+}
+
+#[test]
 fn panic_fences_all_data_operations_and_overlapping_success() {
     let handle = Handle::new();
     handle.put(b"key", b"value");
@@ -570,7 +677,10 @@ fn panic_fences_all_data_operations_and_overlapping_success() {
     entered_rx.recv().unwrap();
     let status = unsafe {
         ffi_call(ptr::null_mut(), || {
-            with_tree(handle.0, false, |_| panic!("injected native failure"))
+            with_tree(handle.0, false, |state| {
+                state.tree.read(b"key", &mut []);
+                Ok(BfTreeStatus::Ok)
+            })
         })
     };
     assert_eq!(status, BfTreeStatus::Panic);

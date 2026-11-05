@@ -9,21 +9,21 @@ repository = "https://github.com/microsoft/bf-tree"
 readme = "README.md"
 publish = false
 include = [
-    "Cargo.toml",
-    "Cargo.lock",
-    "README.md",
-    "LICENSE.txt",
-    "CMakeLists.txt",
-    "include/**",
-    "src/**",
-    "tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE.txt",
+    "/CMakeLists.txt",
+    "/include/**",
+    "/src/**",
+    "/tests/**",
 ]
 
 [lib]
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-# This candidate needs the adjacent, unreleased checked native API.
+# Recovery validation needs the adjacent Config limit getters.
 bf-tree = { path = "..", version = "=0.5.7" }
 
 [dev-dependencies]

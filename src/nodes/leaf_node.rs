@@ -1665,10 +1665,8 @@ impl LeafNode {
         self.snapshot_version &= Self::LEAF_SNAPSHOT_VERSION_MASK;
     }
 
-    #[cfg(test)]
     pub(crate) fn read_by_key(&self, search_key: &[u8], out_buffer: &mut [u8]) -> LeafReadResult {
         self.read_by_key_inner(search_key, out_buffer, true)
-            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// Read by key.
@@ -1678,7 +1676,7 @@ impl LeafNode {
         search_key: &[u8],
         out_buffer: &mut [u8],
         binary_search: bool,
-    ) -> Result<LeafReadResult, crate::BufferTooSmall> {
+    ) -> LeafReadResult {
         let val_count = self.meta.meta_count_with_fence();
         let pos = if binary_search {
             self.lower_bound(search_key)
@@ -1688,7 +1686,7 @@ impl LeafNode {
 
         if pos >= val_count {
             counter!(LeafNotFoundDueToRange);
-            return Ok(LeafReadResult::NotFound);
+            return LeafReadResult::NotFound;
         }
 
         let kv_meta = self.get_kv_meta(pos as usize);
@@ -1704,21 +1702,16 @@ impl LeafNode {
 
         if cmp != Ordering::Equal {
             counter!(LeafNotFoundDueToKey);
-            Ok(LeafReadResult::NotFound)
+            LeafReadResult::NotFound
         } else {
             if kv_meta.op_type().is_absent() {
-                return Ok(LeafReadResult::Deleted);
+                return LeafReadResult::Deleted;
             }
             let val_len = kv_meta.value_len();
             let val_ref = self.get_value(kv_meta);
             debug_assert_eq!(val_len as usize, val_ref.len());
-            let output = out_buffer
-                .get_mut(..val_len as usize)
-                .ok_or(crate::BufferTooSmall {
-                    required: val_len as usize,
-                })?;
-            output.copy_from_slice(val_ref);
-            Ok(LeafReadResult::Found(val_len as u32))
+            out_buffer[..val_len as usize].copy_from_slice(val_ref);
+            LeafReadResult::Found(val_len as u32)
         }
     }
 
@@ -1940,9 +1933,6 @@ impl LeafNode {
 
                 let value = self.get_value(meta);
                 let value_len = meta.value_len() as usize;
-                if out_buffer.len() < value_len {
-                    return GetScanRecordByPosResult::BufferTooSmall(value_len);
-                }
                 out_buffer[..value_len].copy_from_slice(value);
                 GetScanRecordByPosResult::Found(0, value_len as u32)
             }
@@ -1957,9 +1947,6 @@ impl LeafNode {
                 }
 
                 let key_len = full_key.len();
-                if out_buffer.len() < key_len {
-                    return GetScanRecordByPosResult::BufferTooSmall(key_len);
-                }
                 out_buffer[..key_len].copy_from_slice(&full_key);
                 GetScanRecordByPosResult::Found(key_len as u32, 0)
             }
@@ -1977,9 +1964,6 @@ impl LeafNode {
                 let value = self.get_value(meta);
                 let value_len = meta.value_len() as usize;
 
-                if out_buffer.len() < key_len + value_len {
-                    return GetScanRecordByPosResult::BufferTooSmall(key_len + value_len);
-                }
                 out_buffer[..key_len].copy_from_slice(&full_key);
                 out_buffer[key_len..key_len + value_len].copy_from_slice(value);
 
@@ -2023,7 +2007,6 @@ pub(crate) enum GetScanRecordByPosResult {
     Deleted,
     Found(u32, u32),  // length of returned key and value
     BoundKeyExceeded, // The key at the pos exceeds a given bound key
-    BufferTooSmall(usize),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

@@ -37,25 +37,13 @@ assert_eq!(read_size, LeafReadResult::Found(5));
 assert_eq!(&buffer[..5], b"value");
 ```
 
-### Checked operation results
+### C and C++ interface
 
-The additive checked API reports expected caller errors without changing the
-existing Rust methods or snapshot format:
-
-- `BfTree::read_checked` reports required output capacity.
-- `ScanIter::next_checked` reports required capacity without consuming the record.
-- `BfTree::delete_checked` reports invalid keys instead of silently ignoring them.
-- `BfTree::cpr_snapshot_checked` reports disabled or concurrent capture requests.
-
-`BfTree::insert` also rejects empty values through `InvalidKV`, rather than a
-leaf assertion. The native format still requires a nonempty inserted value.
-
-Native I/O failures and internal defects can still panic. A foreign-language
-boundary must contain unwinding and fence handles whose safety remains uncertain.
-See the [checked API contract](doc/checked-api.md) for buffer, lifecycle, and
-compatibility rules. This Rust foundation is not a released C ABI package.
-The [unreleased C ABI candidate](bf-tree-ffi/README.md) preserves ABI-v1 calls
-and adds capability discovery, bounded scans, and handle fencing.
+The [unreleased C ABI package](bf-tree-ffi/README.md) wraps the existing Rust
+operations with caller-owned buffers, explicit statuses, bounded scans, and
+panic fencing. It preserves ABI-v1 layouts and signatures.
+The native read, scan, mutation, and snapshot implementations remain unchanged.
+Recovery validation uses two additional read-only `Config` getters.
 
 ### Snapshots and Recovery
 

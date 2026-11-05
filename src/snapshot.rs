@@ -1030,18 +1030,15 @@ impl CPRSnapShotMgr {
     }
 
     /// Take a CPR snapshot of a Bf-Tree
-    pub fn snapshot(
-        &self,
-        tree: &BfTree,
-        snapshot_file_path: impl AsRef<Path>,
-    ) -> Result<(), crate::SnapshotError> {
+    pub fn snapshot(&self, tree: &BfTree, snapshot_file_path: impl AsRef<Path>) {
         // Allowing only one active snapshot at a time.
         if self
             .snapshot_in_progress
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
-            return Err(crate::SnapshotError::InProgress);
+            println!("Another snapshot is in progress, skipping this snapshot request.");
+            return;
         }
 
         // Never truncate the previous checkpoint before its replacement is complete.
@@ -1182,7 +1179,6 @@ impl CPRSnapShotMgr {
             .snapshot_in_progress
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok());
-        Ok(())
     }
 
     /// Recover a Bf-tree from an existing snapshot file at recovery_snapshot_file_path.
@@ -1646,34 +1642,12 @@ impl BfTree {
 
     /// Take a new CPR snapshot
     pub fn cpr_snapshot(&self, snapshot_file_path: impl AsRef<Path>) {
-        match self.cpr_snapshot_checked(snapshot_file_path) {
-            Ok(()) => {}
-            Err(crate::SnapshotError::Disabled) => {
-                panic!("Snapshots are not enabled in the configuration");
-            }
-            Err(crate::SnapshotError::InProgress) => {
-                println!("Another snapshot is in progress, skipping this snapshot request.");
-            }
-        }
-    }
-
-    /// Captures a CPR snapshot or reports that the request did not start.
-    ///
-    /// Completion is not a power-loss durability guarantee. Native I/O failures
-    /// and internal defects can still panic and leave the handle unsafe to reuse.
-    pub fn cpr_snapshot_checked(
-        &self,
-        snapshot_file_path: impl AsRef<Path>,
-    ) -> Result<(), crate::SnapshotError> {
         if !self.config.use_snapshot {
-            return Err(crate::SnapshotError::Disabled);
+            panic!("Snapshots are not enabled in the configuration");
         }
 
-        let snapshot_mgr = self
-            .snapshot_mgr
-            .as_ref()
-            .ok_or(crate::SnapshotError::Disabled)?;
-        snapshot_mgr.snapshot(self, snapshot_file_path)
+        let snpshot_mgr = self.snapshot_mgr.clone().unwrap();
+        snpshot_mgr.snapshot(self, snapshot_file_path);
     }
 
     /// Recover a BfTree from a CPR snapshot
@@ -1699,34 +1673,6 @@ impl BfTree {
             return snapshot_mgr.are_all_threads_in_next_version();
         }
         false
-    }
-}
-
-#[cfg(all(test, not(feature = "shuttle")))]
-mod checked_snapshot_tests {
-    use super::*;
-
-    #[test]
-    fn checked_snapshot_reports_busy_without_creating_output() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("snapshot.cpr");
-        let mut config = Config::new(":memory:", 2 * 1024 * 1024);
-        config
-            .storage_backend(StorageBackend::Memory)
-            .use_snapshot(true);
-        let tree = BfTree::with_config(config, None).unwrap();
-        let manager = tree.snapshot_mgr.as_ref().unwrap();
-        manager.snapshot_in_progress.store(true, Ordering::Release);
-
-        assert_eq!(
-            tree.cpr_snapshot_checked(&path),
-            Err(crate::SnapshotError::InProgress)
-        );
-        assert!(!path.exists());
-
-        manager.snapshot_in_progress.store(false, Ordering::Release);
-        assert_eq!(tree.cpr_snapshot_checked(&path), Ok(()));
-        assert!(std::fs::metadata(&path).unwrap().len() > 0);
     }
 }
 

@@ -1,9 +1,11 @@
 # Checked Bf-Tree C interface
 
 This is an **unreleased package candidate**.
-It requires the checked Rust operations in the adjacent BF-tree source.
+It wraps the existing Rust read, scan, insert, delete, and CPR operations.
+The native operation implementations remain unchanged.
+Recovery validation requires two read-only `Config` getters in the adjacent BF-tree source.
 The native crate version currently reads `0.5.7`.
-That version number alone does not identify this candidate's additional checked operations.
+That version number alone does not identify this candidate's additional configuration getters.
 Do not publish this package or replace an existing integration until compatible native and FFI versions receive approval.
 
 ## Build
@@ -54,6 +56,10 @@ The caller owns all input and output memory.
 Input buffers remain borrowed for one call.
 Read and scan results are copied into caller buffers.
 Rust references, iterators, and allocator-owned buffers do not cross the interface.
+
+The wrapper sizes scratch buffers from the effective tree configuration, including CPR-restored limits.
+It supplies that scratch space to native reads and scans instead of passing caller output buffers.
+Caller-capacity errors therefore do not depend on a native panic.
 
 `BfTreeScanRecord` holds offsets and lengths within the caller's byte buffer.
 `BUFFER_TOO_SMALL` reports required capacities without partially changing byte or descriptor output.
@@ -115,6 +121,7 @@ It does not supply a replacement application WAL.
 Neither close nor snapshot completion establishes durability of acknowledged application mutations.
 
 Snapshot capture refuses an existing output path and serializes requests per handle.
+The snapshot mutex prevents concurrent requests from reaching the native capture operation.
 The completed generation advances only after capture succeeds.
 Recovery requires a nonzero completed generation.
 Writable recovery enables subsequent capture.

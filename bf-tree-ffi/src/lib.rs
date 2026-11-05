@@ -6,10 +6,7 @@
 #[cfg(not(panic = "unwind"))]
 compile_error!("bf-tree-ffi requires panic=unwind for its checked C boundary");
 
-use bf_tree::{
-    BfTree, Config, LeafDeleteResult, LeafInsertResult, LeafReadResult, ScanReturnField,
-    StorageBackend,
-};
+use bf_tree::{BfTree, Config, LeafInsertResult, LeafReadResult, ScanReturnField, StorageBackend};
 use std::any::Any;
 use std::ffi::c_char;
 use std::fs::{self, OpenOptions};
@@ -408,12 +405,13 @@ unsafe fn config<'a>(value: *const BfTreeAbiConfig) -> ApiResult<&'a BfTreeAbiCo
 }
 
 fn owned_handle(tree: BfTree, writable: bool, generation: u64) -> *mut BfTreeHandle {
-    let limits = tree.record_limits();
+    let maximum_record_bytes = tree.config().get_cb_max_record_size();
+    let maximum_key_bytes = tree.config().get_max_key_len();
     Box::into_raw(Box::new(BfTreeHandle {
         state: RwLock::new(Some(TreeState {
             tree,
-            maximum_record_bytes: limits.maximum_record_bytes,
-            maximum_key_bytes: limits.maximum_key_bytes,
+            maximum_record_bytes,
+            maximum_key_bytes,
             writable,
         })),
         snapshot_generation: Mutex::new(generation),
@@ -551,12 +549,12 @@ pub unsafe extern "C" fn bf_tree_recover(
                     format!("CPR recovery failed: {cause:?}"),
                 )
             })?;
-        let limits = tree.record_limits();
+        let stored = tree.config();
         for (requested, stored) in [
-            (value.minimum_record_bytes, limits.minimum_record_bytes),
-            (value.maximum_record_bytes, limits.maximum_record_bytes),
-            (value.maximum_key_bytes, limits.maximum_key_bytes),
-            (value.leaf_page_bytes, limits.leaf_page_bytes),
+            (value.minimum_record_bytes, stored.get_cb_min_record_size()),
+            (value.maximum_record_bytes, stored.get_cb_max_record_size()),
+            (value.maximum_key_bytes, stored.get_max_key_len()),
+            (value.leaf_page_bytes, stored.get_leaf_page_size()),
         ] {
             if requested != 0 && requested != stored {
                 return Err(error(
@@ -613,18 +611,14 @@ pub unsafe extern "C" fn bf_tree_read(
         let key = input(key, key_length)?;
         let (status, bytes) = with_tree(handle, false, |state| {
             let mut bytes = buffer(state.maximum_record_bytes)?;
-            match state.tree.read_checked(key, &mut bytes) {
-                Ok(LeafReadResult::Found(length)) => {
+            match state.tree.read(key, &mut bytes) {
+                LeafReadResult::Found(length) => {
                     bytes.truncate(length as usize);
                     Ok((BfTreeStatus::Ok, bytes))
                 }
-                Ok(LeafReadResult::NotFound) => Ok((BfTreeStatus::NotFound, Vec::new())),
-                Ok(LeafReadResult::Deleted) => Ok((BfTreeStatus::Deleted, Vec::new())),
-                Ok(LeafReadResult::InvalidKey) => Err(invalid("invalid read key")),
-                Err(cause) => Err(error(
-                    BfTreeStatus::ResourceExhausted,
-                    format!("configured record limit is too small: {cause}"),
-                )),
+                LeafReadResult::NotFound => Ok((BfTreeStatus::NotFound, Vec::new())),
+                LeafReadResult::Deleted => Ok((BfTreeStatus::Deleted, Vec::new())),
+                LeafReadResult::InvalidKey => Err(invalid("invalid read key")),
             }
         })?;
         *value_length = bytes.len();
@@ -651,17 +645,16 @@ pub unsafe extern "C" fn bf_tree_delete(
         let key = input(key, key_length)?;
         with_tree(handle, true, |state| {
             writable(state)?;
-            match state.tree.read_checked(key, &mut []) {
-                Ok(LeafReadResult::NotFound | LeafReadResult::Deleted) => {
+            let mut scratch = buffer(state.maximum_record_bytes)?;
+            match state.tree.read(key, &mut scratch) {
+                LeafReadResult::NotFound | LeafReadResult::Deleted => {
                     return Ok(BfTreeStatus::NotFound)
                 }
-                Ok(LeafReadResult::InvalidKey) => return Err(invalid("invalid delete key")),
-                Ok(LeafReadResult::Found(_)) | Err(_) => {}
+                LeafReadResult::InvalidKey => return Err(invalid("invalid delete key")),
+                LeafReadResult::Found(_) => {}
             }
-            match state.tree.delete_checked(key) {
-                LeafDeleteResult::Success => Ok(BfTreeStatus::Ok),
-                LeafDeleteResult::InvalidKey => Err(invalid("invalid delete key")),
-            }
+            state.tree.delete(key);
+            Ok(BfTreeStatus::Ok)
         })
     })
 }
@@ -718,14 +711,7 @@ fn scan(state: &TreeState, request: ScanRequest<'_>) -> ApiResult<ScanOutput> {
         .map_err(|cause| invalid(format!("native scan rejected request: {cause:?}")))?;
     let mut scratch = buffer(state.maximum_record_bytes)?;
     while result.records.len() < request.records {
-        let Some((key_length, value_length)) =
-            iterator.next_checked(&mut scratch).map_err(|cause| {
-                error(
-                    BfTreeStatus::ResourceExhausted,
-                    format!("configured record limit is too small: {cause}"),
-                )
-            })?
-        else {
+        let Some((key_length, value_length)) = iterator.next(&mut scratch) else {
             break;
         };
         let key = &scratch[..key_length];
@@ -981,12 +967,7 @@ pub unsafe extern "C" fn bf_tree_cpr_snapshot(
         let mut reservation = ReservedPath::reserve(path, false)?;
         let captured = with_tree(handle, false, |state| {
             writable(state)?;
-            state.tree.cpr_snapshot_checked(path).map_err(|cause| {
-                error(
-                    BfTreeStatus::InternalError,
-                    format!("snapshot did not start: {cause}"),
-                )
-            })?;
+            state.tree.cpr_snapshot(path);
             let metadata = fs::metadata(path).map_err(|cause| {
                 owner.fenced.store(true, Ordering::Release);
                 error(
