@@ -37,6 +37,14 @@ assert_eq!(read_size, LeafReadResult::Found(5));
 assert_eq!(&buffer[..5], b"value");
 ```
 
+### C and C++ interface
+
+The [unreleased C ABI package](bf-tree-ffi/README.md) wraps the existing Rust
+operations with caller-owned buffers, explicit statuses, bounded scans, and
+panic fencing. It preserves ABI-v1 layouts and signatures.
+The native read, scan, mutation, and snapshot implementations remain unchanged.
+Recovery validation uses two additional read-only `Config` getters.
+
 ### Snapshots and Recovery
 
 Bf-Tree supports CPR-style consistent snapshots. A snapshot captures a
