@@ -372,9 +372,19 @@ impl Config {
         self
     }
 
+    /// Returns the effective maximum key length, including a fence-length override.
+    pub fn get_max_key_len(&self) -> usize {
+        self.max_fence_len / 2
+    }
+
     pub fn cb_min_record_size(&mut self, min_record_size: usize) -> &mut Self {
         self.cb_min_record_size = min_record_size;
         self
+    }
+
+    /// Returns the configured minimum record size.
+    pub fn get_cb_min_record_size(&self) -> usize {
+        self.cb_min_record_size
     }
 
     pub fn cb_max_record_size(&mut self, max_record_size: usize) -> &mut Self {
@@ -632,5 +642,19 @@ mod tests {
         let another_max_record_size = 8192;
         config.cb_max_record_size(another_max_record_size);
         assert_eq!(config.get_cb_max_record_size(), another_max_record_size);
+    }
+
+    #[test]
+    fn test_minimum_record_and_maximum_key_getters() {
+        let mut config = Config::default();
+        assert_eq!(config.get_cb_min_record_size(), DEFAULT_MIN_RECORD_SIZE);
+        assert_eq!(config.get_max_key_len(), DEFAULT_MAX_KEY_LEN);
+
+        config.cb_min_record_size(2).cb_max_key_len(24);
+        assert_eq!(config.get_cb_min_record_size(), 2);
+        assert_eq!(config.get_max_key_len(), 24);
+
+        config.max_fence_len(20);
+        assert_eq!(config.get_max_key_len(), 10);
     }
 }

@@ -1,0 +1,35 @@
+[package]
+name = "bf-tree-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "MIT"
+description = "Checked, caller-buffered C interface for Bf-Tree."
+repository = "https://github.com/microsoft/bf-tree"
+readme = "README.md"
+publish = false
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE.txt",
+    "/CMakeLists.txt",
+    "/include/**",
+    "/src/**",
+    "/tests/**",
+]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Recovery validation needs the adjacent Config limit getters.
+bf-tree = { path = "..", version = "=0.5.7" }
+
+[dev-dependencies]
+tempfile = "3.10.1"
+
+[workspace]
+
+[profile.release]
+panic = "unwind"
