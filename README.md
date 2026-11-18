@@ -37,6 +37,58 @@ assert_eq!(read_size, LeafReadResult::Found(5));
 assert_eq!(&buffer[..5], b"value");
 ```
 
+### Configuration
+
+Start with `Config::default()`, customize it with builder-style setters such as
+`config.cb_size_byte(64 * 1024 * 1024)`. Validate the configuration with
+`config.validate()?` before passing it to `BfTree::with_config(config, None)`.
+`BfTree::with_config` also validates it internally and returns a `ConfigError`
+if it is invalid. Defaults below refer to `Config::default()`.
+Record sizes are the combined key and value lengths in bytes, excluding metadata.
+
+#### Buffer Pool
+
+The circular buffer holds cached mini pages and full pages. Its size is not a
+limit on total process memory: inner nodes, page mappings, and any in-memory
+backing storage require additional memory.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `cb_size_byte` | 32 MiB | Circular-buffer capacity in bytes; must be a power of two. |
+| `cb_min_record_size` | 4 | Minimum record size in bytes; must be at least 2. Inserts with smaller records are rejected. |
+| `cb_max_record_size` | 1952 | Maximum record size in bytes. Inserts with larger records are rejected; increasing this limit must also satisfy page-layout constraints. |
+| `cb_max_key_len` | 16 | Maximum key length in bytes. Set this to accommodate the longest key in your workload. |
+| `read_promotion_rate` | 30% (50% in debug builds) | Probability of promoting a record into the buffer during a point read. |
+| `scan_promotion_rate` | 30% (50% in debug builds) | Probability of promoting a page into the buffer during a range scan. Lower values help avoid displacing hot data with scan results. |
+
+Promotion rates are percentages from 0 to 100: 0 disables the corresponding
+promotion, while 100 always attempts it when eligible.
+
+#### Persistent Storage
+
+These settings control the backing store and how reads populate its cache.
+The promotion rates are listed again here because they also affect storage I/O.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `read_promotion_rate` | 30% (50% in debug builds) | Controls caching on point reads; higher rates can reduce repeated backing-store reads at the cost of more cache churn. |
+| `scan_promotion_rate` | 30% (50% in debug builds) | Controls page caching during scans; lower rates reduce cache pollution from one-pass scans. |
+| `storage_backend` | `StorageBackend::Memory` | Backing-store implementation. `Memory` keeps backing pages in RAM; `Std` uses standard file I/O. Linux additionally supports `StdDirect`, `IoUringPolling`, and `IoUringBlocking`; `Spdk` requires Linux and the `spdk` feature. |
+| `file_path` | Empty path | Index-file path for file-backed storage. Set this together with a file-backed `storage_backend`; changing the path alone does not change the backend. |
+| `cache_only` | `false` | Keeps all leaf data in the circular buffer, without a backing storage layer. The entire dataset must fit in the buffer. This differs from `StorageBackend::Memory`, which normally keeps backing pages in separately allocated RAM. |
+
+As a convenience, `Config::new(path, buffer_size)` selects `Std` for a normal
+file path, `Memory` for a path starting with `:memory:`, or cache-only mode for
+a path starting with `:cache:`. File-backed storage alone does not provide
+snapshot recovery; see the snapshot options below.
+
+#### Snapshot & Recovery
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `snapshot_backend` | `StorageBackend::Std` | I/O backend used to write snapshots, separate from the index's `storage_backend`. This is currently crate-internal and has no public setter. |
+| `use_snapshot` | `false` | Enables concurrent consistent snapshots. Call `BfTree::cpr_snapshot` explicitly to take one; enabling this does not schedule automatic snapshots. |
+| `snapshot_version` | 0 | Initial snapshot version for a new tree. Normally leave this unchanged; recovery automatically starts at the saved version plus one. |
 ### C and C++ interface
 
 The [unreleased C ABI package](bf-tree-ffi/README.md) wraps the existing Rust
