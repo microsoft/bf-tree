@@ -33,6 +33,11 @@ cmake --build bf-tree-ffi\build --config Release
 ctest --test-dir bf-tree-ffi\build -C Release --output-on-failure
 ```
 
+`BF_TREE_FFI_BUILD_TESTS` defaults to `ON`.
+Pass `-DBF_TREE_FFI_BUILD_TESTS=OFF` to omit the C/C++ test targets and their CTest registration.
+For `FetchContent` use, pass this option when configuring the parent project.
+The option does not disable the parent project's tests.
+
 Pass `-DCARGO_EXECUTABLE=<path>` if Cargo is not on `PATH`.
 For Linux, omit `-A x64` and set `-DCMAKE_BUILD_TYPE=Release`.
 For Windows ARM64, use `-A ARM64` and install the matching Rust target first.

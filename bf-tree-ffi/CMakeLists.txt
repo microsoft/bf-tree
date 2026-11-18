@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(BfTreeFFI LANGUAGES C CXX)
 
+option(BF_TREE_FFI_BUILD_TESTS "Build the C and C++ ABI tests" ON)
+
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -67,16 +69,18 @@ else()
     target_link_libraries(bf_tree_ffi INTERFACE "${CMAKE_DL_LIBS}" m)
 endif()
 
-enable_testing()
-add_executable(bf_tree_c_test tests/c_api.c)
-set_target_properties(bf_tree_c_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
-target_link_libraries(bf_tree_c_test PRIVATE bf_tree_ffi)
-add_test(NAME BfTreeCAbi COMMAND bf_tree_c_test)
+if(BF_TREE_FFI_BUILD_TESTS)
+    enable_testing()
+    add_executable(bf_tree_c_test tests/c_api.c)
+    set_target_properties(bf_tree_c_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_link_libraries(bf_tree_c_test PRIVATE bf_tree_ffi)
+    add_test(NAME BfTreeCAbi COMMAND bf_tree_c_test)
 
-add_executable(bf_tree_cpp_test tests/cpp_api.cpp)
-set_target_properties(bf_tree_cpp_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-target_link_libraries(bf_tree_cpp_test PRIVATE bf_tree_ffi)
-add_test(NAME BfTreeCppAbi COMMAND bf_tree_cpp_test)
+    add_executable(bf_tree_cpp_test tests/cpp_api.cpp)
+    set_target_properties(bf_tree_cpp_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_link_libraries(bf_tree_cpp_test PRIVATE bf_tree_ffi)
+    add_test(NAME BfTreeCppAbi COMMAND bf_tree_cpp_test)
+endif()
 
 install(FILES include/bf_tree.h DESTINATION include)
 install(FILES "$<TARGET_FILE:bf_tree_ffi>" DESTINATION lib)
